@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Visual Pinball Engine
+# Copyright (C) 2026 freezy and VPE Team
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # Builds VpeDof for macOS 12.0 and newer as a universal library (arm64 and x86_64) and copies it into the Unity package.
 # Usage: native/build-macos.sh [Release|Debug]
 # Needs CMake 3.24 or newer, git and the Xcode command-line tools.

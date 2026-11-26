@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# Visual Pinball Engine
+# Copyright (C) 2026 freezy and VPE Team
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Loads the DMD package's native libraries and VpeDof into one process, in both orders, and calls into each.
 
 The DMD package ships its own libusb and libserialport, and ZeDMD, Serum, sockpp, FTDI's driver library and others,

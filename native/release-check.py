@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# Visual Pinball Engine
+# Copyright (C) 2026 freezy and VPE Team
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Release checks for a built VpeDof library.
 
 - It exports the C ABI and nothing else: every function native/include/vpe_dof.h declares, and no other symbol, so its

@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# Visual Pinball Engine
+# Copyright (C) 2026 freezy and VPE Team
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Writes the complete corresponding source of a release as one .tar.gz.
 
 The archive holds the repository at a commit (default HEAD) and every submodule at the revision that commit pins,

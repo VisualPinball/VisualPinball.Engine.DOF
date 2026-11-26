@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Visual Pinball Engine
+# Copyright (C) 2026 freezy and VPE Team
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # Builds VpeDof for linux-x64 and copies it into the Unity package.
 # Usage: native/build-linux.sh [Release|Debug]
 # Needs CMake 3.24 or newer, a C++20 compiler, git, pkg-config and libudev's headers (libudev-dev).
