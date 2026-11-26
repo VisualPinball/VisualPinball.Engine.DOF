@@ -64,6 +64,8 @@ enum class State
 struct vpe_dof
 {
 	DOF::Pinball* pinball = nullptr;
+	// The gate of the session this instance began. It outlives the instance (OutputGate::BeginSession).
+	DOF::OutputGate* gate = nullptr;
 	std::string basePath;
 	std::atomic<State> state { State::Created };
 	std::mutex lifecycle;
@@ -321,7 +323,10 @@ VPE_DOF_API vpe_dof* VPE_DOF_CALL vpe_dof_create(const char* base_path, int32_t*
 			dof->basePath = base_path;
 			DOF::Config::GetInstance()->SetBasePath(base_path);
 			DOF::PathConfinement::SetRoot(base_path);
-			DOF::OutputGate::Instance().BeginSession();
+			// A configuration that cannot be used fails init instead of falling back to defaults or auto-configuring
+			// whatever hardware is connected.
+			DOF::Config::GetInstance()->SetStrictSetup(true);
+			dof->gate = &DOF::OutputGate::BeginSession();
 			{
 				std::lock_guard<std::mutex> hid(VpeDofHidLock());
 				DOF::IOConfigurator::Initialize();
@@ -514,7 +519,7 @@ VPE_DOF_API int64_t VPE_DOF_CALL vpe_dof_set_output_gate(vpe_dof* dof, int32_t o
 		if (!lock.owns_lock() || dof->state.load() != State::Created)
 			return -1;
 		// No outputs exist yet: the state applies to everything init creates.
-		DOF::OutputGate& gate = DOF::OutputGate::Instance();
+		DOF::OutputGate& gate = *dof->gate;
 		int64_t generation = gate.Request(open != 0);
 		gate.Apply(open != 0);
 		gate.Publish(generation);
@@ -532,8 +537,8 @@ VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_set_connect_tests(vpe_dof* dof, int32_t
 		return VPE_DOF_INVALID_ARGUMENT;
 	try
 	{
-		// Process-wide, as the gate is; the session that create began allows them, so this lasts for the instance.
-		DOF::OutputGate::Instance().SetConnectTests(allowed != 0);
+		// The session that create began allows them, so this lasts for the instance.
+		dof->gate->SetConnectTests(allowed != 0);
 		return VPE_DOF_OK;
 	}
 	catch (...)
@@ -548,9 +553,10 @@ VPE_DOF_API int64_t VPE_DOF_CALL vpe_dof_latch_output_gate(vpe_dof* dof)
 		return -1;
 	try
 	{
-		// The gate is process-wide and latches at once in every state, without DOF's main thread: the controllers'
-		// updaters send the closing. Init keeps it (the session began at create), and finish turns everything off anyway.
-		return DOF::OutputGate::Instance().Latch();
+		// Latches the instance's session at once in every state, without DOF's main thread: the controllers' updaters send
+		// the closing. Init keeps it (the session began at create), and finish turns everything off anyway. A later
+		// instance has a session of its own, which this never reaches.
+		return dof->gate->Latch();
 	}
 	catch (...)
 	{
@@ -572,7 +578,7 @@ VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_gate_state(vpe_dof* dof, int64_t genera
 		return 0;
 	try
 	{
-		DOF::OutputGate& gate = DOF::OutputGate::Instance();
+		DOF::OutputGate& gate = *dof->gate;
 		DOF::OutputGate::Counts counts;
 		DOF::OutputGate::Status status = gate.GetState(generation, counts);
 		if (confirmed)
@@ -602,7 +608,7 @@ VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_gate_pending(vpe_dof* dof, int64_t gene
 		return VPE_DOF_INVALID_ARGUMENT;
 	try
 	{
-		for (const std::string& name : DOF::OutputGate::Instance().GetPending(generation))
+		for (const std::string& name : dof->gate->GetPending(generation))
 			callback(Sanitize(name).c_str(), user);
 		return VPE_DOF_OK;
 	}

@@ -12,7 +12,9 @@
 - It imports only libraries of the operating system: no C/C++ runtime DLLs on Windows (static CRT), no libstdc++ or
   libgcc_s on Linux (linked statically), only libSystem, libc++, libobjc and system frameworks on macOS.
 - Its vpe_dof_abi_version returns the VPE_DOF_ABI_VERSION of the header, so a library built from older sources with the
-  same exports does not pass. The library is loaded for that: run the check on the platform it is built for.
+  same exports does not pass. The library is loaded for that: run the check on the platform it is built for. On macOS
+  every architecture's slice is loaded, each by a Python started under that architecture (arch -<arch>); a slice that
+  cannot be loaded (an x86_64 slice without Rosetta) fails the check.
 - Linux: the newest glibc symbol version it needs (--max-glibc fails above that). macOS: the architectures it
   contains (--archs) and the minimum macOS version of each (--min-macos fails above that).
 - --unity-meta: the library has its Unity import settings next to it, and its folder too, as native/unity has them
@@ -74,12 +76,43 @@ def header_abi_version(header):
 LOADERS = {"PE": "win32", "ELF": "linux", "Mach-O": "darwin"}
 
 
+# Loads the library given as the argument and prints its ABI version.
+ABI_PROBE = """import ctypes, sys
+function = ctypes.CDLL(sys.argv[1]).vpe_dof_abi_version
+function.restype = ctypes.c_int32
+function.argtypes = []
+print(function())
+"""
+
+
+def check_slice_abi_versions(library, expected):
+	"""Each architecture of a Mach-O library: a process loads only the slice of its own architecture, so every slice is
+	asked from a process started under that architecture. A slice that cannot be asked (no Rosetta, say) fails."""
+	notes = []
+	for arch in run(["lipo", "-archs", library]).split():
+		try:
+			result = subprocess.run(["arch", "-" + arch, "/usr/bin/python3", "-c", ABI_PROBE, os.path.abspath(library)],
+				stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+			output = result.stdout.strip()
+		except OSError as error:
+			result, output = None, str(error)
+		last = output.splitlines()[-1] if output else ""
+		if result is None or result.returncode != 0 or not re.fullmatch(r"-?\d+", last):
+			notes.append(("{}: cannot call vpe_dof_abi_version: {}".format(arch, output or "exit {}".format(result.returncode)), False))
+			continue
+		version = int(last)
+		notes.append(("{} ABI version {} (the header's is {})".format(arch, version, expected), version == expected))
+	return notes
+
+
 def check_abi_version(library, kind, header):
 	expected = header_abi_version(header)
 	if expected is None:
 		return [("{} defines no VPE_DOF_ABI_VERSION".format(header), False)]
 	if not sys.platform.startswith(LOADERS[kind]):
 		return [("cannot load a {} library on {} to check its ABI version".format(kind, sys.platform), False)]
+	if kind == "Mach-O":
+		return check_slice_abi_versions(library, expected)
 	try:
 		function = ctypes.CDLL(os.path.abspath(library)).vpe_dof_abi_version
 	except (OSError, AttributeError) as error:

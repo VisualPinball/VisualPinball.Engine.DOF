@@ -96,7 +96,9 @@ VPE_DOF_API void VPE_DOF_CALL vpe_dof_destroy(vpe_dof* dof);
 /// so a session can start closed; after init it runs on DOF's main thread and returns at once. Returns the gate
 /// generation, which vpe_dof_gate_state reports against, or -1 while init or finish runs and after finish. It never
 /// waits for DOF's main thread or a device; it only takes short internal locks. A change queued before finish is still
-/// applied. The gate opens with every new instance; after vpe_dof_latch_output_gate a change applies as a closing.
+/// applied, after the table element changes queued before it; once finish started, an opening returns -1 and a closing
+/// latches the gate (vpe_dof_latch_output_gate). Every instance has a gate of its own, open when it is created; after
+/// vpe_dof_latch_output_gate a change applies as a closing.
 VPE_DOF_API int64_t VPE_DOF_CALL vpe_dof_set_output_gate(vpe_dof* dof, int32_t open);
 /// Turns the controllers' connect test sequences (TestOnConnect of Wemos D1 and UMX controllers) off (allowed = 0) for
 /// the rest of the instance, or on again. They run only while the gate is open anyway; turned off, they do not run when
@@ -106,19 +108,22 @@ VPE_DOF_API int64_t VPE_DOF_CALL vpe_dof_set_output_gate(vpe_dof* dof, int32_t o
 VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_set_connect_tests(vpe_dof* dof, int32_t allowed);
 /// Closes the output gate at once, from any thread and in any state, and latches it closed for the rest of the
 /// instance. An opening requested before the latch that DOF's main thread has not applied yet never reaches the
-/// controllers as an opening and reports 2 (superseded); every change requested after it applies as a closing and
-/// reports the closed state. When latches race, the first to start decides: every change requested after it started,
-/// the other latches included, is a closing, and a result a caller saw does not change when a later latch returns.
-/// The closing is published to the controllers at once and every controller's updater sends it without
-/// DOF's main thread: an idle updater checks the gate every 50 ms, its polling interval, which bounds how long it takes
-/// to notice; a busy one sends it after the write in progress (a PacLed64 or PacUIO drops the rest of an opening's
-/// update, a UMX one the rest of the frame it is sending, and sends every line on its next update). Returns the closing's generation, or -1 if `dof` is NULL. Safe to call
-/// from a realtime thread or a fault handler: it takes no lock and never allocates. Once it returned, the gate reports
-/// closed to every caller, also to an opening DOF's main thread is applying at that moment.
+/// controllers as an opening: it reports 0 until DOF's main thread gets to it, then 2 (superseded). Every change
+/// requested after the latch applies as a closing and reports the closed state. When latches race, every change
+/// requested after the first one reserved its generation, the other latches included, is a closing, and a result a
+/// caller saw does not change when a later latch returns. The closing is published to the controllers at once and every
+/// controller's updater sends it without DOF's main thread: an idle updater checks the gate every 50 ms, its polling
+/// interval, which bounds how long it takes to notice; a busy one stops the opening's transfer before its next write to
+/// the device (each report, packet, command or retry), so nothing of the opening goes out after the latch returned, and
+/// then sends the closing to every output. Returns the closing's generation, or -1 if `dof` is NULL. Safe to call from a
+/// realtime thread or a fault handler: it takes no lock and never allocates. Once it returned, the gate reports closed
+/// to every caller, also to an opening DOF's main thread is applying at that moment. It only ever reaches this
+/// instance's gate, never a later instance's.
 VPE_DOF_API int64_t VPE_DOF_CALL vpe_dof_latch_output_gate(vpe_dof* dof);
-/// Reports a gate change: 0 until DOF's main thread applied it, then 1, or 2 (superseded) if a later change that reached
-/// the controllers set the other state, or if it is an opening a latch overtook (see vpe_dof_latch_output_gate). 2 is
-/// final. Also how many controller units confirmed the state: a transfer to their device carried it, or a later change
+/// Reports a gate change: 0 until it was published to the controllers (by DOF's main thread; a latch publishes its own
+/// closing at once), then 1, or 2 (superseded) if it is an opening a latch overtook (see vpe_dof_latch_output_gate). A 1
+/// becomes 2 once a later change that reached the controllers set the other state; 2 is final. Every change the host
+/// requested is applied in turn, none is dropped, so a change reports 0 only until DOF's main thread gets to it. Also how many controller units confirmed the state: a transfer to their device carried it, or a later change
 /// to the same state. How many have not yet, how many failed (device missing, write failed, or the updater ended on its
 /// own, which outranks what it confirmed before; a unit that finished cleanly keeps what it confirmed or left alone and
 /// fails later changes), and how many are untouched: units DOF never used, which it leaves alone while the gate is

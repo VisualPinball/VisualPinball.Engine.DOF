@@ -12,12 +12,12 @@ namespace VisualPinball.Engine.DOF
 	/// <summary>The state of one output gate change, from <see cref="DofInstance.GetGateState"/>.</summary>
 	public readonly struct DofGateState
 	{
-		/// <summary>DOF's main thread has applied the change.</summary>
+		/// <summary>The change was published to the controllers: by DOF's main thread, or at once for a latch.</summary>
 		public bool Applied { get; }
 		/// <summary>
-		/// A later change that reached the controllers set the other state, or this is an opening that a latch overtook
-		/// (requested before the latch, applied after it), which never reaches them as an opening. The latest change is
-		/// the one to wait for. A superseded change stays superseded.
+		/// This is an opening that a latch overtook (requested before the latch, applied after it), which never reaches
+		/// the controllers as an opening, or an applied change that a later change reaching the controllers with the
+		/// other state replaced. The latest change is the one to wait for. A superseded change stays superseded.
 		/// </summary>
 		/// <remarks>
 		/// Only the latest change's counts tell what the outputs show. For an older change they are what each unit wrote
@@ -217,7 +217,8 @@ namespace VisualPinball.Engine.DOF
 		/// Closes or opens the output gate. While closed, every output sends 0 and keeps the value effects set for when it
 		/// opens again. Before <see cref="Init"/> it applies at once; afterwards it is applied by DOF's main thread and this
 		/// returns at once. It never waits for DOF's main thread or a device, only for short internal locks. A change made
-		/// just before <see cref="Finish"/> is still applied.
+		/// just before <see cref="Finish"/> is still applied, after the table element changes made before it; once finish
+		/// started, an opening returns -1 and a closing latches the gate (<see cref="LatchOutputGate"/>).
 		/// </summary>
 		/// <returns>The gate generation to pass to <see cref="GetGateState"/>, or -1 while init or finish runs or after finish.</returns>
 		public long SetOutputGate(bool open)
@@ -237,13 +238,16 @@ namespace VisualPinball.Engine.DOF
 		/// <summary>
 		/// Any thread, in any state until disposed: closes the output gate at once and latches it closed for the rest of
 		/// the instance. An opening requested before the latch that DOF's main thread has not applied yet never reaches
-		/// the controllers as an opening and reports <see cref="DofGateState.Superseded"/>; every change requested after
-		/// it applies as a closing and reports the closed state. When latches race, the first to start decides, and a
-		/// state once reported does not change when a later latch returns. The closing reaches the controllers without
-		/// waiting for DOF's main thread: an idle updater checks the gate every 50 ms, its polling interval, which bounds
-		/// how long it takes to notice; a busy one sends it after the write in progress (a PacLed64 or PacUIO drops the
-		/// rest of an opening's update, a UMX one the rest of the frame it is sending). Takes no lock and never allocates, so the simulation thread or a fault handler may call it.
-		/// Once it returned, the gate reports closed, also to an opening DOF's main thread is applying at that moment.
+		/// the controllers as an opening: it is not applied until DOF's main thread gets to it, then reports
+		/// <see cref="DofGateState.Superseded"/>. Every change requested after the latch applies as a closing and reports
+		/// the closed state. When latches race, every change requested after the first one, the other latches included,
+		/// is a closing, and a state once reported does not change when a later latch returns. The closing reaches the
+		/// controllers without waiting for DOF's main thread: an idle updater checks the gate every 50 ms, its polling
+		/// interval, which bounds how long it takes to notice; a busy one stops the opening's transfer before its next
+		/// write to the device (each report, packet, command or retry), so nothing of the opening goes out after the
+		/// latch returned, and then sends the closing to every output. Takes no lock and never allocates, so the
+		/// simulation thread or a fault handler may call it. Once it returned, the gate reports closed, also to an
+		/// opening DOF's main thread is applying at that moment. It never reaches a later instance's gate.
 		/// </summary>
 		/// <returns>The closing's generation, or -1 after <see cref="Dispose"/>.</returns>
 		public long LatchOutputGate()

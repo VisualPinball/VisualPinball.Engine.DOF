@@ -714,9 +714,15 @@ namespace VisualPinball.Engine.DOF.Test
 			// Finish right after the opening: the input queued before it still goes first.
 			Backlog(dof);
 			dof.Data('S', 1, 0);
-			dof.SetOutputGate(true);
+			var queued = dof.PendingInput;
+			var open = dof.SetOutputGate(true);
 			dof.Finish();
 			Thread.Sleep(100);
+			// What the test is about: the opening came with input still queued before it, and finish applied it.
+			Assert.That(queued, Is.GreaterThan(0), "input was queued before the opening");
+			Assert.That(open, Is.GreaterThanOrEqualTo(0), "the opening was accepted");
+			var opening = dof.GetGateState(open);
+			Assert.That((opening.Applied, opening.Superseded), Is.EqualTo((true, false)), "finish applied the opening: " + opening);
 			var after = _capture.Frames(unit.Universe).Skip(mark).ToList();
 			Assert.That(after, Is.Not.Empty, "finish sends a final frame");
 			Assert.That(after.All(f => f[0] == 0), Is.True, "S1 was off before the gate opened: " + string.Join(",", after.Select(f => f[0])));
@@ -776,10 +782,15 @@ namespace VisualPinball.Engine.DOF.Test
 			dof.Finish();
 		}
 
+		private static int _backlogNames;
+
+		/// <summary>Queues input faster than DOF's main thread takes it, so some is still queued when this returns.</summary>
 		private static void Backlog(DofInstance dof)
 		{
-			for (var i = 0; i < 3000; i++) {
-				dof.Data('L', 1 + i % 64, i & 1);
+			// Numbered input is taken as fast as it is queued. A named element DOF does not know is added to the table, and
+			// every named input is looked up through all of them, so the main thread falls further behind with each one.
+			for (var i = 0; i < 4000; i++) {
+				dof.DataNamed("Backlog" + Interlocked.Increment(ref _backlogNames), 1);
 			}
 		}
 
@@ -789,6 +800,8 @@ namespace VisualPinball.Engine.DOF.Test
 			while (dof.PendingInput > 0 && watch.ElapsedMilliseconds < 2000) {
 				Thread.Sleep(5);
 			}
+			Assert.That(dof.PendingInput, Is.Zero, "DOF's main thread processed the queued input");
+			// The last change taken from the queue is processed and sent.
 			Thread.Sleep(100);
 		}
 
