@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<!-- Runs a parity scenario on the C# DirectOutput framework. Build the official repository
+	     (https://github.com/DirectOutput/DirectOutput, DirectOutput/DirectOutput.csproj, Release x64) and pass its output
+	     folder: dotnet build -p:DirectOutputDir=<folder with DirectOutput.dll> -->
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+		<TargetFramework>net48</TargetFramework>
+		<PlatformTarget>x64</PlatformTarget>
+		<LangVersion>9.0</LangVersion>
+		<Nullable>disable</Nullable>
+	</PropertyGroup>
+	<ItemGroup>
+		<Reference Include="DirectOutput">
+			<HintPath>$(DirectOutputDir)\DirectOutput.dll</HintPath>
+		</Reference>
+		<Compile Include="..\DofParity\Scenario.cs" Link="Scenario.cs" />
+	</ItemGroup>
+</Project>

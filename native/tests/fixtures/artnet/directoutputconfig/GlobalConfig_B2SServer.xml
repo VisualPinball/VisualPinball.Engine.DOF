@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<GlobalConfig>
+  <IniFilesPath>{GlobalConfigDir}</IniFilesPath>
+  <CabinetConfigFilePattern>{GlobalConfigDir}/Cabinet.xml</CabinetConfigFilePattern>
+  <TableConfigFilePatterns />
+  <EnableLogging>true</EnableLogging>
+  <ClearLogOnSessionStart>true</ClearLogOnSessionStart>
+  <LogFilePattern>{GlobalConfigDir}/../../canary.log</LogFilePattern>
+</GlobalConfig>

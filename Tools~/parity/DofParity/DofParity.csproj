@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+		<TargetFramework>net10.0</TargetFramework>
+		<Nullable>disable</Nullable>
+		<VpeDofNativeDir Condition="'$(VpeDofNativeDir)' == ''">$(MSBuildThisFileDirectory)../../../VisualPinball.Engine.DOF.Unity/Plugins/win-x64</VpeDofNativeDir>
+	</PropertyGroup>
+	<ItemGroup>
+		<ProjectReference Include="../../../VisualPinball.Engine.DOF/VisualPinball.Engine.DOF.csproj" />
+		<Compile Include="../../../VisualPinball.Engine.DOF.Test/ArtNetCapture.cs" Link="ArtNetCapture.cs" />
+		<None Include="$(VpeDofNativeDir)/VpeDof.dll" Condition="Exists('$(VpeDofNativeDir)/VpeDof.dll')" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+		<None Include="../scenarios/*.dofscript" Link="scenarios/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+	</ItemGroup>
+</Project>

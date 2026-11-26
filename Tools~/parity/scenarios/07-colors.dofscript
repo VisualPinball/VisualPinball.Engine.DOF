@@ -1,0 +1,16 @@
+name: RGB toys and layers
+row: S1 Red/S2 Blue L2,S3 #FF8000 I24,S4 White Blink 400
+S 1 1
+wait 150
+S 2 1
+wait 150
+S 2 0
+wait 150
+S 1 0
+S 3 1
+S 4 1
+wait 150
+wait 300
+S 3 0
+S 4 0
+wait 150

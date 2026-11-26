@@ -1,0 +1,19 @@
+name: named elements
+# A condition over two named elements, and named elements as plain columns.
+row: ($left=1 and $right=1),$flipper,$kicker I#80
+$left 1
+wait 100
+$right 1
+wait 100
+$flipper 1
+$kicker 1
+wait 100
+$left 0
+$flipper 0
+wait 100
+$left 1
+$kicker 0
+wait 100
+$right 0
+$left 0
+wait 100

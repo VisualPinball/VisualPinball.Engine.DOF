@@ -1,0 +1,16 @@
+name: fading
+row: S1 FU400 FD400,S2 F200
+# A fade moves 255 / (duration / 30 ms) per step. The 30 ms steps of the two engines do not line up with the sample
+# times, so a sample in the middle of a fade can be one step apart. Allow one step of the 200 ms fade (43).
+tolerance: 45
+S 1 1
+S 2 1
+wait 100
+wait 100
+wait 100
+wait 300
+S 1 0
+S 2 0
+wait 100
+wait 100
+wait 400

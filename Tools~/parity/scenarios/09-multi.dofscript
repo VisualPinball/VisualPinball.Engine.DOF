@@ -1,0 +1,18 @@
+name: several settings on one port
+# Each setting gets its own layer, so turning one off keeps the others showing.
+row: S4/S5/S9,S1/S10,S7 I60,S8 Orange/S19 White
+S 4 1
+wait 150
+S 5 1
+wait 150
+S 4 0
+wait 150
+S 5 0
+S 1 1
+S 8 1
+S 7 1
+wait 150
+S 19 1
+wait 150
+S 8 0
+wait 150

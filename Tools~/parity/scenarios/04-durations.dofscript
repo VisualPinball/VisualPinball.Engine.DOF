@@ -1,0 +1,15 @@
+name: durations and delays
+row: S1 MAX300,S2 M400,S3 W200,S4 E300
+S 1 1
+S 2 1
+S 3 1
+S 4 1
+wait 100
+S 2 0
+S 4 0
+wait 150
+wait 200
+S 3 0
+wait 150
+wait 200
+wait 300

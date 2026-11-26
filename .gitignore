@@ -1,0 +1,15 @@
+bin/
+obj/
+build/
+.vs/
+.idea/
+*.user
+*.suo
+*.rsuser
+
+# Builds copy the binaries here; only their import settings are tracked.
+VisualPinball.Engine.DOF.Unity/Plugins/**/*.dll
+VisualPinball.Engine.DOF.Unity/Plugins/**/*.pdb
+VisualPinball.Engine.DOF.Unity/Plugins/**/*.so
+VisualPinball.Engine.DOF.Unity/Plugins/**/*.dylib
+!VisualPinball.Engine.DOF.Unity/Plugins/**/*.meta

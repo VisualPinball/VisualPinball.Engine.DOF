@@ -1,0 +1,13 @@
+name: modulated values
+row: S1,S1 NoBool,L2 NoBool I#80
+S 1 128
+L 2 255
+wait 150
+S 1 255
+L 2 64
+wait 150
+S 1 64
+L 2 0
+wait 150
+S 1 0
+wait 150

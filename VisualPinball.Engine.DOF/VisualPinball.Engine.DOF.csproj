@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591;CS1573</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="VisualPinball.Engine.DOF.Test" />
+  </ItemGroup>
+
+  <!-- The managed assembly is platform-independent and goes to the package's shared Managed folder. The native
+       library (VpeDof) is built by native/build-windows.cmd (or the CI) and copied to Plugins/<rid> from there. -->
+  <Target Name="PluginsDeploy" AfterTargets="AfterBuild">
+    <PropertyGroup>
+      <UnityManagedDir>$(MSBuildThisFileDirectory)..\VisualPinball.Engine.DOF.Unity\Plugins\Managed</UnityManagedDir>
+    </PropertyGroup>
+    <MakeDir Directories="$(UnityManagedDir)" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(UnityManagedDir)" SkipUnchangedFiles="true" />
+  </Target>
+</Project>

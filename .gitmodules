@@ -1,0 +1,15 @@
+[submodule "third-party/libdof"]
+	path = third-party/libdof
+	url = https://github.com/vpinball/libdof.git
+[submodule "third-party/hidapi"]
+	path = third-party/hidapi
+	url = https://github.com/libusb/hidapi.git
+[submodule "third-party/libusb"]
+	path = third-party/libusb
+	url = https://github.com/libusb/libusb.git
+[submodule "third-party/libserialport"]
+	path = third-party/libserialport
+	url = https://github.com/sigrokproject/libserialport.git
+[submodule "third-party/libftdi"]
+	path = third-party/libftdi
+	url = https://github.com/jsm174/libftdi.git

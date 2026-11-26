@@ -1,0 +1,19 @@
+name: conditions and events
+row: (S1=1 and S2=1),(L3=1 or W4=1) I24,E101,E102 Blink 400
+S 1 1
+wait 100
+S 2 1
+wait 100
+L 3 1
+E 101 1
+wait 100
+S 1 0
+L 3 0
+W 4 1
+E 101 0
+E 102 1
+wait 100
+wait 200
+W 4 0
+E 102 0
+wait 150

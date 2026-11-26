@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<TargetFramework>net10.0</TargetFramework>
+		<IsTestProject>true</IsTestProject>
+		<IsPackable>false</IsPackable>
+		<Nullable>disable</Nullable>
+		<!-- The native library under test: what the build scripts deployed into the Unity package. -->
+		<VpeDofRid Condition="'$(VpeDofRid)' == '' And $([MSBuild]::IsOSPlatform('Windows'))">win-x64</VpeDofRid>
+		<VpeDofRid Condition="'$(VpeDofRid)' == '' And $([MSBuild]::IsOSPlatform('Linux'))">linux-x64</VpeDofRid>
+		<VpeDofRid Condition="'$(VpeDofRid)' == '' And $([MSBuild]::IsOSPlatform('OSX'))">osx</VpeDofRid>
+		<VpeDofNativeDir Condition="'$(VpeDofNativeDir)' == ''">$(MSBuildThisFileDirectory)../VisualPinball.Engine.DOF.Unity/Plugins/$(VpeDofRid)</VpeDofNativeDir>
+	</PropertyGroup>
+	<ItemGroup>
+		<ProjectReference Include="../VisualPinball.Engine.DOF/VisualPinball.Engine.DOF.csproj" />
+		<PackageReference Include="NUnit" Version="3.13.3" />
+		<PackageReference Include="NUnit3TestAdapter" Version="4.2.1" />
+		<PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+	</ItemGroup>
+	<ItemGroup>
+		<None Include="$(VpeDofNativeDir)/VpeDof.dll" Condition="Exists('$(VpeDofNativeDir)/VpeDof.dll')" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+		<None Include="$(VpeDofNativeDir)/libVpeDof.so" Condition="Exists('$(VpeDofNativeDir)/libVpeDof.so')" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+		<None Include="$(VpeDofNativeDir)/libVpeDof.dylib" Condition="Exists('$(VpeDofNativeDir)/libVpeDof.dylib')" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+	</ItemGroup>
+</Project>

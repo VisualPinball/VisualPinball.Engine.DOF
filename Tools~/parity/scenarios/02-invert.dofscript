@@ -1,0 +1,12 @@
+name: inverted effects
+row: S3 Invert,S3,S6 Invert NoBool
+S 3 1
+wait 150
+S 3 0
+wait 150
+S 3 1
+S 6 1
+wait 150
+S 6 0
+S 3 0
+wait 150

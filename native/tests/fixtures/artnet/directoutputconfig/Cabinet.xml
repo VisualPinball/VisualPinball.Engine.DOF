@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Cabinet>
+  <Name>Art-Net loopback</Name>
+  <AutoConfigEnabled>false</AutoConfigEnabled>
+  <OutputControllers>
+    <ArtNet>
+      <Name>ArtNet0</Name>
+      <Universe>0</Universe>
+      <BroadcastAddress>127.0.0.1</BroadcastAddress>
+    </ArtNet>
+  </OutputControllers>
+  <Toys>
+    <LedWizEquivalent>
+      <Name>LedWizEquivalent 1</Name>
+      <LedWizNumber>1</LedWizNumber>
+      <Outputs>
+        <LedWizEquivalentOutput><OutputName>ArtNet0.01</OutputName><LedWizEquivalentOutputNumber>1</LedWizEquivalentOutputNumber></LedWizEquivalentOutput>
+        <LedWizEquivalentOutput><OutputName>ArtNet0.02</OutputName><LedWizEquivalentOutputNumber>2</LedWizEquivalentOutputNumber></LedWizEquivalentOutput>
+        <LedWizEquivalentOutput><OutputName>ArtNet0.03</OutputName><LedWizEquivalentOutputNumber>3</LedWizEquivalentOutputNumber></LedWizEquivalentOutput>
+        <LedWizEquivalentOutput><OutputName>ArtNet0.04</OutputName><LedWizEquivalentOutputNumber>4</LedWizEquivalentOutputNumber></LedWizEquivalentOutput>
+        <LedWizEquivalentOutput><OutputName>ArtNet0.05</OutputName><LedWizEquivalentOutputNumber>5</LedWizEquivalentOutputNumber></LedWizEquivalentOutput>
+        <LedWizEquivalentOutput><OutputName>ArtNet0.06</OutputName><LedWizEquivalentOutputNumber>6</LedWizEquivalentOutputNumber></LedWizEquivalentOutput>
+        <LedWizEquivalentOutput><OutputName>ArtNet0.07</OutputName><LedWizEquivalentOutputNumber>7</LedWizEquivalentOutputNumber></LedWizEquivalentOutput>
+        <LedWizEquivalentOutput><OutputName>ArtNet0.08</OutputName><LedWizEquivalentOutputNumber>8</LedWizEquivalentOutputNumber></LedWizEquivalentOutput>
+      </Outputs>
+    </LedWizEquivalent>
+  </Toys>
+</Cabinet>
