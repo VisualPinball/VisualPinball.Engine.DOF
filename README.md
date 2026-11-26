@@ -19,17 +19,19 @@ Get the submodules first:
 git submodule update --init --recursive
 ```
 
-On Windows, with Visual Studio 2022 and CMake 3.24 or newer, build the native library from a command prompt or PowerShell. This also runs the native smoke test and copies `VpeDof.dll` to `VisualPinball.Engine.DOF.Unity/Plugins/win-x64`:
+On Windows, with Visual Studio 2022 or newer and CMake 3.24 or newer (Visual Studio 2026 needs CMake 4.2 or newer), build the native library from a command prompt or PowerShell. It uses the newest Visual Studio installed. This also runs the native smoke test and copies `VpeDof.dll` to `VisualPinball.Engine.DOF.Unity/Plugins/win-x64`:
 
 ```bash
 native\build-windows.cmd
 ```
 
-On Linux and macOS, configure and build with CMake directly:
+On Linux (CMake 3.24 or newer, a C++20 compiler, git, pkg-config and `libudev-dev`) and macOS (CMake 3.24 or newer and the Xcode command-line tools), the scripts do the same and copy the library to `Plugins/linux-x64` or `Plugins/osx`. The macOS library contains arm64 and x86_64 and runs on macOS 12.0 and newer. `BUILD_DIR` overrides the build folder.
+
+The native libraries are not in git, and neither are their Unity import settings: Unity deletes a `.meta` in a package whose library is missing. The builds copy them from `native/unity`, where they are kept with fixed GUIDs, together with the library.
 
 ```bash
-cmake -S native -B build/<rid> -DCMAKE_BUILD_TYPE=Release -DVPE_DOF_OUTPUT_DIR=$PWD/VisualPinball.Engine.DOF.Unity/Plugins/<rid>
-cmake --build build/<rid> --parallel
+bash native/build-linux.sh
+bash native/build-macos.sh
 ```
 
 Then build the managed library, which copies itself to `Plugins/Managed`, and run the tests:
@@ -40,6 +42,26 @@ dotnet test VisualPinball.Engine.DOF.Test -c Release
 ```
 
 The tests listen on UDP port 6454 on 127.0.0.1 and never open real devices.
+
+`VpeDof` is loaded once and stays loaded until the process exits, as Unity does with every native plugin: it is not made to be unloaded. The GCC runtime it links statically on Linux keeps an emergency exception pool, and the file confinement keeps a thread-local root on every thread that read a file; `dlclose` frees neither, so loading and unloading it repeatedly leaks. A host that wants a fresh libdof calls `vpe_dof_destroy` and creates a new instance instead.
+
+## Releases
+
+The [build workflow](.github/workflows/build.yml) builds and tests every platform: Windows x64 with MSVC and the static CRT, Linux x64 in an Ubuntu 22.04 container (glibc 2.35, libstdc++ linked statically) and macOS 12.0 for arm64 and x86_64. Each job uploads its `Plugins/<rid>` and `Plugins/Managed`. A pushed `v*` tag drafts a release with those, the licence texts and the source archive. The checks it runs can be run locally:
+
+- `native/release-check.py <library>` checks that `VpeDof` exports exactly the functions `native/include/vpe_dof.h` declares and imports only system libraries, and with `--unity-meta` that its import settings are next to it (on Linux also the newest glibc it needs, on macOS its architectures and minimum version).
+- `native/tests/load-with-dmd.py <library> <DMD package>/Plugins/<rid>` loads every native library in the DMD package's folder (libusb, libserialport, ZeDMD, Serum, sockpp and the others it ships) and `VpeDof` into one process, in both orders, and calls into each. All of them must load.
+- `native/source-archive.py` writes the complete corresponding source of a commit: the repository with the submodules at their pinned revisions, the patches and the build scripts. Licences are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
+## Using DOF in VPE
+
+DOF runs in the VPE player as a plugin. The [VPE documentation](https://docs.visualpinball.org) (Plugins, DOF) explains how to import a configuration from the [DOF Config Tool](https://configtool.vpuniverse.com) or an existing DOF installation, the device permissions on Linux and macOS, and the settings. In short:
+
+- Download your configuration zip from the Config Tool with your browser and import it on the DOF settings page. The player never contacts the Config Tool itself. An existing configuration folder (DOF on Windows, or VPX's `directoutputconfig`) can be imported as well.
+- On Linux, the user running the player needs access to the controllers' `hidraw` and USB devices (a udev rule) and to the serial ports (the `dialout` group). On macOS, only elevated processes can open Pinscape Pico's feedback interface, and HID boards are opened by one program at a time. On Windows, FT245R boards need the WinUSB driver.
+- Close other DOF hosts (DOFLinx, a frontend with DOF enabled, VPX) before starting a game: a controller can only be driven by one program at a time.
+
+Table authors add a `DofTriggerComponent` (*DOF Triggers*) to send DOF's numbered (`E`) and named (`$name`) events from the table's switches, coils and lamps, as VPX tables do from their scripts, and set the DOF game name of a table without a ROM, so the Config Tool's rows for it apply. The player tries the ROM first and the declared name after it.
 
 ## What the patches change
 
@@ -53,4 +75,4 @@ libdof is used as upstream has it, except for what `native/patches/0001-vpe-libd
 
 ## License
 
-GPLv3 or later, like libdof. See [LICENSE](LICENSE).
+GPLv3 or later, like libdof. See [LICENSE](LICENSE), and [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the libraries `VpeDof` contains.

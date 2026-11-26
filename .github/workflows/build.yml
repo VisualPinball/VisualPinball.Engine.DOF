@@ -1,0 +1,272 @@
+# Builds VpeDof and the managed library for every platform, runs the tests and the release checks, and uploads
+# the Unity package's Plugins folder per platform. A pushed tag (v1.2.3) also drafts a GitHub release with the
+# plugins, the licence texts and the complete corresponding source (submodules at their pinned revisions).
+#
+# Artifacts, each laid out like VisualPinball.Engine.DOF.Unity/Plugins (download them all into that folder):
+#   VpeDof-win-x64     win-x64/VpeDof.dll, Managed/VisualPinball.Engine.DOF.dll
+#   VpeDof-linux-x64   linux-x64/libVpeDof.so, Managed/...
+#   VpeDof-osx         osx/libVpeDof.dylib (arm64 and x86_64), Managed/...
+#   VpeDof-source      VisualPinball.Engine.DOF-<version>-source.tar.gz
+#
+# Minimum systems:
+#   Windows   x64, MSVC (the runner's newest Visual Studio) with the static CRT: no runtime DLLs besides the system's.
+#   Linux     glibc 2.35 (Ubuntu 22.04, the oldest Linux Unity 6's editor supports; the player itself needs
+#             2.39). Built in an ubuntu:22.04 container rather than on a 22.04 runner, so the baseline does not
+#             move when GitHub retires runner images. libstdc++ and libgcc are linked statically.
+#   macOS     12.0, arm64 and x86_64 in one library.
+
+name: Build
+
+on:
+  push:
+    branches: [ master, 'feat/**', 'fix/**' ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  windows:
+    # native/build-windows.cmd uses the newest Visual Studio installed
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build VpeDof
+        shell: cmd
+        run: native\build-windows.cmd
+
+      - name: Release checks
+        run: python native/release-check.py VisualPinball.Engine.DOF.Unity/Plugins/win-x64/VpeDof.dll --unity-meta
+
+      - name: Build the managed library
+        run: dotnet build VisualPinball.Engine.DOF -c Release
+
+      - name: Test
+        run: dotnet test VisualPinball.Engine.DOF.Test -c Release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VpeDof-win-x64
+          path: |
+            VisualPinball.Engine.DOF.Unity/Plugins/win-x64/VpeDof.dll
+            VisualPinball.Engine.DOF.Unity/Plugins/win-x64/VpeDof.dll.meta
+            VisualPinball.Engine.DOF.Unity/Plugins/win-x64.meta
+            VisualPinball.Engine.DOF.Unity/Plugins/Managed/VisualPinball.Engine.DOF.dll
+            VisualPinball.Engine.DOF.Unity/Plugins/Managed/VisualPinball.Engine.DOF.dll.meta
+            VisualPinball.Engine.DOF.Unity/Plugins/Managed.meta
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    steps:
+      # before the checkout, which needs git for the submodules; CMake from PyPI, since 22.04's is older than 3.24
+      - name: Install the build tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential git ca-certificates curl python3 python3-pip \
+            pkg-config ninja-build libudev-dev libicu70 libssl3
+          python3 -m pip install --no-cache-dir 'cmake>=3.24,<4'
+          cmake --version
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build VpeDof
+        run: bash native/build-linux.sh
+
+      - name: Release checks
+        run: python3 native/release-check.py VisualPinball.Engine.DOF.Unity/Plugins/linux-x64/libVpeDof.so --max-glibc 2.35 --unity-meta
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build the managed library
+        run: dotnet build VisualPinball.Engine.DOF -c Release
+
+      - name: Test
+        run: dotnet test VisualPinball.Engine.DOF.Test -c Release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VpeDof-linux-x64
+          path: |
+            VisualPinball.Engine.DOF.Unity/Plugins/linux-x64/libVpeDof.so
+            VisualPinball.Engine.DOF.Unity/Plugins/linux-x64/libVpeDof.so.meta
+            VisualPinball.Engine.DOF.Unity/Plugins/linux-x64.meta
+            VisualPinball.Engine.DOF.Unity/Plugins/Managed/VisualPinball.Engine.DOF.dll
+            VisualPinball.Engine.DOF.Unity/Plugins/Managed/VisualPinball.Engine.DOF.dll.meta
+            VisualPinball.Engine.DOF.Unity/Plugins/Managed.meta
+          if-no-files-found: error
+
+  macos:
+    # arm64; the build script also runs the smoke test as x86_64 where Rosetta is installed
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build VpeDof
+        run: bash native/build-macos.sh
+
+      - name: Release checks
+        run: python3 native/release-check.py VisualPinball.Engine.DOF.Unity/Plugins/osx/libVpeDof.dylib --archs arm64,x86_64 --min-macos 12.0 --unity-meta
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build the managed library
+        run: dotnet build VisualPinball.Engine.DOF -c Release
+
+      - name: Test
+        run: dotnet test VisualPinball.Engine.DOF.Test -c Release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VpeDof-osx
+          path: |
+            VisualPinball.Engine.DOF.Unity/Plugins/osx/libVpeDof.dylib
+            VisualPinball.Engine.DOF.Unity/Plugins/osx/libVpeDof.dylib.meta
+            VisualPinball.Engine.DOF.Unity/Plugins/osx.meta
+            VisualPinball.Engine.DOF.Unity/Plugins/Managed/VisualPinball.Engine.DOF.dll
+            VisualPinball.Engine.DOF.Unity/Plugins/Managed/VisualPinball.Engine.DOF.dll.meta
+            VisualPinball.Engine.DOF.Unity/Plugins/Managed.meta
+          if-no-files-found: error
+
+  # DMD ships its own libusb and libserialport: load them and VpeDof into one process, in both orders
+  dmd:
+    needs: [ windows, linux, macos ]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: VpeDof-win-x64
+            library: win-x64/VpeDof.dll
+            dmd-rid: win-x64
+            python: python
+          # the DMD package's Linux libraries need glibc 2.38 or newer
+          - os: ubuntu-24.04
+            artifact: VpeDof-linux-x64
+            library: linux-x64/libVpeDof.so
+            dmd-rid: linux-x64
+            python: python3
+          - os: macos-15
+            artifact: VpeDof-osx
+            library: osx/libVpeDof.dylib
+            dmd-rid: osx-arm64
+            python: python3
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: VisualPinball/VisualPinball.Engine.DMD
+          path: dmd
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: VisualPinball.Engine.DOF.Unity/Plugins
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      # deploys LibDmd's natives from NuGet to the DMD package's Plugins/<rid>
+      - name: Build DMD
+        run: dotnet build dmd/VisualPinball.Engine.DMD/VisualPinball.Engine.DMD.csproj -c Release -r ${{ matrix.dmd-rid }}
+
+      - name: Load DMD and DOF together
+        run: ${{ matrix.python }} native/tests/load-with-dmd.py VisualPinball.Engine.DOF.Unity/Plugins/${{ matrix.library }} dmd/VisualPinball.Engine.DMD.Unity/Plugins/${{ matrix.dmd-rid }}
+
+  source:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # the tags, for the version in the archive's name
+          fetch-depth: 0
+
+      - name: Write the source archive
+        run: python3 native/source-archive.py --output dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VpeDof-source
+          path: dist/*-source.tar.gz
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ windows, linux, macos, dmd, source ]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      # for the licence texts
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p licenses dist
+          cp LICENSE licenses/VpeDof-GPL-3.0.txt
+          cp third-party/libdof/LICENSE licenses/libdof-LICENSE.txt
+          cp third-party/hidapi/LICENSE.txt licenses/hidapi-LICENSE.txt
+          cp third-party/hidapi/LICENSE-bsd.txt licenses/hidapi-LICENSE-bsd.txt
+          cp third-party/libusb/COPYING licenses/libusb-COPYING.txt
+          cp third-party/libserialport/COPYING licenses/libserialport-COPYING.txt
+          cp third-party/libftdi/LICENSE licenses/libftdi-LICENSE.txt
+          cp third-party/libftdi/COPYING.LIB licenses/libftdi-COPYING.LIB.txt
+          for rid in win-x64 linux-x64 osx; do
+            folder="$RUNNER_TEMP/VpeDof-$rid"
+            mkdir -p "$folder/Plugins"
+            cp -R "artifacts/VpeDof-$rid/." "$folder/Plugins/"
+            cp -R LICENSE THIRD-PARTY-NOTICES.md licenses "$folder/"
+            (cd "$folder" && zip -qr "$GITHUB_WORKSPACE/dist/VpeDof-$GITHUB_REF_NAME-$rid.zip" .)
+          done
+          cp artifacts/VpeDof-source/*-source.tar.gz dist/
+          ls -l dist
+
+      # a draft, published by hand; a rerun replaces the draft's files of the same name, never a published release's
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if draft=$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2> /dev/null); then
+            if [ "$draft" != "true" ]; then
+              echo "::error::Release $GITHUB_REF_NAME is already published; its files are not replaced."
+              exit 1
+            fi
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --draft --title "$GITHUB_REF_NAME" \
+              --notes "VpeDof and the managed DOF library for Windows x64, Linux x64 (glibc 2.35) and macOS 12.0 (arm64 and x86_64). The source archive is the complete corresponding source of the binaries (GPLv3); see THIRD-PARTY-NOTICES.md."
+          fi

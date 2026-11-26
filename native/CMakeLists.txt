@@ -231,10 +231,17 @@ if(WIN32)
 	target_link_libraries(VpeDof PRIVATE ws2_32 setupapi cfgmgr32 hid)
 	set_target_properties(VpeDof PROPERTIES PREFIX "" OUTPUT_NAME "VpeDof")
 elseif(APPLE)
-	set_target_properties(VpeDof PROPERTIES OUTPUT_NAME "VpeDof" INSTALL_NAME_DIR "@rpath" BUILD_WITH_INSTALL_NAME_DIR ON)
+	set_target_properties(VpeDof PROPERTIES OUTPUT_NAME "VpeDof" INSTALL_NAME_DIR "@rpath" BUILD_WITH_INSTALL_NAME_DIR ON
+		LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vpe_dof.exp")
+	# only the C ABI: tinyxml2 and the hardware libraries mark their API visible themselves
+	target_link_options(VpeDof PRIVATE "LINKER:-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/cmake/vpe_dof.exp")
 else()
-	set_target_properties(VpeDof PROPERTIES OUTPUT_NAME "VpeDof")
-	target_link_options(VpeDof PRIVATE "-Wl,--exclude-libs,ALL" "-Wl,-z,defs")
+	set_target_properties(VpeDof PROPERTIES OUTPUT_NAME "VpeDof" LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vpe_dof.map")
+	# Only the C ABI is exported (the version script also hides the C++ template instantiations and tinyxml2's API).
+	# libstdc++ and libgcc are linked statically, so the library runs on distributions with an older libstdc++ than
+	# the build machine's and cannot clash with the one the host process loaded.
+	target_link_options(VpeDof PRIVATE "-Wl,--exclude-libs,ALL" "-Wl,-z,defs"
+		"-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cmake/vpe_dof.map" -static-libstdc++ -static-libgcc)
 endif()
 
 if(MSVC)
@@ -245,9 +252,23 @@ if(MSVC)
 endif()
 
 if(VPE_DOF_OUTPUT_DIR)
+	# The library's Unity import settings (unity/<rid>/<library>.meta, with fixed GUIDs, and the folder's) are copied
+	# with it, before it: the binaries are not in git, and Unity deletes a .meta in a package whose asset is missing,
+	# so the package keeps no .meta of its own for them.
+	if(WIN32)
+		set(_unity_rid "win-x64")
+	elseif(APPLE)
+		set(_unity_rid "osx")
+	else()
+		set(_unity_rid "linux-x64")
+	endif()
+	set(_unity_meta "${CMAKE_CURRENT_SOURCE_DIR}/unity")
+	get_filename_component(_output "${VPE_DOF_OUTPUT_DIR}" ABSOLUTE)
 	add_custom_command(TARGET VpeDof POST_BUILD
-		COMMAND "${CMAKE_COMMAND}" -E make_directory "${VPE_DOF_OUTPUT_DIR}"
-		COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:VpeDof>" "${VPE_DOF_OUTPUT_DIR}")
+		COMMAND "${CMAKE_COMMAND}" -E make_directory "${_output}"
+		COMMAND "${CMAKE_COMMAND}" -E copy "${_unity_meta}/${_unity_rid}.meta" "${_output}.meta"
+		COMMAND "${CMAKE_COMMAND}" -E copy "${_unity_meta}/${_unity_rid}/$<TARGET_FILE_NAME:VpeDof>.meta" "${_output}/"
+		COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:VpeDof>" "${_output}/")
 endif()
 
 if(VPE_DOF_BUILD_TESTS)

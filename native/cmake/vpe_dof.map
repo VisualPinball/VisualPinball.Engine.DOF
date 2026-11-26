@@ -1,0 +1,6 @@
+{
+	global:
+		vpe_dof_*;
+	local:
+		*;
+};

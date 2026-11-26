@@ -7,9 +7,16 @@ build/
 *.suo
 *.rsuser
 
-# Builds copy the binaries here; only their import settings are tracked.
+# Builds copy the binaries here; only the managed library's import settings are tracked. The native builds copy
+# the native libraries' import settings from native/unity with them, so Unity never finds a .meta without its library.
 VisualPinball.Engine.DOF.Unity/Plugins/**/*.dll
 VisualPinball.Engine.DOF.Unity/Plugins/**/*.pdb
 VisualPinball.Engine.DOF.Unity/Plugins/**/*.so
 VisualPinball.Engine.DOF.Unity/Plugins/**/*.dylib
 !VisualPinball.Engine.DOF.Unity/Plugins/**/*.meta
+VisualPinball.Engine.DOF.Unity/Plugins/win-x64/
+VisualPinball.Engine.DOF.Unity/Plugins/linux-x64/
+VisualPinball.Engine.DOF.Unity/Plugins/osx/
+VisualPinball.Engine.DOF.Unity/Plugins/win-x64.meta
+VisualPinball.Engine.DOF.Unity/Plugins/linux-x64.meta
+VisualPinball.Engine.DOF.Unity/Plugins/osx.meta
