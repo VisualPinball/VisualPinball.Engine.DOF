@@ -1,0 +1,11 @@
+{
+	"name": "VisualPinball.Engine.DOF.Player",
+	"rootNamespace": "VisualPinball.Engine.DOF.Player",
+	"references": [
+		"VisualPinball.Plugins",
+		"VisualPinball.Unity",
+		"VisualPinball.Engine.DOF.Unity",
+		"Newtonsoft.Json"
+	],
+	"autoReferenced": true
+}

@@ -1,0 +1,30 @@
+{
+	"name": "VisualPinball.Engine.DOF.Unity.Tests",
+	"rootNamespace": "VisualPinball.Engine.DOF.Unity.Tests",
+	"references": [
+		"VisualPinball.Engine.DOF.Unity",
+		"VisualPinball.Engine.DOF.Player",
+		"VisualPinball.Unity",
+		"VisualPinball.Engine",
+		"VisualPinball.Plugins",
+		"UnityEngine.TestRunner",
+		"UnityEditor.TestRunner"
+	],
+	"includePlatforms": [
+		"Editor"
+	],
+	"excludePlatforms": [],
+	"allowUnsafeCode": false,
+	"overrideReferences": true,
+	"precompiledReferences": [
+		"nunit.framework.dll",
+		"Newtonsoft.Json.dll",
+		"VisualPinball.Engine.DOF.dll"
+	],
+	"autoReferenced": false,
+	"defineConstraints": [
+		"UNITY_INCLUDE_TESTS"
+	],
+	"versionDefines": [],
+	"noEngineReferences": false
+}
