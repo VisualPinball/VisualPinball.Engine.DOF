@@ -505,6 +505,22 @@ VPE_DOF_API int64_t VPE_DOF_CALL vpe_dof_set_output_gate(vpe_dof* dof, int32_t o
 	}
 }
 
+VPE_DOF_API int64_t VPE_DOF_CALL vpe_dof_latch_output_gate(vpe_dof* dof)
+{
+	if (!dof)
+		return -1;
+	try
+	{
+		// The gate is process-wide and latches at once in every state, without DOF's main thread: the controllers'
+		// updaters send the closing. Init keeps it (the session began at create), and finish turns everything off anyway.
+		return DOF::OutputGate::Instance().Latch();
+	}
+	catch (...)
+	{
+		return -1;
+	}
+}
+
 VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_gate_state(vpe_dof* dof, int64_t generation, int32_t* confirmed, int32_t* pending, int32_t* failed)
 {
 	if (confirmed)

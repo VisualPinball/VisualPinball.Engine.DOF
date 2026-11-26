@@ -157,7 +157,10 @@ namespace VisualPinball.Engine.DOF
 			}
 		}
 
-		/// <summary>Queues a change of a named table element (<c>$name</c> in DOF configs, without the dollar sign).</summary>
+		/// <summary>
+		/// Queues a change of a named table element (<c>$name</c> in DOF configs, with or without the dollar sign). The
+		/// name always addresses a named element: "S1" is the element named S1, not solenoid 1.
+		/// </summary>
 		public void DataNamed(string name, int value)
 		{
 			if (string.IsNullOrEmpty(name)) {
@@ -165,9 +168,15 @@ namespace VisualPinball.Engine.DOF
 			}
 			var handle = _handle;
 			if (handle != IntPtr.Zero) {
-				DofNative.DataNamed(handle, Utf8.Encode(name), value);
+				DofNative.DataNamed(handle, Utf8.Encode(NativeName(name)), value);
 			}
 		}
+
+		/// <summary>
+		/// The name as libdof's named path takes it. libdof reads a name that starts with an element type and a number
+		/// ("S1", "L12") as that element; with the dollar sign in front it is always a name.
+		/// </summary>
+		internal static string NativeName(string name) => name[0] == '$' ? name : "$" + name;
 
 		/// <summary>Table element changes queued but not processed by DOF's main thread yet.</summary>
 		public int PendingInput
@@ -197,6 +206,22 @@ namespace VisualPinball.Engine.DOF
 		{
 			var handle = _handle;
 			return handle == IntPtr.Zero ? -1 : DofNative.SetOutputGate(handle, open ? 1 : 0);
+		}
+
+		/// <summary>
+		/// Any thread, in any state until disposed: closes the output gate at once and latches it closed for the rest of
+		/// the instance. Openings that DOF's main thread has not applied yet, and every later one, apply as closings,
+		/// and their generations report the closed state. The closing reaches the controllers without waiting for DOF's
+		/// main thread: an idle updater checks the gate every 50 ms, its polling interval, which bounds how long it takes
+		/// to notice; a busy one sends it after the write in progress (a PacLed64 or PacUIO drops the rest of an
+		/// opening's update). Never blocks beyond a short internal lock and never allocates, so the simulation thread may
+		/// call it.
+		/// </summary>
+		/// <returns>The closing's generation, or -1 after <see cref="Dispose"/>.</returns>
+		public long LatchOutputGate()
+		{
+			var handle = _handle;
+			return handle == IntPtr.Zero ? -1 : DofNative.LatchOutputGate(handle);
 		}
 
 		public DofGateState GetGateState(long generation)

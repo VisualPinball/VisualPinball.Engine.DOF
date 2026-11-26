@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // Loads VpeDof through its C ABI and runs two sessions against a configuration folder (argument 1, default "."):
-// create, gate before init, init, describe, gate changes, finish, destroy. Exits non-zero on the first failure.
+// create, gate before init, init, describe, gate changes, gate latch, finish, destroy. Exits non-zero on the first failure.
 // Usage: vpe_dof_smoke [base path] [table file] [rom]
 
 #include <stdio.h>
@@ -63,6 +63,10 @@ static void RunSession(const char* basePath, const char* table, const char* rom)
 	vpe_dof_data(dof, 'S', 1, 1);
 	vpe_dof_data(dof, 'S', 1, 0);
 	vpe_dof_data_named(dof, "smoke", 1);
+
+	int64_t latched = vpe_dof_latch_output_gate(dof);
+	CHECK(latched > open, "gate latches closed");
+	CHECK(vpe_dof_set_output_gate(dof, 1) > latched, "an opening after the latch still gets a generation");
 
 	result = vpe_dof_finish(dof, error, (int32_t)sizeof(error));
 	CHECK(result == VPE_DOF_OK, error[0] ? error : "finish");

@@ -1,0 +1,225 @@
+// Visual Pinball Engine
+// Copyright (C) 2026 freezy and VPE Team
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+using System;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using NUnit.Framework;
+using VisualPinball.Engine.DOF.Configuration;
+using VisualPinball.Engine.DOF.Session;
+
+namespace VisualPinball.Engine.DOF.Test
+{
+	/// <summary>
+	/// An imported configuration run by a session on the real native library, against an Art-Net cabinet on localhost.
+	/// </summary>
+	[TestFixture, NonParallelizable]
+	public class DofSessionIntegrationTests
+	{
+		private const int Game = 3;
+		private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(5);
+
+		private ArtNetCapture _capture;
+		private string _dir;
+
+		[OneTimeSetUp]
+		public void SetUpCapture()
+		{
+			DofLibrary.EnsureCompatible();
+			_capture = new ArtNetCapture();
+		}
+
+		[OneTimeTearDown]
+		public void TearDownCapture() => _capture?.Dispose();
+
+		[SetUp]
+		public void SetUp()
+		{
+			_dir = Path.Combine(Path.GetTempPath(), "vpe-dof-session", Guid.NewGuid().ToString("N"));
+			Directory.CreateDirectory(_dir);
+		}
+
+		[TearDown]
+		public void TearDown()
+		{
+			try {
+				Directory.Delete(_dir, true);
+			} catch (IOException) {
+			} catch (UnauthorizedAccessException) {
+			}
+		}
+
+		private static T Wait<T>(Task<T> task)
+		{
+			Assert.That(task.Wait(Timeout), Is.True, "timed out");
+			return task.Result;
+		}
+
+		private void Expect(int universe, Func<byte[], bool> match, string what, int after = 0)
+		{
+			if (_capture.WaitFor(universe, match, after) == null) {
+				var latest = _capture.Latest(universe);
+				Assert.Fail($"{what}: no matching frame on universe {universe}; last: {(latest == null ? "none" : string.Join(",", latest.Take(8)))}");
+			}
+		}
+
+		/// <summary>Imports an Art-Net cabinet on one universe and a row for the ROM, the way the player does.</summary>
+		private DofRevisionLease Import(int universe, string row) => Import(_dir, universe, row);
+
+		private static DofRevisionLease Import(string dir, int universe, string row)
+		{
+			var source = Path.Combine(dir, "source");
+			Directory.CreateDirectory(source);
+			File.WriteAllText(Path.Combine(source, "Cabinet.xml"), "<?xml version=\"1.0\"?>\r\n<Cabinet><Name>Test</Name><AutoConfigEnabled>false</AutoConfigEnabled>"
+				+ $"<OutputControllers><ArtNet><Name>ArtNet 1</Name><Universe>{universe}</Universe><BroadcastAddress>127.0.0.1</BroadcastAddress></ArtNet></OutputControllers>"
+				+ "<Toys><LedWizEquivalent><Name>LedWizEquivalent 1</Name><LedWizNumber>1</LedWizNumber><Outputs>"
+				+ string.Concat(Enumerable.Range(1, 8).Select(p => $"<LedWizEquivalentOutput><OutputName>ArtNet 1.{p:00}</OutputName><LedWizEquivalentOutputNumber>{p}</LedWizEquivalentOutputNumber></LedWizEquivalentOutput>"))
+				+ "</Outputs></LedWizEquivalent></Toys></Cabinet>\r\n");
+			File.WriteAllText(Path.Combine(source, "directoutputconfig.ini"), TestConfig.IniText(row));
+			var store = new DofConfigStore(Path.Combine(dir, "store"));
+			var report = new DofImporter(store).Import(source);
+			Assert.That(report.Accepted, Is.True, report.ToString());
+			return store.Acquire();
+		}
+
+		private static DofSession Session(DofRevision revision, bool waitForSnapshot = true) => new DofSession(new DofSessionOptions {
+			BasePath = revision.BasePath,
+			TableFile = revision.TableFileFor(null, "Test Table"),
+			RomName = "vpetest_l1",
+			GameSession = Game,
+			WaitForSnapshot = waitForSnapshot,
+		});
+
+		[Test]
+		public void NamedEventsDriveNamedElementsOnly()
+		{
+			const int universe = 302;
+			// Port 1 is solenoid 1, port 2 the element named knocker, port 3 the element named S1.
+			using var lease = Import(universe, "vpetest,S1,$knocker,$S1");
+			var session = Session(lease.Revision, false);
+			Assert.That(Wait(session.StartAsync()).Started, Is.True);
+			Expect(universe, f => true, "a frame");
+
+			session.PublishNamed("S1", 1);
+			Expect(universe, f => f[2] == 255, "the element named S1 shows");
+			session.PublishNamed("Knocker", 1);
+			Expect(universe, f => f[1] == 255, "the knocker shows");
+			session.PublishNamed("KNOCKER", 1);
+			session.PublishNamed("knocker", 0);
+			var mark = _capture.Count(universe);
+			Expect(universe, f => f[1] == 0, "the knocker goes off, however it is spelled", mark);
+			Assert.That(_capture.Frames(universe).All(f => f[0] == 0), Is.True, "\"S1\" as a name never drives solenoid 1");
+			Wait(session.StopAsync());
+		}
+
+		[Test]
+		public void RunsFromAFolderWithANonAsciiName()
+		{
+			const int universe = 303;
+			var dir = Path.Combine(_dir, "Jürgen");
+			Directory.CreateDirectory(dir);
+			var windows = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows);
+			if (windows) {
+				try {
+					DofPaths.ToNative(dir);
+				} catch (DofException) {
+					Assert.Ignore("This volume has no short (8.3) names, so libdof cannot open a non-ASCII folder on Windows.");
+				}
+			}
+			using var lease = Import(dir, universe, "vpetest,S1");
+			if (windows) {
+				var global = System.Xml.Linq.XDocument.Load(lease.Revision.GlobalConfigFile).Root;
+				Assert.That(DofPaths.IsAscii(global.Element("CabinetConfigFilePattern").Value), Is.True, "libdof opens files through the ANSI API on Windows");
+				Assert.That(DofPaths.IsAscii(global.Element("IniFilesPath").Value), Is.True);
+			}
+			var session = Session(lease.Revision, false);
+			var started = Wait(session.StartAsync());
+			Assert.That(started.Started, Is.True, started.Error);
+			Assert.That(started.Cabinet.Controllers.Select(c => c.Name), Is.EqualTo(new[] { "ArtNet 1" }), "the explicit cabinet, not auto-configuration");
+			session.Publish(Game, DofElementKind.Solenoid, 1, 255);
+			Expect(universe, f => f[0] == 255, "the outputs work");
+			Wait(session.StopAsync());
+		}
+
+		[Test]
+		public void RunsAGameFromSnapshotToStop()
+		{
+			const int universe = 300;
+			using var lease = Import(universe, "vpetest,S1,L2 I#80,W3");
+			var session = Session(lease.Revision);
+
+			// The snapshot arrives before DOF runs; the outputs stay dark until its boundary.
+			session.Publish(Game, DofElementKind.Solenoid, 1, 255);
+			var started = Wait(session.StartAsync());
+			Assert.That(started.Started, Is.True, started.Error);
+			Assert.That(started.Cabinet.Controllers.Select(c => c.Name), Is.EqualTo(new[] { "ArtNet 1" }));
+			Expect(universe, f => true, "a frame");
+			Thread.Sleep(100);
+			Assert.That(_capture.Frames(universe).All(f => f.Take(8).All(v => v == 0)), Is.True, "dark until the snapshot is in");
+
+			session.PublishSnapshotBoundary(Game);
+			Expect(universe, f => f[0] == 255, "the snapshot shows");
+			session.Publish(Game, DofElementKind.Lamp, 2, 1);
+			session.Publish(Game, DofElementKind.Switch, 3, 1);
+			Expect(universe, f => f[0] == 255 && f[1] == 128 && f[2] == 255, "changes show");
+
+			var paused = Wait(session.PauseAsync());
+			Assert.That(paused.Settled, Is.True, paused.ToString());
+			var mark = _capture.Count(universe);
+			Expect(universe, f => f.Take(8).All(v => v == 0), "pause darkens", mark);
+			session.Publish(Game, DofElementKind.Solenoid, 1, 0);
+
+			var resumed = Wait(session.ResumeAsync());
+			Assert.That(resumed.Settled, Is.True, resumed.ToString());
+			mark = _capture.Count(universe);
+			Expect(universe, f => f[0] == 0 && f[1] == 128 && f[2] == 255, "resume shows the current state", mark);
+
+			var stopped = Wait(session.StopAsync());
+			Assert.That((stopped.Completed, stopped.Gate.Settled, stopped.Error), Is.EqualTo((true, true, (string)null)));
+			Assert.That(_capture.Latest(universe).Take(8), Is.All.EqualTo((byte)0), "stop turns everything off");
+			Assert.That(session.Diagnostics.Delivered, Is.EqualTo(4));
+		}
+
+		[Test]
+		public void ASecondGameStartsAfterTheFirstCompleted()
+		{
+			const int universe = 301;
+			using var lease = Import(universe, "vpetest,S1");
+			var first = Session(lease.Revision);
+			Wait(first.StartAsync());
+			Wait(first.StopAsync());
+			Assert.That(first.Completion.IsCompleted, Is.True);
+
+			var second = Session(lease.Revision);
+			var started = Wait(second.StartAsync());
+			Assert.That(started.Started, Is.True, started.Error);
+			second.PublishSnapshotBoundary(Game);
+			second.Publish(Game, DofElementKind.Solenoid, 1, 255);
+			Expect(universe, f => f[0] == 255, "the second game drives the outputs", _capture.Count(universe));
+			Wait(second.StopAsync());
+		}
+
+		[Test]
+		public void ImportsARealConfigToolZip()
+		{
+			// Opt-in: a Config Tool download is personal (it carries the user's account details), so it is not part of
+			// the repository. Set VPE_DOF_SAMPLE_ZIP to its path to run this.
+			var zip = Environment.GetEnvironmentVariable("VPE_DOF_SAMPLE_ZIP");
+			if (string.IsNullOrEmpty(zip) || !File.Exists(zip)) {
+				Assert.Ignore("VPE_DOF_SAMPLE_ZIP is not set.");
+			}
+			var store = new DofConfigStore(Path.Combine(_dir, "store"));
+			var report = new DofImporter(store).Import(zip);
+			TestContext.Out.WriteLine(report.ToString());
+			Assert.That(report.Accepted, Is.True, report.ToString());
+			var catalog = DofCatalog.Load(store.Active);
+			Assert.That(catalog.Rows, Is.Not.Empty);
+			Assert.That(catalog.Devices.All(d => d.Ports.Count > 0), Is.True, "the Config Tool header names the ports");
+			TestContext.Out.WriteLine($"{catalog.Rows.Count} rows, {catalog.TableMappings.Count} table mappings, devices {string.Join(", ", catalog.Devices.Select(d => d.Number))}");
+		}
+	}
+}

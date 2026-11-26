@@ -98,7 +98,7 @@ namespace VisualPinball.Engine.DOF.Test
 		[Test]
 		public void ReportsAbiAndLibdofVersion()
 		{
-			Assert.That(DofLibrary.NativeAbiVersion, Is.EqualTo(1));
+			Assert.That(DofLibrary.NativeAbiVersion, Is.EqualTo(2));
 			Assert.That(DofLibrary.LibdofVersion, Does.Match(@"^\d+\.\d+\.\d+"));
 		}
 
@@ -217,6 +217,64 @@ namespace VisualPinball.Engine.DOF.Test
 			Assert.That(WaitSettled(dof, open).Written, Is.EqualTo(1));
 			Expect(unit.Universe, f => f[0] == 255 && f[1] == 128 && f[2] == 255 && f[3] == 0, "opening restores the current state", mark);
 			dof.Finish();
+		}
+
+		[Test]
+		public void LatchedGateTurnsOpeningsIntoClosings()
+		{
+			var unit = Unit("ArtNetA");
+			using (var config = StandardConfig(unit))
+			using (var dof = Start(config, closed: true)) {
+				dof.Data('S', 1, 1);
+				dof.Data('S', 3, 1);
+				dof.Data('S', 3, 0);
+				Expect(unit.Universe, f => true, "the closed gate sends zeros");
+
+				// An opening still queued for DOF's main thread when the latch comes applies as a closing, and so does
+				// every later one: the outputs never show the effects' state again.
+				var open = dof.SetOutputGate(true);
+				var latched = dof.LatchOutputGate();
+				Assert.That(latched, Is.GreaterThan(open));
+				var state = WaitSettled(dof, latched);
+				Assert.That((state.Applied, state.Written), Is.EqualTo((true, 1)), "the latch reaches the unit");
+				var mark = _capture.Count(unit.Universe);
+				var later = dof.SetOutputGate(true);
+				Assert.That(later, Is.GreaterThan(latched));
+				Assert.That(WaitSettled(dof, later).Written, Is.EqualTo(1), "a later opening confirms the closed state");
+				dof.Data('S', 2, 1);
+				Thread.Sleep(300);
+				var after = _capture.Frames(unit.Universe).Skip(mark).ToList();
+				Assert.That(after, Is.Not.Empty);
+				Assert.That(after.All(f => f.Take(8).All(v => v == 0)), Is.True, "nothing opens a latched gate");
+				dof.Finish();
+			}
+
+			// The latch lasts as long as its instance: the next one opens.
+			var next = Unit("ArtNetNext");
+			using (var config = StandardConfig(next))
+			using (var dof = Start(config)) {
+				dof.Data('S', 1, 1);
+				Expect(next.Universe, f => f[0] == 255, "a new instance starts unlatched");
+				dof.Finish();
+			}
+		}
+
+		[Test]
+		public void LatchAppliesBeforeInit()
+		{
+			var unit = Unit("ArtNetA");
+			using var config = StandardConfig(unit);
+			using var dof = DofInstance.Create(config.Root);
+			Assert.That(dof.LatchOutputGate(), Is.GreaterThan(0));
+			dof.Init(config.TableFile, "vpetest");
+			dof.SetOutputGate(true);
+			dof.Data('S', 1, 1);
+			Expect(unit.Universe, f => true, "frames");
+			Thread.Sleep(300);
+			Assert.That(_capture.Frames(unit.Universe).All(f => f.Take(8).All(v => v == 0)), Is.True, "init keeps the latch");
+			dof.Finish();
+			dof.Dispose();
+			Assert.That(dof.LatchOutputGate(), Is.EqualTo(-1), "no instance after dispose");
 		}
 
 		[Test]

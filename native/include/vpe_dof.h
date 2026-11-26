@@ -32,7 +32,7 @@ extern "C" {
 #endif
 
 /// Version of this ABI. Bumped on every incompatible change; the managed binding refuses a library with another one.
-#define VPE_DOF_ABI_VERSION 1
+#define VPE_DOF_ABI_VERSION 2
 
 enum vpe_dof_status
 {
@@ -90,8 +90,17 @@ VPE_DOF_API void VPE_DOF_CALL vpe_dof_destroy(vpe_dof* dof);
 /// so a session can start closed; after init it runs on DOF's main thread and returns at once. Returns the gate
 /// generation, which vpe_dof_gate_state reports against, or -1 while init or finish runs and after finish. It never
 /// waits for DOF's main thread or a device; it only takes short internal locks. A change queued before finish is still
-/// applied. The gate opens with every new instance.
+/// applied. The gate opens with every new instance; after vpe_dof_latch_output_gate an opening applies as a closing.
 VPE_DOF_API int64_t VPE_DOF_CALL vpe_dof_set_output_gate(vpe_dof* dof, int32_t open);
+/// Closes the output gate at once, from any thread and in any state, and latches it closed for the rest of the
+/// instance: openings queued for DOF's main thread and not applied yet, and every later one, apply as closings, and
+/// their generations report the closed state. The closing is published to the controllers at once and every
+/// controller's updater sends it without DOF's main thread: an idle updater checks the gate every 50 ms, its polling
+/// interval, which bounds how long it takes to notice; a busy one sends it after the write in progress (a PacLed64
+/// or PacUIO drops the rest of an opening's update). Returns the closing's generation, or -1 if `dof` is NULL. Safe to call
+/// from a realtime thread: it never waits beyond a short internal lock and never allocates (the closing's history entry
+/// is storage the other gate calls reserve or, once that ran out, the oldest entry's).
+VPE_DOF_API int64_t VPE_DOF_CALL vpe_dof_latch_output_gate(vpe_dof* dof);
 /// Reports a gate change: 0 until DOF's main thread applied it, then 1, or 2 if a later change set the other state
 /// while some unit had not confirmed this one. Also how many controller units confirmed the state: a transfer to their
 /// device carried it or a later change to the same state, or, for a unit DOF never used, the gate is open and DOF
