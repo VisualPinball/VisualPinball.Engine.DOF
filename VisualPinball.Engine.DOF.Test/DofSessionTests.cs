@@ -102,6 +102,58 @@ namespace VisualPinball.Engine.DOF.Test
 		}
 
 		[Test]
+		public void PulsesFromSeveralThreadsKeepBothEdges()
+		{
+			const int pulses = 500;
+			var (session, native) = Create();
+			Wait(session.StartAsync());
+			using (var start = new Barrier(3)) {
+				var threads = new[] {
+					new Thread(() => { start.SignalAndWait(); for (var i = 0; i < pulses; i++) session.PulseEvent(101); }),
+					new Thread(() => { start.SignalAndWait(); for (var i = 0; i < pulses; i++) session.PulseEvent(101); }),
+					new Thread(() => { start.SignalAndWait(); for (var i = 0; i < pulses; i++) session.PulseNamed("Knocker"); }),
+				};
+				foreach (var thread in threads) {
+					thread.Start();
+				}
+				foreach (var thread in threads) {
+					thread.Join();
+				}
+			}
+			// Two values each: interleaved, 1, 1, 0, 0 would be one pulse in DOF.
+			WaitUntil(() => native.Changes.Count == 3 * pulses * 2, "every edge");
+			var events = native.Changes.Where(c => c.StartsWith("E101=")).ToList();
+			var named = native.Changes.Where(c => c.StartsWith("$Knocker=")).ToList();
+			Assert.That(events.Count, Is.EqualTo(2 * pulses * 2));
+			Assert.That(events.Where((change, i) => change != (i % 2 == 0 ? "E101=1" : "E101=0")), Is.Empty, "on and off of each pulse back to back");
+			Assert.That(named.Where((change, i) => change != (i % 2 == 0 ? "$Knocker=1" : "$Knocker=0")), Is.Empty);
+			Wait(session.StopAsync());
+		}
+
+		[Test]
+		public void APulseDuringAPauseReachesDofBeforeTheGateOpens()
+		{
+			var (session, native) = Create();
+			Wait(session.StartAsync());
+			WaitUntil(() => native.GateOpen, "the gate to open");
+			Wait(session.PauseAsync());
+
+			session.PublishEvent(102, 1);
+			session.PulseEvent(101);
+			session.PulseNamed("Knocker");
+			var resumed = Wait(session.ResumeAsync());
+			Assert.That(resumed.Open, Is.True, resumed.ToString());
+			var calls = native.Calls;
+			var opened = calls.LastIndexOf("gate:open");
+			// Like any event of the pause: DOF takes it with the gate closed, and the gate opens on the state after it.
+			Assert.That(calls.IndexOf("E102=1"), Is.InRange(0, opened));
+			Assert.That(calls.IndexOf("E101=0"), Is.EqualTo(calls.IndexOf("E101=1") + 1).And.LessThan(opened));
+			Assert.That(calls.IndexOf("$Knocker=0"), Is.EqualTo(calls.IndexOf("$Knocker=1") + 1).And.LessThan(opened));
+			Assert.That(calls.IndexOf("E101=1"), Is.GreaterThan(calls.IndexOf("E102=1")), "in the order they came");
+			Wait(session.StopAsync());
+		}
+
+		[Test]
 		public void InitialSnapshotIsBufferedAndGatesTheOpening()
 		{
 			var (session, native) = Create(o => o.WaitForSnapshot = true);

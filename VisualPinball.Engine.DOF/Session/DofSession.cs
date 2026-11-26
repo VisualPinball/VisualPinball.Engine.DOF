@@ -213,7 +213,8 @@ namespace VisualPinball.Engine.DOF.Session
 
 		private readonly DofSessionOptions _options;
 		private readonly DofEventRing _ring;
-		private readonly ConcurrentQueue<(DofElementKind kind, int number, string name, int value)> _ingress = new ConcurrentQueue<(DofElementKind, int, string, int)>();
+		// Events and named elements; a pulse is one entry, which the worker sends as its value and then 0.
+		private readonly ConcurrentQueue<(DofElementKind kind, int number, string name, int value, bool pulse)> _ingress = new ConcurrentQueue<(DofElementKind, int, string, int, bool)>();
 		private readonly ConcurrentQueue<Command> _commands = new ConcurrentQueue<Command>();
 		private readonly DofEventTranslator _translator = new DofEventTranslator();
 		private readonly LatencyHistogram _latency = new LatencyHistogram();
@@ -325,7 +326,21 @@ namespace VisualPinball.Engine.DOF.Session
 			if (string.IsNullOrEmpty(name) || !_admitting) {
 				return;
 			}
-			_ingress.Enqueue((DofElementKind.Event, 0, name, value));
+			_ingress.Enqueue((DofElementKind.Event, 0, name, value, false));
+			_ring.Wake();
+		}
+
+		/// <summary>
+		/// Any thread: turns a named element on and off again, as VPX's <c>DOFPulse</c>. The pulse is one entry, sent to DOF
+		/// as 1 and then 0 back to back by the worker, so pulses from several threads never interleave into one (1, 1, 0, 0),
+		/// and it is ordered with the other events, a pause or resume included, as they are.
+		/// </summary>
+		public void PulseNamed(string name)
+		{
+			if (string.IsNullOrEmpty(name) || !_admitting) {
+				return;
+			}
+			_ingress.Enqueue((DofElementKind.Event, 0, name, 1, true));
 			_ring.Wake();
 		}
 
@@ -335,7 +350,17 @@ namespace VisualPinball.Engine.DOF.Session
 			if (!_admitting) {
 				return;
 			}
-			_ingress.Enqueue((DofElementKind.Event, number, null, value));
+			_ingress.Enqueue((DofElementKind.Event, number, null, value, false));
+			_ring.Wake();
+		}
+
+		/// <summary>Any thread: turns an <c>E</c> event on and off again, as <see cref="PulseNamed"/> does a named element.</summary>
+		public void PulseEvent(int number)
+		{
+			if (!_admitting) {
+				return;
+			}
+			_ingress.Enqueue((DofElementKind.Event, number, null, 1, true));
 			_ring.Wake();
 		}
 
@@ -835,21 +860,28 @@ namespace VisualPinball.Engine.DOF.Session
 				if (Dropping) {
 					continue;
 				}
-				if (item.name != null) {
-					// Not filtered here: DOF compares names its own way (ignoring case, spaces as underscores) and drops
-					// repeated values itself, so a filter that compared them differently could drop an off.
-					_native.DataNamed(item.name, item.value);
-				} else {
-					var value = item.value;
-					if (!_translator.Translate(item.kind, item.number, ref value)) {
-						Interlocked.Increment(ref _unchanged);
-						continue;
-					}
-					_native.Data(DofEventTranslator.TypeOf(item.kind), item.number, value);
+				Deliver(item.kind, item.number, item.name, item.value);
+				if (item.pulse) {
+					Deliver(item.kind, item.number, item.name, 0);
 				}
-				Interlocked.Increment(ref _delivered);
 			}
 			return any;
+		}
+
+		private void Deliver(DofElementKind kind, int number, string name, int value)
+		{
+			if (name != null) {
+				// Not filtered here: DOF compares names its own way (ignoring case, spaces as underscores) and drops
+				// repeated values itself, so a filter that compared them differently could drop an off.
+				_native.DataNamed(name, value);
+			} else {
+				if (!_translator.Translate(kind, number, ref value)) {
+					Interlocked.Increment(ref _unchanged);
+					return;
+				}
+				_native.Data(DofEventTranslator.TypeOf(kind), number, value);
+			}
+			Interlocked.Increment(ref _delivered);
 		}
 
 		/// <summary>A faulted session, or one about to be, delivers nothing more.</summary>

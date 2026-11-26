@@ -164,6 +164,86 @@ namespace VisualPinball.Engine.DOF.Test
 		}
 
 		[Test]
+		public void SerialPortsGoIntoTheImportSoUndoRestoresTheConfigurationBeforeIt()
+		{
+			Accepted(_importer.Import(Zip("before.zip", ("directoutputconfig.ini", MainIni))));
+			var before = _store.Active.Id;
+
+			var report = Accepted(_importer.Import(Folder("ported",
+				("GlobalConfig_B2SServer.xml", WindowsGlobalConfig), ("cabinet.xml", Cabinet), ("directoutputconfig.ini", MainIni)),
+				DofImportMode.Replace, new Dictionary<string, string> { ["PinControl 1"] = "/dev/ttyACM0", ["Nope"] = "/dev/ttyACM1" }));
+			Assert.That(XDocument.Load(Path.Combine(_store.Active.ConfigDir, "cabinet.xml")).Root.Descendants("PinControl").Single().Element("ComPort").Value, Is.EqualTo("/dev/ttyACM0"));
+			Assert.That(Has(report, DofReportSeverity.Warning, "no controller named \"Nope\""), Is.True, report.ToString());
+			Assert.That(_store.Previous.Id, Is.EqualTo(before), "one revision for the import and its ports");
+
+			Assert.That(_store.Rollback(), Is.True);
+			Assert.That(_store.Active.Id, Is.EqualTo(before));
+		}
+
+		[Test]
+		public void ReadsACabinetWithADefaultNamespaceAsLibdofDoes()
+		{
+			// tinyxml2 matches element names as written, so libdof reads this cabinet as one without the namespace.
+			var cabinet = Cabinet.Replace("<Cabinet>", "<Cabinet xmlns=\"http://example.org/dof\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">");
+			Accepted(_importer.Import(Folder("namespaced",
+				("GlobalConfig_B2SServer.xml", WindowsGlobalConfig), ("cabinet.xml", cabinet), ("directoutputconfig.ini", MainIni))));
+			var catalog = DofCatalog.Load(_store.Active);
+			Assert.That(catalog.Controllers.Select(c => c.Type), Is.EqualTo(new[] { "PinControl", "TeensyStripController", "ArtNet" }));
+			Assert.That(catalog.Controllers.Select(c => c.Name), Is.EqualTo(new[] { "PinControl 1", "Teensy 1", "ArtNet 1" }));
+			Assert.That(catalog.SerialPorts, Is.EqualTo(new[] { "COM3", "COM5" }));
+			Assert.That(_store.Active.ReadSerialPorts(), Is.EqualTo(new[] { "COM3", "COM5" }));
+
+			// A port for this computer replaces the element libdof reads instead of adding one it would not.
+			Accepted(_importer.ApplySerialOverrides(new Dictionary<string, string> { ["Teensy 1"] = "/dev/ttyACM1" }));
+			Assert.That(DofCatalog.Load(_store.Active).SerialPorts, Is.EqualTo(new[] { "COM3", "/dev/ttyACM1" }));
+			var teensy = XDocument.Load(Path.Combine(_store.Active.ConfigDir, "cabinet.xml")).Root.Descendants().Single(e => e.Name.LocalName == "TeensyStripController");
+			Assert.That(teensy.Elements().Count(e => e.Name.LocalName == "ComPortName"), Is.EqualTo(1));
+		}
+
+		[Test]
+		public void ReadsElementsAsTinyxml2Does()
+		{
+			var root = XDocument.Parse("<Cabinet xmlns=\"http://example.org/dof\" xmlns:p=\"http://example.org/p\">"
+				+ "<A><!-- off -->false</A><B><C /></B><C>text</C><p:D>prefixed</p:D><E><!-- a --><!-- b --> x </E><F /></Cabinet>").Root;
+			Assert.That(DofXml.LiteralName(root), Is.EqualTo("Cabinet"), "a default namespace does not change the name");
+			Assert.That(DofXml.FirstChild(root, "D"), Is.Null, "a prefix does");
+			Assert.That(DofXml.Text(DofXml.FirstChild(root, "p:D")), Is.EqualTo("prefixed"));
+			Assert.That(DofXml.Text(DofXml.FirstChild(root, "A")), Is.EqualTo("false"), "comments before the text are skipped");
+			Assert.That(DofXml.Text(DofXml.FirstChild(root, "E")), Is.EqualTo(" x "), "the text is as written");
+			Assert.That(DofXml.Text(DofXml.FirstChild(root, "B")), Is.Null, "an element first is no text");
+			Assert.That(DofXml.Text(DofXml.FirstChild(root, "C")), Is.EqualTo("text"), "only children count, not deeper elements");
+			Assert.That(DofXml.Text(DofXml.FirstChild(root, "F")), Is.Null);
+		}
+
+		[Test]
+		public void NamesControllersAsLibdofDoes()
+		{
+			// Each type's FromXml: pac boards take only the attribute (libdof writes them so), a LedWiz only the element,
+			// the others the attribute before the element. Without a name libdof names the controller itself.
+			const string cabinet = "<?xml version=\"1.0\"?>\r\n<Cabinet><AutoConfigEnabled>false</AutoConfigEnabled><OutputControllers>"
+				+ "<PacDrive Name=\"Main\" />"
+				+ "<LedWiz Name=\"ignored\"><Name>LW</Name><Number>1</Number></LedWiz>"
+				+ "<TeensyStripController Name=\"Strip\"><Name>Other</Name><ComPortName>COM5</ComPortName></TeensyStripController>"
+				+ "<PinControl Name=\"\"><Name>ignored</Name><Number>1</Number><ComPort>COM3</ComPort></PinControl>"
+				+ "<PacUIO><Name>ignored</Name></PacUIO>"
+				+ "</OutputControllers></Cabinet>\r\n";
+			Accepted(_importer.Import(Folder("named",
+				("GlobalConfig_B2SServer.xml", WindowsGlobalConfig), ("cabinet.xml", cabinet), ("directoutputconfig.ini", MainIni))));
+			var catalog = DofCatalog.Load(_store.Active);
+			Assert.That(catalog.Controllers.Select(c => (c.Type, c.Name, c.Named)), Is.EqualTo(new[] {
+				("PacDrive", "Main", true),
+				("LedWiz", "LW", true),
+				("TeensyStripController", "Strip", true),
+				("PinControl", "PinControl", false),
+				("PacUIO", "PacUIO", false),
+			}));
+
+			// A port for a controller named by its attribute reaches it.
+			Accepted(_importer.ApplySerialOverrides(new Dictionary<string, string> { ["Strip"] = "/dev/ttyACM1", ["PinControl"] = "/dev/ttyACM0" }));
+			Assert.That(DofCatalog.Load(_store.Active).SerialPorts, Is.EquivalentTo(new[] { "/dev/ttyACM1", "/dev/ttyACM0" }));
+		}
+
+		[Test]
 		public void MergeKeepsTheCabinetAndReplacesAllIniFiles()
 		{
 			Accepted(_importer.Import(Folder("first",

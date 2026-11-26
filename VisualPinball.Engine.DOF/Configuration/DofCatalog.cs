@@ -35,7 +35,10 @@ namespace VisualPinball.Engine.DOF.Configuration
 	{
 		/// <summary>The XML element name, such as <c>LedWiz</c> or <c>TeensyStripController</c>.</summary>
 		public string Type { get; }
+		/// <summary>The name libdof gives it (<see cref="DofXml.ControllerName"/>), or the type when it names it itself.</summary>
 		public string Name { get; }
+		/// <summary>Whether the cabinet names it; otherwise libdof names it after its number or type.</summary>
+		public bool Named { get; }
 		/// <summary>
 		/// The serial port the controller names (<c>ComPort</c> for PinControl and PinOne, <c>ComPortName</c> for the
 		/// Teensy and Wemos strip controllers), or null.
@@ -45,7 +48,8 @@ namespace VisualPinball.Engine.DOF.Configuration
 		internal DofCatalogController(string type, string name, string serialPort)
 		{
 			Type = type;
-			Name = name;
+			Named = name != null;
+			Name = name ?? type;
 			SerialPort = serialPort;
 		}
 	}
@@ -113,13 +117,14 @@ namespace VisualPinball.Engine.DOF.Configuration
 				var xml = DofXml.Load(path);
 				switch (DofXml.KindOf(xml)) {
 					case DofXmlKind.Cabinet:
-						foreach (var controller in xml.Root.Element("OutputControllers")?.Elements() ?? Enumerable.Empty<System.Xml.Linq.XElement>()) {
-							cabinetControllers.Add(new DofCatalogController(controller.Name.LocalName,
-								DofXml.Value(controller, "Name") ?? controller.Name.LocalName, DofXml.SerialPortOf(controller)));
+						// The elements as libdof finds them, by the names as written: a default namespace changes nothing.
+						foreach (var controller in CabinetControllers(xml)) {
+							var type = DofXml.LiteralName(controller);
+							cabinetControllers.Add(new DofCatalogController(type, DofXml.ControllerName(controller), DofXml.SerialPortOf(controller)));
 						}
 						break;
 					case DofXmlKind.TableMappings:
-						foreach (var mapping in xml.Root.Elements("Mapping")) {
+						foreach (var mapping in DofXml.Children(xml.Root, "Mapping")) {
 							var table = DofXml.Value(mapping, "TableName");
 							var rom = DofXml.Value(mapping, "RomName");
 							if (!string.IsNullOrEmpty(table) && !string.IsNullOrEmpty(rom)) {
@@ -140,6 +145,15 @@ namespace VisualPinball.Engine.DOF.Configuration
 			return new DofCatalog(revision, devices, effective ?? rows, effective != null, mappings, revision.TableConfigs, cabinetControllers);
 		}
 
+		/// <summary>
+		/// The controller elements of a cabinet file, as libdof reads them: the children of the root's
+		/// <c>OutputControllers</c>, when the root is <c>Cabinet</c> as written (a prefixed root is no cabinet to libdof).
+		/// </summary>
+		private static IEnumerable<System.Xml.Linq.XElement> CabinetControllers(System.Xml.Linq.XDocument xml)
+			=> xml.Root == null || DofXml.LiteralName(xml.Root) != "Cabinet"
+				? Enumerable.Empty<System.Xml.Linq.XElement>()
+				: DofXml.FirstChild(xml.Root, "OutputControllers")?.Elements() ?? Enumerable.Empty<System.Xml.Linq.XElement>();
+
 		/// <summary>The serial ports the cabinet file of a <c>directoutputconfig</c> folder names.</summary>
 		internal static IReadOnlyList<string> SerialPortsOf(string configDir)
 		{
@@ -157,7 +171,7 @@ namespace VisualPinball.Engine.DOF.Configuration
 				if (DofXml.KindOf(xml) != DofXmlKind.Cabinet) {
 					continue;
 				}
-				foreach (var controller in xml.Root.Element("OutputControllers")?.Elements() ?? Enumerable.Empty<System.Xml.Linq.XElement>()) {
+				foreach (var controller in CabinetControllers(xml)) {
 					var port = DofXml.SerialPortOf(controller);
 					if (port != null && !ports.Contains(port, StringComparer.OrdinalIgnoreCase)) {
 						ports.Add(port);

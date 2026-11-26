@@ -98,7 +98,7 @@ namespace VisualPinball.Engine.DOF.Test
 		[Test]
 		public void ReportsAbiAndLibdofVersion()
 		{
-			Assert.That(DofLibrary.NativeAbiVersion, Is.EqualTo(2));
+			Assert.That(DofLibrary.NativeAbiVersion, Is.EqualTo(3));
 			Assert.That(DofLibrary.LibdofVersion, Does.Match(@"^\d+\.\d+\.\d+"));
 		}
 

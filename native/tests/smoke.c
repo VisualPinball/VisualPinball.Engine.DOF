@@ -50,6 +50,8 @@ static void RunSession(const char* basePath, const char* table, const char* rom)
 	CHECK(closed > 0, "gate closes before init");
 	int32_t confirmed, pending, failed;
 	CHECK(vpe_dof_gate_state(dof, closed, &confirmed, &pending, &failed) == 1, "gate applied before init");
+	CHECK(vpe_dof_set_connect_tests(NULL, 0) == VPE_DOF_INVALID_ARGUMENT, "connect tests need an instance");
+	CHECK(vpe_dof_set_connect_tests(dof, 0) == VPE_DOF_OK, "connect tests turned off before init");
 
 	char error[512] = { 0 };
 	int32_t result = vpe_dof_init(dof, table, rom, error, (int32_t)sizeof(error));

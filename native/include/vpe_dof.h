@@ -10,6 +10,10 @@
 // libdof's configuration base path, log and device lists are process-wide, so at most one DOF instance can exist at a
 // time. libdof reads files only inside the instance's base path and never writes or deletes any file. On Windows,
 // libdof passes paths to the narrow (ANSI code page) file API: pass paths that code page can represent.
+//
+// The library is loaded for the lifetime of the process, as Unity loads native plugins, and is not made to be unloaded:
+// the GCC runtime linked statically on Linux keeps an exception pool, and the file confinement a thread-local root,
+// which dlclose does not free, so repeated dlopen/dlclose leaks. Destroy the instance and create a new one instead.
 
 #pragma once
 
@@ -32,7 +36,7 @@ extern "C" {
 #endif
 
 /// Version of this ABI. Bumped on every incompatible change; the managed binding refuses a library with another one.
-#define VPE_DOF_ABI_VERSION 2
+#define VPE_DOF_ABI_VERSION 3
 
 enum vpe_dof_status
 {
@@ -63,7 +67,8 @@ VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_abi_version(void);
 VPE_DOF_API const char* VPE_DOF_CALL vpe_dof_libdof_version(void);
 /// Sets the log callback (or NULL) and the most detailed level passed to it, by severity: VPE_DOF_LOG_ERROR passes errors,
 /// VPE_DOF_LOG_WARN adds warnings, VPE_DOF_LOG_INFO adds information and VPE_DOF_LOG_DEBUG everything. Process-wide;
-/// the callback and its user pointer change together, and a line being delivered may still reach the previous one.
+/// the callback and its user pointer change together. Returns once no line is being delivered to the previous one (not
+/// waiting when called from a callback), so the previous callback can be unloaded afterwards. The callback must not block.
 VPE_DOF_API void VPE_DOF_CALL vpe_dof_set_log(vpe_dof_log_fn callback, void* user, int32_t level);
 
 /// Creates the DOF instance. `base_path` is the folder that contains `directoutputconfig/`, where libdof reads
@@ -92,6 +97,12 @@ VPE_DOF_API void VPE_DOF_CALL vpe_dof_destroy(vpe_dof* dof);
 /// waits for DOF's main thread or a device; it only takes short internal locks. A change queued before finish is still
 /// applied. The gate opens with every new instance; after vpe_dof_latch_output_gate an opening applies as a closing.
 VPE_DOF_API int64_t VPE_DOF_CALL vpe_dof_set_output_gate(vpe_dof* dof, int32_t open);
+/// Turns the controllers' connect test sequences (TestOnConnect of Wemos D1 and UMX controllers) off (allowed = 0) for
+/// the rest of the instance, or on again. They run only while the gate is open anyway; turned off, they do not run when
+/// the gate opens either, so a controller that connects late or reconnects while the gate is open, as in a port test,
+/// does not light its whole strip. Call before init to cover the controllers init connects. Every new instance allows
+/// them. VPE_DOF_INVALID_ARGUMENT if `dof` is NULL.
+VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_set_connect_tests(vpe_dof* dof, int32_t allowed);
 /// Closes the output gate at once, from any thread and in any state, and latches it closed for the rest of the
 /// instance: openings queued for DOF's main thread and not applied yet, and every later one, apply as closings, and
 /// their generations report the closed state. The closing is published to the controllers at once and every

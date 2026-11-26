@@ -79,7 +79,17 @@ namespace VisualPinball.Engine.DOF.Configuration
 		}
 
 		/// <summary>Imports a zip file, a folder or a single configuration file.</summary>
-		public DofImportReport Import(string source, DofImportMode mode = DofImportMode.Merge)
+		public DofImportReport Import(string source, DofImportMode mode = DofImportMode.Merge) => Import(source, mode, null);
+
+		/// <summary>Imports a zip file, a folder or a single configuration file, with the serial ports of your controllers.</summary>
+		/// <param name="source">The zip, folder or file.</param>
+		/// <param name="mode">Whether the import replaces the active configuration or is merged into it.</param>
+		/// <param name="serialOverrides">
+		/// Controller name to serial port, applied to the imported cabinet before it becomes active, so the import is one
+		/// revision and undoing it restores the configuration before it. A controller the cabinet doesn't have, or one
+		/// without a serial port, is reported and skipped.
+		/// </param>
+		public DofImportReport Import(string source, DofImportMode mode, IReadOnlyDictionary<string, string> serialOverrides)
 		{
 			var report = new DofImportReport();
 			if (string.IsNullOrEmpty(source) || (!File.Exists(source) && !Directory.Exists(source))) {
@@ -108,6 +118,13 @@ namespace VisualPinball.Engine.DOF.Configuration
 				var config = Merge(imported, previous, report);
 				if (report.HasErrors) {
 					return report;
+				}
+				if (serialOverrides != null && serialOverrides.Count > 0) {
+					if (config.Cabinet == null) {
+						report.Warning(DofReportTopic.General, "The configuration has no cabinet file, so your serial ports were not applied.");
+					} else {
+						SetSerialPorts(config, serialOverrides, staging, report, false);
+					}
 				}
 				ResolveShapes(config);
 				Analyse(config, WindowsPortNames, report);
@@ -144,30 +161,9 @@ namespace VisualPinball.Engine.DOF.Configuration
 					report.Error("The DOF configuration has no cabinet file, so it has no serial ports to set.");
 					return report;
 				}
-				var xml = new XDocument(config.Cabinet.Xml);
-				var controllers = xml.Root.Element("OutputControllers")?.Elements().ToList() ?? new List<XElement>();
-				foreach (var pair in ports) {
-					var controller = controllers.FirstOrDefault(c => string.Equals(DofXml.Value(c, "Name"), pair.Key, StringComparison.Ordinal));
-					if (controller == null) {
-						report.Error($"The cabinet has no controller named \"{pair.Key}\".");
-						return report;
-					}
-					var element = DofXml.SerialPortElement(controller.Name.LocalName);
-					if (element == null) {
-						report.Error($"{pair.Key} is a {controller.Name.LocalName}, which has no serial port.");
-						return report;
-					}
-					if (string.IsNullOrWhiteSpace(pair.Value) || pair.Value.Any(c => c < 32 || c >= 128)) {
-						report.Error($"\"{pair.Value}\" is not a serial port name.");
-						return report;
-					}
-					var current = DofXml.Value(controller, element);
-					report.Info(DofReportTopic.General, string.IsNullOrEmpty(current) ? $"{pair.Key} uses {pair.Value}." : $"{pair.Key} uses {pair.Value} instead of {current}.");
-					controller.SetElementValue(element, pair.Value.Trim());
+				if (!SetSerialPorts(config, ports, staging, report, true)) {
+					return report;
 				}
-				var path = Path.Combine(staging, config.Cabinet.Name);
-				DofXml.Save(xml, path);
-				config.Cabinet = new ConfigFile { Path = path, Name = config.Cabinet.Name, Origin = config.Cabinet.Name, Xml = xml };
 				ResolveShapes(config);
 				Analyse(config, WindowsPortNames, report);
 				if (!report.HasErrors) {
@@ -180,6 +176,51 @@ namespace VisualPinball.Engine.DOF.Configuration
 			} finally {
 				DofConfigStore.TryDelete(staging);
 			}
+		}
+
+		/// <summary>
+		/// Sets the serial port of the cabinet's controllers in a copy of the cabinet file in the staging folder. Strict, a
+		/// controller that can't take its port is an error and nothing is set; otherwise it is a warning and skipped.
+		/// </summary>
+		private static bool SetSerialPorts(ConfigSet config, IReadOnlyDictionary<string, string> ports, string staging, DofImportReport report, bool strict)
+		{
+			var xml = new XDocument(config.Cabinet.Xml);
+			// Found as libdof finds them, by the names as written (DofXml.FirstChild).
+			var controllers = DofXml.FirstChild(xml.Root, "OutputControllers")?.Elements().ToList() ?? new List<XElement>();
+			foreach (var pair in ports) {
+				// By the name the catalog lists it with: libdof's, or the type for one libdof names itself.
+				var controller = controllers.FirstOrDefault(c => string.Equals(DofXml.ControllerName(c) ?? DofXml.LiteralName(c), pair.Key, StringComparison.Ordinal));
+				string problem = null;
+				string element = null;
+				if (controller == null) {
+					problem = $"The cabinet has no controller named \"{pair.Key}\".";
+				} else if ((element = DofXml.SerialPortElement(DofXml.LiteralName(controller))) == null) {
+					problem = $"{pair.Key} is a {DofXml.LiteralName(controller)}, which has no serial port.";
+				} else if (string.IsNullOrWhiteSpace(pair.Value) || pair.Value.Any(c => c < 32 || c >= 128)) {
+					problem = $"\"{pair.Value}\" is not a serial port name.";
+				}
+				if (problem != null) {
+					if (strict) {
+						report.Error(problem);
+						return false;
+					}
+					report.Warning(DofReportTopic.General, problem + " Its port was not changed.");
+					continue;
+				}
+				var current = DofXml.Value(controller, element);
+				report.Info(DofReportTopic.General, string.IsNullOrEmpty(current) ? $"{pair.Key} uses {pair.Value}." : $"{pair.Key} uses {pair.Value} instead of {current}.");
+				// The element libdof reads, in the controller's namespace when there is none yet.
+				var port = DofXml.FirstChild(controller, element);
+				if (port != null) {
+					port.Value = pair.Value.Trim();
+				} else {
+					controller.Add(new XElement(controller.Name.Namespace + element, pair.Value.Trim()));
+				}
+			}
+			var path = Path.Combine(staging, config.Cabinet.Name);
+			DofXml.Save(xml, path);
+			config.Cabinet = new ConfigFile { Path = path, Name = config.Cabinet.Name, Origin = config.Cabinet.Name, Xml = xml };
+			return true;
 		}
 
 		#region Staging
@@ -818,14 +859,14 @@ namespace VisualPinball.Engine.DOF.Configuration
 		private static void AnalyseCabinet(ConfigFile cabinet, bool windowsPorts, DofImportReport report)
 		{
 			var root = cabinet.Xml.Root;
-			if (root.Element("TableOverrideSettings")?.HasElements == true) {
+			if (DofXml.FirstChild(root, "TableOverrideSettings")?.HasElements == true) {
 				report.Warning(DofReportTopic.Unsupported, $"{cabinet.Name} has table override settings, which libdof ignores.");
 			}
-			var controllers = root.Element("OutputControllers");
+			var controllers = DofXml.FirstChild(root, "OutputControllers");
 			if (controllers != null) {
 				foreach (var controller in controllers.Elements()) {
-					var type = controller.Name.LocalName;
-					var name = DofXml.Value(controller, "Name") ?? type;
+					var type = DofXml.LiteralName(controller);
+					var name = DofXml.ControllerName(controller) ?? type;
 					var port = DofXml.SerialPortOf(controller);
 					if (!string.IsNullOrEmpty(port) && !windowsPorts && port.StartsWith("COM", StringComparison.OrdinalIgnoreCase)) {
 						report.Warning(DofReportTopic.Unresolved, $"{cabinet.Name}: {name} uses {port}, a Windows port name; set its serial port for this computer.");
@@ -837,9 +878,9 @@ namespace VisualPinball.Engine.DOF.Configuration
 					}
 				}
 			}
-			var toys = root.Element("Toys");
+			var toys = DofXml.FirstChild(root, "Toys");
 			if (toys != null) {
-				var skipped = toys.Elements().Select(t => t.Name.LocalName).Where(t => !SupportedToys.Contains(t)).Distinct().ToList();
+				var skipped = toys.Elements().Select(DofXml.LiteralName).Where(t => !SupportedToys.Contains(t)).Distinct().ToList();
 				if (skipped.Count > 0) {
 					report.Warning(DofReportTopic.Unsupported, $"{cabinet.Name} defines toys libdof only builds from the ini files and skips here: {string.Join(", ", skipped)}.");
 				}

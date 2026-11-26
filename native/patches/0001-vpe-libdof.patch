@@ -850,7 +850,7 @@ new file mode 100644
 index 0000000..824f940
 --- /dev/null
 +++ b/src/cab/out/OutputGate.cpp
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,221 @@
 +#include "OutputGate.h"
 +
 +#include <cstdint>
@@ -908,6 +908,7 @@ index 0000000..824f940
 +   Reserve();
 +   m_latched.store(false, std::memory_order_release);
 +   m_open.store(true, std::memory_order_release);
++   m_connectTests.store(true, std::memory_order_release);
 +   m_published.store(Pack(generation, true), std::memory_order_release);
 +   // Units of earlier sessions stay allocated, since a hung updater thread of an abandoned session may still use its
 +   // unit, but they are no longer scanned.
@@ -1076,7 +1077,7 @@ new file mode 100644
 index 0000000..672ad8f
 --- /dev/null
 +++ b/src/cab/out/OutputGate.h
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,139 @@
 +#pragma once
 +
 +#include <atomic>
@@ -1147,6 +1148,12 @@ index 0000000..672ad8f
 +
 +   // The state outputs report. It changes before the generation that set it is published.
 +   bool IsOpen() const { return m_open.load(std::memory_order_acquire); }
++   // Whether a controller may run its connect test sequence (TestOnConnect): only while the gate is open, and never in a
++   // session that turned them off, such as a port test, where a controller that connects late or reconnects would light
++   // its whole strip.
++   bool AllowsConnectTests() const { return IsOpen() && m_connectTests.load(std::memory_order_acquire); }
++   // Turns the connect test sequences off, or on again, for the current session. Every new session allows them.
++   void SetConnectTests(bool allowed) { m_connectTests.store(allowed, std::memory_order_release); }
 +   Snapshot Current() const;
 +
 +   // Starts a new session: opens the gate and forgets the units of the previous one.
@@ -1186,6 +1193,7 @@ index 0000000..672ad8f
 +   bool IsConfirmed(const Unit& unit, int64_t generation, bool open) const;
 +
 +   std::atomic<bool> m_open { true };
++   std::atomic<bool> m_connectTests { true };
 +   // Written with m_mutex held.
 +   std::atomic<bool> m_latched { false };
 +   // The last published generation and its state: (generation << 1) | open.
@@ -1348,7 +1356,7 @@ index d460fbd..4c70be3 100644
     }
  
 -   if (m_dev->m_testOnConnect != UMXDevice::TestMode::None)
-+   if (m_dev->m_testOnConnect != UMXDevice::TestMode::None && OutputGate::Instance().IsOpen())
++   if (m_dev->m_testOnConnect != UMXDevice::TestMode::None && OutputGate::Instance().AllowsConnectTests())
     {
        std::vector<uint8_t> parameters = {
           static_cast<uint8_t>(m_dev->m_testOnConnect),
@@ -1424,7 +1432,7 @@ index 1832b60..417b43c 100644
     }
  
 -   if (m_testOnConnect)
-+   if (m_testOnConnect && OutputGate::Instance().IsOpen())
++   if (m_testOnConnect && OutputGate::Instance().AllowsConnectTests())
     {
        commandData = { (uint8_t)'T' };
        Log::Write("Send a test request to the controller");

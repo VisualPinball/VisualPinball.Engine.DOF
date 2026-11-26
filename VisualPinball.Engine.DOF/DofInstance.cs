@@ -209,6 +209,14 @@ namespace VisualPinball.Engine.DOF
 		}
 
 		/// <summary>
+		/// Turns the controllers' connect test sequences (TestOnConnect of Wemos D1 and UMX controllers) off for the rest
+		/// of the instance, or on again. They run only while the output gate is open; turned off, a controller that
+		/// connects late or reconnects while the gate is open does not light its whole strip. Call before
+		/// <see cref="Init"/> to cover the controllers it connects. Every new instance allows them.
+		/// </summary>
+		public void SetConnectTests(bool allowed) => DofException.ThrowIfFailed(DofNative.SetConnectTests(Handle, allowed ? 1 : 0), "Setting DOF's connect tests");
+
+		/// <summary>
 		/// Any thread, in any state until disposed: closes the output gate at once and latches it closed for the rest of
 		/// the instance. Openings that DOF's main thread has not applied yet, and every later one, apply as closings,
 		/// and their generations report the closed state. The closing reaches the controllers without waiting for DOF's

@@ -83,7 +83,8 @@ namespace VisualPinball.Engine.DOF
 
 		/// <summary>
 		/// Sets where libdof's log lines go, or null to drop them. The sink is called on libdof's threads, so it must be
-		/// thread-safe and fast. Process-wide.
+		/// thread-safe and must not block: replacing it waits until no line is still being delivered to the previous one.
+		/// Process-wide.
 		/// </summary>
 		/// <param name="level">The most detailed level passed; <see cref="DofLogLevel.Info"/> passes errors, warnings and
 		/// information.</param>

@@ -16,6 +16,7 @@
 #include <exception>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <typeinfo>
 #include <unordered_map>
 #include <vector>
@@ -83,6 +84,9 @@ struct LogTarget
 	void* user;
 };
 std::atomic<const LogTarget*> g_logTarget { nullptr };
+// Lines being delivered, so vpe_dof_set_log can wait until none still uses the target it replaced.
+std::atomic<int32_t> g_logCalls { 0 };
+thread_local bool t_inLogCallback = false;
 std::atomic<int32_t> g_logLevel { VPE_DOF_LOG_INFO };
 
 // Lower is more severe. libdof's levels are not ordered by severity (INFO 0, WARN 1, ERROR 2, DEBUG 3).
@@ -133,7 +137,13 @@ void QuietLogFile()
 
 void LIBDOFCALLBACK OnLibdofLog(DOF_LogLevel level, const char* format, va_list args)
 {
-	const LogTarget* target = g_logTarget.load(std::memory_order_acquire);
+	// counted before the target is read: a caller that replaces it and then sees no line in flight knows none has the old one
+	g_logCalls.fetch_add(1, std::memory_order_seq_cst);
+	struct Leave
+	{
+		~Leave() { g_logCalls.fetch_sub(1, std::memory_order_release); }
+	} leave;
+	const LogTarget* target = g_logTarget.load(std::memory_order_seq_cst);
 	if (!target || !target->callback || !format)
 		return;
 	if (Severity(static_cast<int32_t>(level)) > Severity(g_logLevel.load(std::memory_order_relaxed)))
@@ -147,6 +157,7 @@ void LIBDOFCALLBACK OnLibdofLog(DOF_LogLevel level, const char* format, va_list 
 	va_end(copy);
 	if (length < 0)
 		return;
+	t_inLogCallback = true;
 	try
 	{
 		if (static_cast<size_t>(length) < sizeof(stackBuffer))
@@ -163,6 +174,7 @@ void LIBDOFCALLBACK OnLibdofLog(DOF_LogLevel level, const char* format, va_list 
 	catch (...)
 	{
 	}
+	t_inLogCallback = false;
 }
 
 std::string GlobalConfigPath(const std::string& basePath) { return DOF::Path::Combine(basePath, "directoutputconfig", "GlobalConfig_B2SServer.xml"); }
@@ -265,7 +277,16 @@ VPE_DOF_API void VPE_DOF_CALL vpe_dof_set_log(vpe_dof_log_fn callback, void* use
 	{
 		QuietLogFile();
 		g_logLevel.store(std::clamp<int32_t>(level, VPE_DOF_LOG_INFO, VPE_DOF_LOG_DEBUG), std::memory_order_relaxed);
-		g_logTarget.store(callback ? new LogTarget { callback, user } : nullptr, std::memory_order_release);
+		g_logTarget.store(callback ? new LogTarget { callback, user } : nullptr, std::memory_order_seq_cst);
+		// Lines that read the previous target finish before this returns, so the caller can unload what it pointed to: a
+		// line counts itself before it reads the target, so once the count is zero after the store, every later line reads
+		// the new one. Without a deadline, since one would let a stalled line call into what was unloaded; the callback
+		// must not block. Not from inside a callback, which would wait for itself.
+		if (!t_inLogCallback)
+		{
+			while (g_logCalls.load(std::memory_order_seq_cst) != 0)
+				std::this_thread::yield();
+		}
 	}
 	catch (...)
 	{
@@ -502,6 +523,22 @@ VPE_DOF_API int64_t VPE_DOF_CALL vpe_dof_set_output_gate(vpe_dof* dof, int32_t o
 	catch (...)
 	{
 		return -1;
+	}
+}
+
+VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_set_connect_tests(vpe_dof* dof, int32_t allowed)
+{
+	if (!dof)
+		return VPE_DOF_INVALID_ARGUMENT;
+	try
+	{
+		// Process-wide, as the gate is; the session that create began allows them, so this lasts for the instance.
+		DOF::OutputGate::Instance().SetConnectTests(allowed != 0);
+		return VPE_DOF_OK;
+	}
+	catch (...)
+	{
+		return VPE_DOF_ERROR;
 	}
 }
 
