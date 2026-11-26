@@ -91,20 +91,22 @@ VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_finish(vpe_dof* dof, char* error, int32
 /// Frees the instance. Calls finish first if it was not called.
 VPE_DOF_API void VPE_DOF_CALL vpe_dof_destroy(vpe_dof* dof);
 
-/// Closes (open = 0) or opens (open = 1) the output gate. While closed, every output sends 0 and keeps the value effects
-/// set for when it opens again; controllers also skip their connect test sequences. Before init it applies at once,
-/// so a session can start closed; after init it runs on DOF's main thread and returns at once. Returns the gate
-/// generation, which vpe_dof_gate_state reports against, or -1 while init or finish runs and after finish. It never
-/// waits for DOF's main thread or a device; it only takes short internal locks. A change queued before finish is still
-/// applied, after the table element changes queued before it; once finish started, an opening returns -1 and a closing
-/// latches the gate (vpe_dof_latch_output_gate). Every instance has a gate of its own, open when it is created; after
-/// vpe_dof_latch_output_gate a change applies as a closing.
+/// Closes (open = 0) or opens (open = 1) the output gate. While closed, every output sends 0 and keeps the value
+/// effects set for when it opens again; controllers also skip their connect test sequences. Before init it applies at
+/// once, so a session can start closed: every controller then turns its outputs off before an opening reaches it, also
+/// one whose first update comes after the gate opened. After init it runs on DOF's main thread and returns at once.
+/// Returns the gate generation, which vpe_dof_gate_state reports against, or -1 while init runs, for an opening once
+/// finish started, and after finish. It never waits for DOF's main thread or a device; it only takes short internal
+/// locks. A change queued before finish is still applied, after the table element changes queued before it; once finish
+/// started, a closing latches the gate (vpe_dof_latch_output_gate) and returns the latch's generation. Every instance
+/// has a gate of its own, open when it is created; after vpe_dof_latch_output_gate a change applies as a closing.
 VPE_DOF_API int64_t VPE_DOF_CALL vpe_dof_set_output_gate(vpe_dof* dof, int32_t open);
 /// Turns the controllers' connect test sequences (TestOnConnect of Wemos D1 and UMX controllers) off (allowed = 0) for
-/// the rest of the instance, or on again. They run only while the gate is open anyway; turned off, they do not run when
-/// the gate opens either, so a controller that connects late or reconnects while the gate is open, as in a port test,
-/// does not light its whole strip. Call before init to cover the controllers init connects. Every new instance allows
-/// them. VPE_DOF_INVALID_ARGUMENT if `dof` is NULL.
+/// the rest of the instance, or on again. They run only while the gate is open for the controller anyway (one connected
+/// while it was closed turned its outputs off first), and once: a test the gate skipped does not run on a reconnect.
+/// Turned off, they do not run when the gate opens either, so a controller that connects late or reconnects while the
+/// gate is open, as in a port test, does not light its whole strip. Call before init to cover the controllers init
+/// connects. Every new instance allows them. VPE_DOF_INVALID_ARGUMENT if `dof` is NULL.
 VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_set_connect_tests(vpe_dof* dof, int32_t allowed);
 /// Closes the output gate at once, from any thread and in any state, and latches it closed for the rest of the
 /// instance. An opening requested before the latch that DOF's main thread has not applied yet never reaches the
@@ -114,11 +116,12 @@ VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_set_connect_tests(vpe_dof* dof, int32_t
 /// caller saw does not change when a later latch returns. The closing is published to the controllers at once and every
 /// controller's updater sends it without DOF's main thread: an idle updater checks the gate every 50 ms, its polling
 /// interval, which bounds how long it takes to notice; a busy one stops the opening's transfer before its next write to
-/// the device (each report, packet, command or retry), so nothing of the opening goes out after the latch returned, and
-/// then sends the closing to every output. Returns the closing's generation, or -1 if `dof` is NULL. Safe to call from a
-/// realtime thread or a fault handler: it takes no lock and never allocates. Once it returned, the gate reports closed
-/// to every caller, also to an opening DOF's main thread is applying at that moment. It only ever reaches this
-/// instance's gate, never a later instance's.
+/// the device (each report, packet, command or retry), and then sends the closing to every output. A write that was
+/// already past that check when the latch came can still reach the device after the latch returned: at most that one
+/// write per controller, followed by the closing. Nothing else of the opening goes out. Returns the closing's
+/// generation, or -1 if `dof` is NULL. Safe to call from a realtime thread or a fault handler: it takes no lock and
+/// never allocates. Once it returned, the gate reports closed to every caller, also to an opening DOF's main thread is
+/// applying at that moment. It only ever reaches this instance's gate, never a later instance's.
 VPE_DOF_API int64_t VPE_DOF_CALL vpe_dof_latch_output_gate(vpe_dof* dof);
 /// Reports a gate change: 0 until it was published to the controllers (by DOF's main thread; a latch publishes its own
 /// closing at once), then 1, or 2 (superseded) if it is an opening a latch overtook (see vpe_dof_latch_output_gate). A 1

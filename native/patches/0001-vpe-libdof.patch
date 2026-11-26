@@ -1,5 +1,5 @@
 diff --git a/src/Pinball.cpp b/src/Pinball.cpp
-index 389786b..1cad703 100644
+index 389786b..303c2ff 100644
 --- a/src/Pinball.cpp
 +++ b/src/Pinball.cpp
 @@ -12,6 +12,9 @@
@@ -16,7 +16,7 @@ index 389786b..1cad703 100644
     , m_inputQueue(new InputQueue())
     , m_keepMainThreadAlive(false)
     , m_mainThreadDoWork(false)
-+   , m_gate(&OutputGate::Instance())
++   , m_gate(OutputGate::Instance().shared_from_this())
     , m_cabinetOwner(nullptr)
  {
  }
@@ -338,23 +338,24 @@ index 389786b..1cad703 100644
 +
  }
 diff --git a/src/Pinball.h b/src/Pinball.h
-index 4bf85b5..350018a 100644
+index 4bf85b5..1bd1a59 100644
 --- a/src/Pinball.h
 +++ b/src/Pinball.h
-@@ -3,9 +3,12 @@
+@@ -3,9 +3,13 @@
  #include <atomic>
  #include <chrono>
  #include <condition_variable>
 +#include <cstdint>
 +#include <deque>
  #include <functional>
++#include <memory>
  #include <mutex>
  #include <thread>
 +#include <vector>
  
  #include "DOF/DOF.h"
  
-@@ -19,6 +22,7 @@ class GlobalConfig;
+@@ -19,6 +23,7 @@ class GlobalConfig;
  class InputQueue;
  class TableElementData;
  class CabinetOwner;
@@ -362,7 +363,7 @@ index 4bf85b5..350018a 100644
  
  class Pinball
  {
-@@ -42,7 +46,19 @@ public:
+@@ -42,7 +47,19 @@ public:
     void ReceiveData(const std::string& tableElementName, int value);
     void ReceiveData(const TableElementData& tableElementData);
  
@@ -382,7 +383,7 @@ index 4bf85b5..350018a 100644
     void SetAlarms(AlarmHandler* alarms) { m_alarms = alarms; }
     void SetGlobalConfig(GlobalConfig* globalConfig) { m_globalConfig = globalConfig; }
  
-@@ -61,7 +77,34 @@ private:
+@@ -61,7 +78,35 @@ private:
     std::condition_variable m_mainThreadCV;
     std::atomic<bool> m_keepMainThreadAlive;
     std::atomic<bool> m_mainThreadDoWork;
@@ -411,7 +412,8 @@ index 4bf85b5..350018a 100644
 +   void DrainCommands();
  
 +   // The gate of the session this was created in.
-+   OutputGate* m_gate;
++   // Kept while the Pinball lives, whichever session is current.
++   std::shared_ptr<OutputGate> m_gate;
 +   // Set when Finish starts, under m_mainThreadMutex, and never cleared.
 +   bool m_stopping = false;
     bool m_tableStarted = false;
@@ -498,7 +500,7 @@ index f222f0c..bdd8bf0 100644
  }
  
 diff --git a/src/cab/out/OutputControllerCompleteBase.cpp b/src/cab/out/OutputControllerCompleteBase.cpp
-index 2b1478c..a1ad8bd 100644
+index 2b1478c..ed9ce2d 100644
 --- a/src/cab/out/OutputControllerCompleteBase.cpp
 +++ b/src/cab/out/OutputControllerCompleteBase.cpp
 @@ -1,5 +1,6 @@
@@ -508,11 +510,13 @@ index 2b1478c..a1ad8bd 100644
  #include "../../Log.h"
  #include "../../general/StringExtensions.h"
  #include <algorithm>
-@@ -36,16 +37,37 @@ void OutputControllerCompleteBase::Init(Cabinet* cabinet)
+@@ -36,16 +37,53 @@ void OutputControllerCompleteBase::Init(Cabinet* cabinet)
     if (settingsValid)
     {
        SetupOutputs();
 +      RegisterGateUnit();
++      // VPE: a connect test is used up here when the unit registered under a closing (TakeConnectTest).
++      m_connectTestEligible = m_gateUnit->Observe().open;
        m_finishError.clear();
 -      InitUpdaterThread();
 +      try
@@ -535,7 +539,21 @@ index 2b1478c..a1ad8bd 100644
     }
  }
  
-+OutputGate::Unit* OutputControllerCompleteBase::RegisterGateUnit()
++void OutputControllerCompleteBase::ConnectTestSent(const OutputGate::Snapshot& gate)
++{
++   m_deviceUsed = true;
++   if (m_gateUnit && gate.open)
++      m_gateUnit->Ack(gate);
++}
++
++OutputGate::Snapshot OutputControllerCompleteBase::ObserveGate() const { return m_gateUnit ? m_gateUnit->Observe() : OutputGate::Instance().Current(); }
++
++bool OutputControllerCompleteBase::TakeConnectTest()
++{
++   return m_connectTestEligible.exchange(false) && m_gateUnit && ObserveGate().open && OutputGate::Instance().AllowsConnectTests();
++}
++
++OutputGate::UnitHandle OutputControllerCompleteBase::RegisterGateUnit()
 +{
 +   // VPE: units belong to a session's gate; a controller that a connect test registered already keeps its unit.
 +   OutputGate& gate = OutputGate::Instance();
@@ -547,23 +565,56 @@ index 2b1478c..a1ad8bd 100644
  void OutputControllerCompleteBase::Finish()
  {
     FinishUpdaterThread();
-@@ -269,6 +291,7 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -269,15 +307,37 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
  {
     Log::Write(StringExtensions::Build("Updater thread started for {0} {1}", GetXmlElementName(), GetName()));
  
-+   OutputGate::Unit* gateUnit = m_gateUnit;
++   OutputGate::UnitHandle gateUnit = m_gateUnit;
     try
     {
        try
-@@ -285,6 +308,7 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+       {
+          ConnectToController();
++         // VPE: a connect test belongs to the first connect only, also when it did not get that far (a failed
++         // handshake the controller returns from): a reconnect during the session never sends one.
++         m_connectTestEligible = false;
+       }
+       catch (const std::exception& e)
+       {
++         m_connectTestEligible = false;
+          Log::Exception(StringExtensions::Build("Could not connect to controller. Thread will quit: {0}", e.what()));
++         // VPE: a connect that fails after the device took a connect test, which may light it, ends as a session does:
++         // with the blackout, and with an error unless the blackout got through.
++         bool turnedOff = false;
++         if (m_deviceUsed)
++         {
++            OutputGate::Snapshot finalGate = gateUnit->Observe();
++            try
++            {
++               std::vector<uint8_t> zeroValues(m_outputValues.size(), 0);
++               turnedOff = Transfer(zeroValues, true, { finalGate.generation, false });
++            }
++            catch (const std::exception& blackout)
++            {
++               Log::Exception(StringExtensions::Build("Exception occurred while trying to turn off all outputs: {0}", blackout.what()));
++            }
++         }
++         m_disconnectTurnedOff = false;
+          try
+          {
+             DisconnectFromController();
+@@ -285,6 +345,10 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
           catch (...)
           {
           }
++         if (m_deviceUsed && !turnedOff && !m_disconnectTurnedOff)
++            m_finishError = StringExtensions::Build("{0} {1} could not connect after its connect test, its outputs may still be on: {2}", GetXmlElementName(), GetName(), e.what());
++         m_deviceUsed = false;
 +         gateUnit->Die();
           m_updaterThreadFinished = true;
           return;
        }
-@@ -295,13 +319,20 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -295,13 +359,20 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
        bool fullTransferRequired = true;
        while (m_keepUpdaterThreadAlive)
        {
@@ -584,7 +635,7 @@ index 2b1478c..a1ad8bd 100644
           try
           {
              if (m_inUseState == InUseState::ValueChanged)
-@@ -312,14 +343,28 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -312,14 +383,30 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
                 m_inUseState = InUseState::Running;
              }
  
@@ -604,6 +655,8 @@ index 2b1478c..a1ad8bd 100644
 +               }
 +            }
 +            else
++               // VPE: nothing is written while no value changed. A connect test confirmed the opening it went out with
++               // (ConnectTestSent), not this one.
 +               gateUnit->Untouched(gate);
           }
           catch (const std::exception& e)
@@ -615,7 +668,7 @@ index 2b1478c..a1ad8bd 100644
           }
  
           if (!updateOK)
-@@ -345,7 +390,7 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -345,7 +432,7 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
              Log::Write("Reconnected to controller");
           }
  
@@ -624,7 +677,7 @@ index 2b1478c..a1ad8bd 100644
           {
              std::unique_lock<std::mutex> lock(m_conditionMutex);
              m_updateCondition.wait_for(lock, std::chrono::milliseconds(50), [this] { return !m_keepUpdaterThreadAlive || m_updateRequired; });
-@@ -353,17 +398,18 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -353,18 +440,23 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
           m_updateRequired = false;
        }
  
@@ -633,7 +686,7 @@ index 2b1478c..a1ad8bd 100644
        try
        {
 -         if (m_inUseState != InUseState::Startup)
-+         if (m_inUseState != InUseState::Startup || !finalGate.open)
++         if (m_inUseState != InUseState::Startup || !finalGate.open || m_deviceUsed)
           {
              if (died)
                 m_finishError = StringExtensions::Build("{0} {1} lost its connection, its outputs may still be on", GetXmlElementName(), GetName());
@@ -641,11 +694,17 @@ index 2b1478c..a1ad8bd 100644
              {
                 std::vector<uint8_t> zeroValues(m_outputValues.size(), 0);
 -               turnedOff = Transfer(zeroValues, true);
+-               if (!turnedOff)
 +               turnedOff = Transfer(zeroValues, true, { finalGate.generation, false });
-                if (!turnedOff)
++               // VPE: confirmed at the blackout itself. A closing published later, while the controller disconnects,
++               // was not carried by it, and fails as one published after the unit stopped does.
++               if (turnedOff)
++                  gateUnit->AckOff(finalGate);
++               else
                    m_finishError = StringExtensions::Build("{0} {1} could not send its final update", GetXmlElementName(), GetName());
              }
-@@ -390,20 +436,40 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+          }
+@@ -390,20 +482,42 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
        catch (...)
        {
        }
@@ -655,10 +714,12 @@ index 2b1478c..a1ad8bd 100644
 +         gateUnit->Die();
 +      else
 +      {
-+         if (turnedOff || m_disconnectTurnedOff)
++         // A blackout the disconnect sent (UMX_AllOff) is the last write, and confirms there.
++         if (m_disconnectTurnedOff)
 +            gateUnit->AckOff(finalGate);
 +         gateUnit->Stop();
 +      }
++      m_deviceUsed = false;
        Log::Write("Updater thread disconnected and will terminate");
     }
     catch (const std::exception& e)
@@ -687,7 +748,7 @@ index 2b1478c..a1ad8bd 100644
     try
     {
        UpdateOutputs(values);
-@@ -411,10 +477,19 @@ bool OutputControllerCompleteBase::Transfer(const std::vector<uint8_t>& values,
+@@ -411,10 +525,19 @@ bool OutputControllerCompleteBase::Transfer(const std::vector<uint8_t>& values,
     catch (...)
     {
        m_forceFullTransfer = false;
@@ -709,7 +770,7 @@ index 2b1478c..a1ad8bd 100644
 +
  }
 diff --git a/src/cab/out/OutputControllerCompleteBase.h b/src/cab/out/OutputControllerCompleteBase.h
-index e625193..5e6ccd4 100644
+index e625193..6fb346a 100644
 --- a/src/cab/out/OutputControllerCompleteBase.h
 +++ b/src/cab/out/OutputControllerCompleteBase.h
 @@ -3,6 +3,7 @@
@@ -725,25 +786,45 @@ index e625193..5e6ccd4 100644
  protected:
     void SetupOutputs();
 +   // VPE: the controller's unit in the current session's gate, registered before anything is sent to the device.
-+   OutputGate::Unit* RegisterGateUnit();
++   OutputGate::UnitHandle RegisterGateUnit();
     void RenameOutputs();
  
     virtual int GetNumberOfConfiguredOutputs() = 0;
-@@ -49,6 +52,9 @@ protected:
+@@ -49,6 +52,27 @@ protected:
     bool m_forceFullTransfer = false;
     bool m_transferSkipped = false;
     bool m_disconnectTurnedOff = false;
++   // VPE: set once the device took a connect test (ConnectTestSent), which may light it before any value changed: the
++   // session ends with the blackout, also if no value ever changed, and so does a connect that fails after it.
++   std::atomic<bool> m_deviceUsed { false };
++   // VPE: a connect test the device's transport accepted, sent with the gate state `gate` (ObserveGate, read before it
++   // was sent, and open: a test is not sent otherwise). The unit counts as having written that opening, and no later
++   // one: an opening after a closing is written again before it counts.
++   void ConnectTestSent(const OutputGate::Snapshot& gate);
++   // VPE: the gate state the unit sends now (OutputGate::Unit::Observe), which a connect test goes out with.
++   OutputGate::Snapshot ObserveGate() const;
++   // VPE: whether the controller sends its connect test, asked where it would be sent; true once at most. A connect test
++   // runs only during the first connect after Init, only if the unit registered while the gate was open (a session that
++   // starts closed runs none, also not on a reconnect once it opened), and only while the gate is open for the unit and
++   // allows connect tests. The caller checks the gate again right before the write (TransferCancelled), as for every
++   // other write.
++   bool TakeConnectTest();
++   // VPE: this controller's unit of the session's gate (RegisterGateUnit), for a write outside Transfer, such as a
++   // connect test, to be bound to (OutputGate::Transfer).
++   const OutputGate::UnitHandle& GateUnit() const { return m_gateUnit; }
 +   // VPE: asked right before each write to the device; true once a latch overtook the transfer (OutputGate::Transfer),
 +   // which then stops without writing.
 +   bool TransferCancelled();
  
  
     void InitUpdaterThread();
-@@ -76,9 +82,11 @@ private:
+@@ -76,9 +100,13 @@ private:
     mutable std::mutex m_conditionMutex;
     bool m_keepUpdaterThreadAlive;
     std::atomic<bool> m_updaterThreadFinished { false };
-+   OutputGate::Unit* m_gateUnit = nullptr;
++   OutputGate::UnitHandle m_gateUnit;
++   // VPE: see TakeConnectTest.
++   std::atomic<bool> m_connectTestEligible { false };
     std::string m_finishError;
 +   bool m_transferCancelled = false;
     void UpdaterThreadDoIt();
@@ -752,12 +833,80 @@ index e625193..5e6ccd4 100644
  };
  
  }
+diff --git a/src/cab/out/OutputControllerList.cpp b/src/cab/out/OutputControllerList.cpp
+index 0d7a194..45b44d2 100644
+--- a/src/cab/out/OutputControllerList.cpp
++++ b/src/cab/out/OutputControllerList.cpp
+@@ -212,32 +212,39 @@ bool OutputControllerList::FromXml(const tinyxml2::XMLElement* element)
+    while (controllerElement)
+    {
+       std::string typeName = controllerElement->Name();
+-      IOutputController* controller = CreateController(typeName);
+-
+-      if (controller)
++      // VPE: a controller whose configuration cannot be used is skipped, in strict setup too, as toys that cannot be
++      // read are, so the rest of the cabinet starts: whether its XML is unreadable (FromXml returns false) or a setting
++      // is refused (a setter throws, such as an Id out of range). VPE imports cabinets without libdof reading them (that
++      // would open their devices), and must not activate one that setup then refuses as a whole. Nothing a skipped
++      // controller is made of opens a device or registers with the output gate; that happens in Init.
++      IOutputController* controller = nullptr;
++      bool loaded = false;
++      std::string error;
++      try
+       {
+-         bool loaded;
+-         try
+-         {
+-            loaded = controller->FromXml(controllerElement);
+-         }
+-         catch (...)
+-         {
+-            delete controller;
+-            throw;
+-         }
+-         if (loaded)
+-         {
+-            push_back(controller);
+-            Log::Write(StringExtensions::Build("Loaded output controller: {0} ({1})", controller->GetName(), typeName));
+-         }
+-         else
+-         {
++         controller = CreateController(typeName);
++         loaded = controller && controller->FromXml(controllerElement);
++      }
++      catch (const std::exception& e)
++      {
++         error = e.what();
++      }
++      catch (...)
++      {
++         error = "unknown error";
++      }
++      if (controller && loaded)
++      {
++         push_back(controller);
++         Log::Write(StringExtensions::Build("Loaded output controller: {0} ({1})", controller->GetName(), typeName));
++      }
++      else if (controller || !error.empty())
++      {
++         if (error.empty())
+             Log::Warning(StringExtensions::Build("Failed to load output controller from XML: {0}", typeName));
+-            delete controller;
+-            if (Config::GetInstance()->IsStrictSetup())
+-               throw std::runtime_error(StringExtensions::Build("the output controller {0} could not be loaded", typeName));
+-         }
++         else
++            Log::Warning(StringExtensions::Build("Failed to load output controller from XML: {0}: {1}", typeName, error));
++         delete controller;
+       }
+ 
+       controllerElement = controllerElement->NextSiblingElement();
 diff --git a/src/cab/out/OutputGate.cpp b/src/cab/out/OutputGate.cpp
 new file mode 100644
-index 0000000..1ad550a
+index 0000000..316d022
 --- /dev/null
 +++ b/src/cab/out/OutputGate.cpp
-@@ -0,0 +1,342 @@
+@@ -0,0 +1,379 @@
 +#include "OutputGate.h"
 +
 +#include <cstdint>
@@ -778,17 +927,35 @@ index 0000000..1ad550a
 +
 +std::mutex s_sessionMutex;
 +
++// The current session's gate, read without a lock by Instance().
 +std::atomic<OutputGate*>& CurrentSession()
 +{
 +   static std::atomic<OutputGate*> current { nullptr };
 +   return current;
 +}
 +
++// What keeps the current session's gate; replaced, under s_sessionMutex, when the next session begins. Never destroyed,
++// so a thread that ends after the static destructors still finds its gate.
++std::shared_ptr<OutputGate>& CurrentOwner()
++{
++   static std::shared_ptr<OutputGate>* owner = new std::shared_ptr<OutputGate>();
++   return *owner;
++}
++
 +thread_local OutputGate::Transfer* t_transfer = nullptr;
 +
 +}
 +
-+OutputGate::Snapshot OutputGate::Unit::Observe() const { return m_gate->Current(); }
++OutputGate::Snapshot OutputGate::Unit::Observe() const
++{
++   Snapshot current = m_gate->Current();
++   // The closing in force when the unit registered stays in force for it until it confirmed or failed it: a session
++   // that starts closed starts dark on every unit, also on one whose first update comes after the gate opened.
++   int64_t closed = m_closedAtRegistration;
++   if (current.open && closed != 0 && m_ackedClosed.load(std::memory_order_acquire) < closed && m_failed.load(std::memory_order_acquire) < closed)
++      return { closed, false };
++   return current;
++}
 +
 +bool OutputGate::Unit::IsAcked(const Snapshot& snapshot) const
 +{
@@ -848,7 +1015,7 @@ index 0000000..1ad550a
 +   // The session's first generation, open and published.
 +   int64_t generation = lastGeneration + 1;
 +   m_requested.store(generation << 1, std::memory_order_relaxed);
-+   m_published.store(Pack(generation, true), std::memory_order_relaxed);
++   m_published.store(Pack(generation, true, false), std::memory_order_relaxed);
 +   Entry entry;
 +   entry.open = true;
 +   entry.decided = true;
@@ -866,7 +1033,8 @@ index 0000000..1ad550a
 +   gate = CurrentSession().load(std::memory_order_acquire);
 +   if (!gate)
 +   {
-+      gate = new OutputGate(0);
++      CurrentOwner() = std::shared_ptr<OutputGate>(new OutputGate(0));
++      gate = CurrentOwner().get();
 +      CurrentSession().store(gate, std::memory_order_release);
 +   }
 +   return *gate;
@@ -876,27 +1044,34 @@ index 0000000..1ad550a
 +{
 +   OutputGate& previous = Instance();
 +   std::lock_guard<std::mutex> lock(s_sessionMutex);
-+   // Never freed: a latch, a unit or a hung updater thread of the ended session may still use it.
-+   OutputGate* gate = new OutputGate(previous.m_requested.load(std::memory_order_acquire) >> 1);
-+   CurrentSession().store(gate, std::memory_order_release);
++   std::shared_ptr<OutputGate> gate(new OutputGate(previous.m_requested.load(std::memory_order_acquire) >> 1));
++   CurrentSession().store(gate.get(), std::memory_order_release);
++   // The previous gate is freed here unless its instance, its Pinball or a unit handle (a controller, an updater thread
++   // that still runs) holds it.
++   CurrentOwner() = gate;
 +   return *gate;
 +}
 +
 +OutputGate::Snapshot OutputGate::Current() const
 +{
++   // The state comes from the published word alone, so it is the state Publish recorded for the generation.
 +   int64_t word = m_published.load(std::memory_order_acquire);
-+   return { word >> 1, (word & 1) != 0 && !m_latched.load(std::memory_order_acquire) };
++   return { word >> 2, (word & OpenBit) != 0 && (word & LatchedBit) == 0 };
 +}
 +
-+OutputGate::Unit* OutputGate::Register(const std::string& name)
++OutputGate::UnitHandle OutputGate::Register(const std::string& name)
 +{
 +   std::lock_guard<std::mutex> lock(m_mutex);
 +   auto unit = std::make_unique<Unit>();
 +   unit->m_gate = this;
 +   unit->m_name = name;
++   Snapshot current = Current();
++   if (!current.open)
++      unit->m_closedAtRegistration = current.generation;
 +   Unit* result = unit.get();
 +   m_units.push_back(std::move(unit));
-+   return result;
++   // Shares the gate's ownership: the gate owns its units, the handle keeps the gate.
++   return UnitHandle(shared_from_this(), result);
 +}
 +
 +void OutputGate::RegisterFailed(const std::string& name) { Register(name)->Die(); }
@@ -949,6 +1124,9 @@ index 0000000..1ad550a
 +{
 +   m_latched.store(true, std::memory_order_release);
 +   m_open.store(false, std::memory_order_release);
++   // From here on every generation is published closed, and Current() reports closed: in one step with a publication
++   // that raced it, so an opening is either published before this, open, or after it, closed.
++   m_published.fetch_or(LatchedBit, std::memory_order_acq_rel);
 +   // Takes the generation and sets the latch flag in one step: every generation taken after it is recorded as a closing
 +   // (Request), whenever this latch publishes.
 +   int64_t word = m_requested.load(std::memory_order_acquire);
@@ -962,7 +1140,8 @@ index 0000000..1ad550a
 +{
 +   // Published at once, so the updaters send zeros without waiting for the main thread. Until then the latch's
 +   // generation reports as not applied; it is a closing either way.
-+   RaisePublished(generation, false);
++   bool sent;
++   RaisePublished(generation, false, sent);
 +}
 +
 +int64_t OutputGate::Latch()
@@ -974,15 +1153,20 @@ index 0000000..1ad550a
 +   return generation;
 +}
 +
-+bool OutputGate::RaisePublished(int64_t generation, bool open)
++bool OutputGate::RaisePublished(int64_t generation, bool open, bool& sent)
 +{
-+   int64_t current = m_published.load(std::memory_order_relaxed);
-+   int64_t word = Pack(generation, open);
-+   while ((current >> 1) < generation)
++   int64_t current = m_published.load(std::memory_order_acquire);
++   while ((current >> 2) < generation)
 +   {
-+      if (m_published.compare_exchange_weak(current, word, std::memory_order_acq_rel, std::memory_order_relaxed))
++      // The latched bit is carried over: once set, it stays.
++      bool latched = (current & LatchedBit) != 0;
++      if (m_published.compare_exchange_weak(current, Pack(generation, open && !latched, latched), std::memory_order_acq_rel, std::memory_order_acquire))
++      {
++         sent = open && !latched;
 +         return true;
++      }
 +   }
++   sent = open && (current & LatchedBit) == 0;
 +   return false;
 +}
 +
@@ -991,8 +1175,10 @@ index 0000000..1ad550a
 +   std::lock_guard<std::mutex> lock(m_mutex);
 +   auto it = m_history.find(generation);
 +   bool requested = it != m_history.end() ? it->second.open : m_open.load(std::memory_order_acquire);
-+   bool open = requested && !m_latched.load(std::memory_order_acquire);
-+   bool raised = RaisePublished(generation, open);
++   // Whether the session latched is decided in the step that publishes, not read before it: a latch that began in
++   // between makes it go out closed.
++   bool open;
++   bool raised = RaisePublished(generation, requested, open);
 +   // What it reports is decided here, from what was published, and kept: nothing installed later changes it.
 +   if (it != m_history.end() && !it->second.decided)
 +   {
@@ -1102,10 +1288,10 @@ index 0000000..1ad550a
 +}
 diff --git a/src/cab/out/OutputGate.h b/src/cab/out/OutputGate.h
 new file mode 100644
-index 0000000..0913671
+index 0000000..7ea71ed
 --- /dev/null
 +++ b/src/cab/out/OutputGate.h
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,256 @@
 +#pragma once
 +
 +#include <atomic>
@@ -1127,10 +1313,12 @@ index 0000000..0913671
 +// unit acknowledges the state of a generation once a transfer to its hardware carried that state, so the host can tell
 +// when the outputs are really off.
 +//
-+// Each session (one DOF instance, from its creation on) has its own gate object. Instance() is the current session's;
-+// one that ended stays allocated, so a latch, a unit or a hung updater thread of an ended session only ever reaches its
-+// own session, never the next one.
-+class OutputGate
++// Each session (one DOF instance, from its creation on) has its own gate object. Instance() is the current session's.
++// A gate is shared: the current session slot, the host's instance, Pinball and every unit handle (held by its controller
++// and copied by its updater thread) keep it, and it is freed with its history and units once none does. So a latch, a
++// unit or a hung updater thread of an ended session only ever reaches its own session, never the next one, and a host
++// that runs many sessions keeps only the gates something still uses.
++class OutputGate : public std::enable_shared_from_this<OutputGate>
 +{
 +public:
 +   // A generation and the state it set, read together.
@@ -1166,7 +1354,9 @@ index 0000000..0913671
 +   class Unit
 +   {
 +   public:
-+      // Called by the unit's updater before it copies the values it sends, under the lock the values are set with.
++      // Called by the unit's updater before it copies the values it sends, under the lock the values are set with. A unit
++      // registered while the gate was closed gets that closing until it confirmed or failed it, also once the gate
++      // opened: its device, which an earlier session may have left lit, is turned off before any opening reaches it.
 +      Snapshot Observe() const;
 +      // Whether the hardware already got the state of `snapshot`, or the gate is open at a unit DOF leaves alone; until
 +      // then the updater transfers every output.
@@ -1197,16 +1387,26 @@ index 0000000..0913671
 +      std::atomic<int64_t> m_failed { 0 };
 +      std::atomic<bool> m_dead { false };
 +      std::atomic<bool> m_stopped { false };
++      // The closing the gate was at when the unit registered, or 0 if it was open.
++      int64_t m_closedAtRegistration = 0;
 +   };
 +
++   // A unit, and with it its session's gate: the gate lives as long as any handle to one of its units.
++   using UnitHandle = std::shared_ptr<Unit>;
++
 +   // A transfer of the values observed at `snapshot`, made by the calling thread while this exists. A latch overtakes
-+   // the transfer of an opening: from then on TransferCancelled() is true, and every write point stops before it writes,
-+   // so no value of the opening goes out after the latch. The transfer then stays unconfirmed and the updater sends the
-+   // closing in full next.
++   // the transfer of an opening: from then on TransferCancelled() is true, and every write point stops before it writes.
++   // A write already past its check when the latch came still goes out: at most that one write per controller, whose
++   // updater has one transfer at a time; no later one does. The transfer then stays unconfirmed and the updater sends
++   // the closing in full next.
 +   class Transfer
 +   {
 +   public:
 +      Transfer(const Unit* unit, const Snapshot& snapshot);
++      Transfer(const UnitHandle& unit, const Snapshot& snapshot)
++         : Transfer(unit.get(), snapshot)
++      {
++      }
 +      ~Transfer();
 +      Transfer(const Transfer&) = delete;
 +      Transfer& operator=(const Transfer&) = delete;
@@ -1226,10 +1426,11 @@ index 0000000..0913671
 +   // must then stop without writing. False outside a transfer and for a closing.
 +   static bool TransferCancelled();
 +
-+   // The current session's gate.
++   // The current session's gate, kept by the session slot until the next session begins.
 +   static OutputGate& Instance();
 +   // Starts a new session with an open gate and returns it; Instance() returns it from now on. Generations go on from
-+   // the previous session's. The previous session's gate stays allocated (see above).
++   // the previous session's. The slot lets go of the previous session's gate, which lives on while anything else holds
++   // it (see above). A caller that uses the gate beyond the session holds it with shared_from_this().
 +   static OutputGate& BeginSession();
 +
 +   // The state outputs report. It changes before the generation that set it is published. The latch decides on its own,
@@ -1245,9 +1446,10 @@ index 0000000..0913671
 +   // generation is published.
 +   Snapshot Current() const;
 +
-+   // Registers an output controller unit of this session, before anything is sent to its device. The returned unit
-+   // lives until the process ends.
-+   Unit* Register(const std::string& name);
++   // Registers an output controller unit of this session, before anything is sent to its device. The unit and the
++   // gate live as long as the returned handle or one of its copies. Registered while the gate is closed, the unit sends
++   // that closing before any later opening (Unit::Observe).
++   UnitHandle Register(const std::string& name);
 +   // Registers a configured unit that cannot deliver anything, such as a device that is not connected.
 +   void RegisterFailed(const std::string& name);
 +
@@ -1299,7 +1501,10 @@ index 0000000..0913671
 +
 +   explicit OutputGate(int64_t lastGeneration);
 +
-+   static int64_t Pack(int64_t generation, bool open) { return (generation << 1) | (open ? 1 : 0); }
++   // The published word: the generation, whether the session latched, and the state the units send for it.
++   static constexpr int64_t OpenBit = 1;
++   static constexpr int64_t LatchedBit = 2;
++   static int64_t Pack(int64_t generation, bool open, bool latched) { return (generation << 2) | (latched ? LatchedBit : 0) | (open ? OpenBit : 0); }
 +
 +   // The two halves of Latch: closes at once and reserves the generation with the latch flag, then publishes it.
 +   int64_t BeginLatch();
@@ -1316,13 +1521,17 @@ index 0000000..0913671
 +   bool IsSuperseded(int64_t generation, bool open, int64_t applied) const;
 +   // Records the state of a generation and forgets the oldest ones.
 +   void Record(int64_t generation, const Entry& entry);
-+   // Publishes `generation` unless a later one was published already. Lock-free.
-+   bool RaisePublished(int64_t generation, bool open);
++   // Publishes `generation` unless a later one was published already, and returns whether it did. Lock-free. It goes
++   // out closed once the published word says latched, in the same step that publishes it: `sent` is the state it was
++   // published with, what Current() gave the units for it.
++   bool RaisePublished(int64_t generation, bool open, bool& sent);
 +
 +   std::atomic<bool> m_open { true };
 +   std::atomic<bool> m_connectTests { true };
 +   std::atomic<bool> m_latched { false };
-+   // The last published generation and its state: (generation << 1) | open.
++   // The last published generation, whether the session latched, and the state the units send: Pack. The latch sets
++   // its bit before it reserves its generation, so a generation is published either before the latch began, open if it
++   // asked to, or after, closed: what Publish records is what Current() gave the units.
 +   std::atomic<int64_t> m_published { 0 };
 +   // The last generation taken, and whether the session latched: (generation << 1) | latched.
 +   std::atomic<int64_t> m_requested { 0 };
@@ -1352,7 +1561,7 @@ index 47b36ec..9e608ae 100644
        output->ValueChanged += [this](void* sender, const OutputEventArgs& args) { OutputValueChanged.Invoke(this, args); };
     }
 diff --git a/src/cab/out/adressableledstrip/DirectStripController.cpp b/src/cab/out/adressableledstrip/DirectStripController.cpp
-index d9a5f85..085c22f 100644
+index d9a5f85..61b94f7 100644
 --- a/src/cab/out/adressableledstrip/DirectStripController.cpp
 +++ b/src/cab/out/adressableledstrip/DirectStripController.cpp
 @@ -1,5 +1,6 @@
@@ -1374,7 +1583,7 @@ index d9a5f85..085c22f 100644
  
  void DirectStripController::UpdaterThreadDoIt()
  {
-+   OutputGate::Unit* gateUnit = m_gateUnit;
++   OutputGate::UnitHandle gateUnit = m_gateUnit;
     if (!m_controller)
     {
        m_controller = new DirectStripControllerApi(m_controllerNumber);
@@ -1433,8 +1642,20 @@ index d9a5f85..085c22f 100644
     m_updaterThreadFinished = true;
  }
  
+@@ -267,7 +285,10 @@ bool DirectStripController::FromXml(const tinyxml2::XMLElement* element)
+    {
+       try
+       {
+-         int controllerNumber = std::stoi(controllerNumberElement->GetText());
++         // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board.
++         int controllerNumber = 0;
++         if (!StringExtensions::TryParseInt(controllerNumberElement->GetText(), controllerNumber))
++            return false;
+          SetControllerNumber(controllerNumber);
+       }
+       catch (...)
 diff --git a/src/cab/out/adressableledstrip/DirectStripController.h b/src/cab/out/adressableledstrip/DirectStripController.h
-index e112579..175fad3 100644
+index e112579..6ce43dc 100644
 --- a/src/cab/out/adressableledstrip/DirectStripController.h
 +++ b/src/cab/out/adressableledstrip/DirectStripController.h
 @@ -4,6 +4,7 @@
@@ -1449,26 +1670,54 @@ index e112579..175fad3 100644
     std::atomic<bool> m_updaterThreadFinished { false };
  
     DirectStripControllerApi* m_controller;
-+   OutputGate::Unit* m_gateUnit = nullptr;
++   OutputGate::UnitHandle m_gateUnit;
  };
  
  }
 \ No newline at end of file
 diff --git a/src/cab/out/adressableledstrip/TeensyStripController.cpp b/src/cab/out/adressableledstrip/TeensyStripController.cpp
-index d3678e4..b70ae6a 100644
+index d3678e4..c502afc 100644
 --- a/src/cab/out/adressableledstrip/TeensyStripController.cpp
 +++ b/src/cab/out/adressableledstrip/TeensyStripController.cpp
-@@ -245,6 +245,9 @@ void TeensyStripController::UpdateOutputs(const std::vector<uint8_t>& outputValu
+@@ -213,18 +213,20 @@ bool TeensyStripController::VerifySettings()
+    return true;
+ }
+ 
+-void TeensyStripController::SendLedstripData(const std::vector<uint8_t>& outputValues, int targetPosition)
++bool TeensyStripController::SendLedstripData(const std::vector<uint8_t>& outputValues, int targetPosition)
+ {
+    int nrOfLeds = static_cast<int>(outputValues.size()) / 3;
+    std::vector<uint8_t> commandData = { (uint8_t)'R', (uint8_t)(targetPosition >> 8), (uint8_t)(targetPosition & 255), (uint8_t)(nrOfLeds >> 8), (uint8_t)(nrOfLeds & 255) };
++   // VPE: the command and the values are one write, the same bytes on the line: a latch can let at most that one write
++   // through, never a header without its values or values after a stopped header.
++   commandData.insert(commandData.end(), outputValues.begin(), outputValues.end());
++   if (TransferCancelled())
++      return false;
+ 
+-   enum sp_return result = sp_blocking_write(m_comPort, commandData.data(), 5, m_comPortTimeOutMs);
+-   if (result < 0)
+-      throw std::runtime_error(StringExtensions::Build("Failed to write command data: {0}", sp_last_error_message()));
+-
+-   result = sp_blocking_write(m_comPort, outputValues.data(), outputValues.size(), m_comPortTimeOutMs);
++   enum sp_return result = sp_blocking_write(m_comPort, commandData.data(), commandData.size(), m_comPortTimeOutMs);
+    if (result < 0)
+       throw std::runtime_error(StringExtensions::Build("Failed to write output values: {0}", sp_last_error_message()));
++   return true;
+ }
+ 
+ void TeensyStripController::UpdateOutputs(const std::vector<uint8_t>& outputValues)
+@@ -245,7 +247,9 @@ void TeensyStripController::UpdateOutputs(const std::vector<uint8_t>& outputValu
           int targetPosition = i * m_numberOfLedsPerChannel;
  
           std::vector<uint8_t> stripData(outputValues.begin() + sourcePosition * 3, outputValues.begin() + sourcePosition * 3 + nrOfLedsOnStrip * 3);
+-         SendLedstripData(stripData, targetPosition);
 +         // VPE: a latch that overtook the transfer stops it before the next write (each strip, then the output command).
-+         if (TransferCancelled())
++         if (!SendLedstripData(stripData, targetPosition))
 +            return;
-          SendLedstripData(stripData, targetPosition);
  
           bytesRead = -1;
-@@ -270,6 +273,8 @@ void TeensyStripController::UpdateOutputs(const std::vector<uint8_t>& outputValu
+          answerData = std::vector<uint8_t>(1);
+@@ -270,6 +274,8 @@ void TeensyStripController::UpdateOutputs(const std::vector<uint8_t>& outputValu
     }
  
     commandData = { (uint8_t)'O' };
@@ -1477,8 +1726,23 @@ index d3678e4..b70ae6a 100644
     enum sp_return result = sp_blocking_write(m_comPort, commandData.data(), 1, m_comPortTimeOutMs);
     if (result < 0)
        throw std::runtime_error(StringExtensions::Build("Failed to write output command: {0}", sp_last_error_message()));
+diff --git a/src/cab/out/adressableledstrip/TeensyStripController.h b/src/cab/out/adressableledstrip/TeensyStripController.h
+index e910f68..51c6565 100644
+--- a/src/cab/out/adressableledstrip/TeensyStripController.h
++++ b/src/cab/out/adressableledstrip/TeensyStripController.h
+@@ -107,7 +107,9 @@ protected:
+    virtual void DisconnectFromController() override;
+    virtual void UpdateOutputs(const std::vector<uint8_t>& outputValues) override;
+ 
+-   virtual void SendLedstripData(const std::vector<uint8_t>& outputValues, int targetPosition);
++   // VPE: sends the strip's command and values in one write, checked once they are prepared; false if a latch that
++   // overtook the transfer stopped it before that write.
++   virtual bool SendLedstripData(const std::vector<uint8_t>& outputValues, int targetPosition);
+    virtual void SetupController();
+    int ReadPortWait(uint8_t* buffer, int bufferOffset, int numberOfBytes);
+ 
 diff --git a/src/cab/out/adressableledstrip/UMXController.cpp b/src/cab/out/adressableledstrip/UMXController.cpp
-index 9cbe817..427556d 100644
+index 9cbe817..cb58397 100644
 --- a/src/cab/out/adressableledstrip/UMXController.cpp
 +++ b/src/cab/out/adressableledstrip/UMXController.cpp
 @@ -1,4 +1,5 @@
@@ -1487,7 +1751,31 @@ index 9cbe817..427556d 100644
  #include "UMXControllerAutoConfigurator.h"
  #include "../../Cabinet.h"
  #include "../OutputControllerList.h"
-@@ -98,7 +99,11 @@ void UMXController::UpdateOutputs(const std::vector<uint8_t>& outputValues)
+@@ -47,9 +48,12 @@ int UMXController::GetNumberOfConfiguredOutputs() { return m_dev ? m_dev->NumOut
+ 
+ void UMXController::ConnectToController()
+ {
++   // VPE: only a controller that ran turns its outputs off here (a reconnect), so a connect test that started before
++   // the first connect is not cut short; the session's end turns it off.
+    try
+    {
+-      DisconnectFromController();
++      if (m_inUseState == InUseState::Running)
++         DisconnectFromController();
+    }
+    catch (const std::exception& e)
+    {
+@@ -63,7 +67,8 @@ void UMXController::ConnectToController()
+ 
+ void UMXController::DisconnectFromController()
+ {
+-   if (m_inUseState == InUseState::Running && m_dev)
++   // VPE: also after a connect test that started, which may still light the strip when the session ends.
++   if ((m_inUseState == InUseState::Running || m_deviceUsed) && m_dev)
+    {
+       m_dev->SendCommand(UMXDevice::UMXCommand::UMX_AllOff);
+       m_disconnectTurnedOff = true;
+@@ -98,7 +103,11 @@ void UMXController::UpdateOutputs(const std::vector<uint8_t>& outputValues)
  
     if (!m_dev)
        throw std::runtime_error(StringExtensions::Build("UMX controller {0} has no device", GetName()));
@@ -1500,7 +1788,7 @@ index 9cbe817..427556d 100644
     m_lastTime = std::chrono::steady_clock::now();
     m_lastTimeInit = true;
  }
-@@ -122,20 +127,26 @@ void UMXController::UpdateCabinetFromConfig(Cabinet* cabinet)
+@@ -122,20 +131,32 @@ void UMXController::UpdateCabinetFromConfig(Cabinet* cabinet)
        return;
     }
  
@@ -1511,12 +1799,18 @@ index 9cbe817..427556d 100644
           static_cast<uint8_t>(m_dev->m_testOnConnect),
           m_dev->m_testOnConnectDuration,
        };
-+      OutputGate::Unit* gateUnit = RegisterGateUnit();
++      OutputGate::UnitHandle gateUnit = RegisterGateUnit();
++      // VPE: the test goes out with the gate as this unit sends it, and confirms that opening only (ConnectTestSent).
++      OutputGate::Snapshot gate = ObserveGate();
        try
        {
 -         m_dev->SendCommand(UMXDevice::UMXCommand::UMX_StartTest, parameters);
-+         if (!m_dev->SendCommand(UMXDevice::UMXCommand::UMX_StartTest, parameters, []() { return !OutputGate::Instance().AllowsConnectTests(); }))
++         // VPE: the cancel check runs right before the write: a closing or a latch since the gate was observed skips it.
++         if (!gate.open
++            || !m_dev->SendCommand(UMXDevice::UMXCommand::UMX_StartTest, parameters, [this]() { return !OutputGate::Instance().AllowsConnectTests() || !ObserveGate().open; }))
 +            Log::Write(StringExtensions::Build("UMX controller {0} does not start its connect test, the output gate is closed", GetName()));
++         else
++            ConnectTestSent(gate);
        }
        catch (const std::exception& e)
        {
@@ -1529,6 +1823,18 @@ index 9cbe817..427556d 100644
           Log::Warning(StringExtensions::Build("UMX controller {0} could not start its connect test: {1}", GetName(), e.what()));
        }
     }
+@@ -269,7 +290,10 @@ bool UMXController::FromXml(const tinyxml2::XMLElement* element)
+    {
+       try
+       {
+-         int number = std::stoi(numberElement->GetText());
++         // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board.
++         int number = 0;
++         if (!StringExtensions::TryParseInt(numberElement->GetText(), number))
++            return false;
+          SetNumber(number);
+       }
+       catch (...)
 diff --git a/src/cab/out/adressableledstrip/UMXControllerAutoConfigurator.cpp b/src/cab/out/adressableledstrip/UMXControllerAutoConfigurator.cpp
 index 385851c..c9e4536 100644
 --- a/src/cab/out/adressableledstrip/UMXControllerAutoConfigurator.cpp
@@ -1638,7 +1944,7 @@ index 4475b47..07e2e83 100644
     virtual bool IsLost() const { return false; }
     virtual void Release() { }
 diff --git a/src/cab/out/adressableledstrip/WemosD1StripController.cpp b/src/cab/out/adressableledstrip/WemosD1StripController.cpp
-index cb013c8..51cf2b9 100644
+index cb013c8..81f5327 100644
 --- a/src/cab/out/adressableledstrip/WemosD1StripController.cpp
 +++ b/src/cab/out/adressableledstrip/WemosD1StripController.cpp
 @@ -1,5 +1,6 @@
@@ -1648,20 +1954,105 @@ index cb013c8..51cf2b9 100644
  #include "../../../Log.h"
  #include "../../../general/StringExtensions.h"
  #include <chrono>
-@@ -66,10 +67,11 @@ void WemosD1MPStripController::SetupController()
+@@ -66,14 +67,38 @@ void WemosD1MPStripController::SetupController()
        }
     }
  
 -   if (m_testOnConnect)
-+   if (m_testOnConnect && OutputGate::Instance().AllowsConnectTests())
-+      Log::Write("Send a test request to the controller");
-+   if (m_testOnConnect && OutputGate::Instance().AllowsConnectTests())
++   // VPE: the test is decided once (TakeConnectTest): never on a reconnect, nor in a session that starts closed, which
++   // starts dark. It goes out with the gate as this unit sends it, checked again right before the write as every other
++   // write is, so a closing or a latch since (also one during the log line) skips it, and its 2 s wait.
++   bool test = m_testOnConnect && TakeConnectTest();
++   m_testOnConnect = false;
++   if (test)
     {
-       commandData = { (uint8_t)'T' };
--      Log::Write("Send a test request to the controller");
+-      commandData = { (uint8_t)'T' };
+       Log::Write("Send a test request to the controller");
+-
+-      enum sp_return result = sp_blocking_write(GetComPort(), commandData.data(), 1, GetComPortTimeOutMs());
+-      if (result < 0)
+-         throw std::runtime_error(StringExtensions::Build("Failed to write test command: {0}", sp_last_error_message()));
++      OutputGate::Snapshot gate = ObserveGate();
++      bool sent = false;
++      if (gate.open && OutputGate::Instance().AllowsConnectTests())
++      {
++         OutputGate::Transfer transfer(GateUnit(), gate);
++         if (!TransferCancelled())
++         {
++            commandData = { (uint8_t)'T' };
++            enum sp_return result = sp_blocking_write(GetComPort(), commandData.data(), 1, GetComPortTimeOutMs());
++            if (result < 0)
++               throw std::runtime_error(StringExtensions::Build("Failed to write test command: {0}", sp_last_error_message()));
++            if (result == 0)
++               throw std::runtime_error("Failed to write test command: the port took nothing within its timeout");
++            // VPE: the port took the test, which may light the strip whatever the controller answers: the session ends
++            // with the blackout from here on, also if the setup fails below.
++            sent = true;
++            ConnectTestSent(gate);
++         }
++      }
++      if (!sent)
++      {
++         Log::Write("The test request is not sent, the output gate closed");
++         return;
++      }
  
-       enum sp_return result = sp_blocking_write(GetComPort(), commandData.data(), 1, GetComPortTimeOutMs());
-       if (result < 0)
+       std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+ 
+@@ -95,12 +120,10 @@ void WemosD1MPStripController::SetupController()
+          throw std::runtime_error(StringExtensions::Build(
+             "Expected a Ack (A) after requesting a test sequence, but received no answer or a unexpected answer ({0}). Will not send data to the controller.", std::string(1, receivedChar)));
+       }
+-
+-      m_testOnConnect = false;
+    }
+ }
+ 
+-void WemosD1MPStripController::SendLedstripData(const std::vector<uint8_t>& outputValues, int targetPosition)
++bool WemosD1MPStripController::SendLedstripData(const std::vector<uint8_t>& outputValues, int targetPosition)
+ {
+    if (m_useCompression)
+    {
+@@ -148,18 +171,22 @@ void WemosD1MPStripController::SendLedstripData(const std::vector<uint8_t>& outp
+ 
+          std::vector<uint8_t> commandData = { (uint8_t)'Q', (uint8_t)(targetPosition >> 8), (uint8_t)(targetPosition & 255), (uint8_t)(nbData >> 8), (uint8_t)(nbData & 255),
+             (uint8_t)(nbLeds >> 8), (uint8_t)(nbLeds & 255) };
++         // VPE: as in TeensyStripController, one write, checked once the values are compressed.
++         commandData.insert(commandData.end(), m_compressedData.begin(), m_compressedData.end());
++         if (TransferCancelled())
++            return false;
+ 
+-         sp_blocking_write(GetComPort(), commandData.data(), 7, GetComPortTimeOutMs());
+-         sp_blocking_write(GetComPort(), m_compressedData.data(), m_compressedData.size(), GetComPortTimeOutMs());
++         sp_blocking_write(GetComPort(), commandData.data(), commandData.size(), GetComPortTimeOutMs());
++         return true;
+       }
+       else
+       {
+-         TeensyStripController::SendLedstripData(outputValues, targetPosition);
++         return TeensyStripController::SendLedstripData(outputValues, targetPosition);
+       }
+    }
+    else
+    {
+-      TeensyStripController::SendLedstripData(outputValues, targetPosition);
++      return TeensyStripController::SendLedstripData(outputValues, targetPosition);
+    }
+ }
+ 
+diff --git a/src/cab/out/adressableledstrip/WemosD1StripController.h b/src/cab/out/adressableledstrip/WemosD1StripController.h
+index 4b18a5d..b063812 100644
+--- a/src/cab/out/adressableledstrip/WemosD1StripController.h
++++ b/src/cab/out/adressableledstrip/WemosD1StripController.h
+@@ -29,7 +29,7 @@ public:
+ 
+ protected:
+    virtual void SetupController() override;
+-   virtual void SendLedstripData(const std::vector<uint8_t>& outputValues, int targetPosition) override;
++   virtual bool SendLedstripData(const std::vector<uint8_t>& outputValues, int targetPosition) override;
+ 
+ protected:
+    std::vector<uint8_t> m_compressedData;
 diff --git a/src/cab/out/comport/PinControl.cpp b/src/cab/out/comport/PinControl.cpp
 index 2b16bd5..605b5ce 100644
 --- a/src/cab/out/comport/PinControl.cpp
@@ -1717,7 +2108,7 @@ index 1bebe23..980636d 100644
     virtual void DisconnectFromController() override;
  
 diff --git a/src/cab/out/dmx/ArtNet.cpp b/src/cab/out/dmx/ArtNet.cpp
-index b7516b8..25936a5 100644
+index b7516b8..f1285c0 100644
 --- a/src/cab/out/dmx/ArtNet.cpp
 +++ b/src/cab/out/dmx/ArtNet.cpp
 @@ -29,7 +29,12 @@ void ArtNet::UpdateOutputs(const std::vector<uint8_t>& outputValues)
@@ -1733,6 +2124,18 @@ index b7516b8..25936a5 100644
           }
           else
           {
+@@ -109,7 +114,10 @@ bool ArtNet::FromXml(const tinyxml2::XMLElement* element)
+    {
+       try
+       {
+-         int universe = std::stoi(universeElement->GetText());
++         // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board.
++         int universe = 0;
++         if (!StringExtensions::TryParseInt(universeElement->GetText(), universe))
++            return false;
+          SetUniverse(static_cast<short>(universe));
+       }
+       catch (...)
 diff --git a/src/cab/out/dmx/artnetengine/Engine.cpp b/src/cab/out/dmx/artnetengine/Engine.cpp
 index 302baa3..22ce37c 100644
 --- a/src/cab/out/dmx/artnetengine/Engine.cpp
@@ -1755,7 +2158,7 @@ index 302baa3..22ce37c 100644
     {
        try
 diff --git a/src/cab/out/dudescab/DudesCab.cpp b/src/cab/out/dudescab/DudesCab.cpp
-index b9a8fd5..ba9fc08 100644
+index b9a8fd5..8f6d8de 100644
 --- a/src/cab/out/dudescab/DudesCab.cpp
 +++ b/src/cab/out/dudescab/DudesCab.cpp
 @@ -25,6 +25,7 @@ namespace DOF
@@ -1967,6 +2370,18 @@ index b9a8fd5..ba9fc08 100644
  }
  
  DudesCab::Device::HIDCommonReportType DudesCab::Device::RemapCommonCommand(HIDCommonReportType command)
+@@ -832,7 +886,10 @@ bool DudesCab::FromXml(const tinyxml2::XMLElement* element)
+    {
+       try
+       {
+-         int number = std::stoi(numberElement->GetText());
++         // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board.
++         int number = 0;
++         if (!StringExtensions::TryParseInt(numberElement->GetText(), number))
++            return false;
+          SetNumber(number);
+       }
+       catch (...)
 diff --git a/src/cab/out/dudescab/DudesCab.h b/src/cab/out/dudescab/DudesCab.h
 index a42d974..9b2749c 100644
 --- a/src/cab/out/dudescab/DudesCab.h
@@ -2067,7 +2482,7 @@ index 4a73aec..e24fc86 100644
     bool IsLost() const override { return m_device && m_device->IsLost(); }
     void Release() override;
 diff --git a/src/cab/out/ftdichip/FT245RBitbangController.cpp b/src/cab/out/ftdichip/FT245RBitbangController.cpp
-index 4c0f5f7..4448662 100644
+index 4c0f5f7..adb5973 100644
 --- a/src/cab/out/ftdichip/FT245RBitbangController.cpp
 +++ b/src/cab/out/ftdichip/FT245RBitbangController.cpp
 @@ -7,6 +7,7 @@
@@ -2099,7 +2514,7 @@ index 4c0f5f7..4448662 100644
  
  void FT245RBitbangController::UpdaterThreadDoIt()
  {
-+   OutputGate::Unit* gateUnit = m_gateUnit;
++   OutputGate::UnitHandle gateUnit = m_gateUnit;
     Connect();
     if (!m_ftdi)
     {
@@ -2218,8 +2633,20 @@ index 4c0f5f7..4448662 100644
  
     if (m_ftdi)
     {
+@@ -460,7 +504,10 @@ bool FT245RBitbangController::FromXml(const tinyxml2::XMLElement* element)
+    {
+       try
+       {
+-         int id = std::stoi(idElement->GetText());
++         // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board.
++         int id = 0;
++         if (!StringExtensions::TryParseInt(idElement->GetText(), id))
++            return false;
+          SetId(id);
+       }
+       catch (...)
 diff --git a/src/cab/out/ftdichip/FT245RBitbangController.h b/src/cab/out/ftdichip/FT245RBitbangController.h
-index b90b458..fba2a65 100644
+index b90b458..52afc27 100644
 --- a/src/cab/out/ftdichip/FT245RBitbangController.h
 +++ b/src/cab/out/ftdichip/FT245RBitbangController.h
 @@ -2,6 +2,7 @@
@@ -2234,12 +2661,12 @@ index b90b458..fba2a65 100644
     std::condition_variable m_updaterThreadCondition;
     std::atomic<bool> m_keepUpdaterThreadAlive;
     std::atomic<bool> m_updaterThreadFinished;
-+   OutputGate::Unit* m_gateUnit = nullptr;
++   OutputGate::UnitHandle m_gateUnit;
     std::string m_finishError;
     int m_firstTryFailCnt;
  
 diff --git a/src/cab/out/lw/LedWiz.cpp b/src/cab/out/lw/LedWiz.cpp
-index 21cda40..60eaab0 100644
+index 21cda40..24d0b1c 100644
 --- a/src/cab/out/lw/LedWiz.cpp
 +++ b/src/cab/out/lw/LedWiz.cpp
 @@ -1,5 +1,6 @@
@@ -2249,7 +2676,100 @@ index 21cda40..60eaab0 100644
  #include "../../../Log.h"
  #include "../../../general/MathExtensions.h"
  #include "../../../general/StringExtensions.h"
-@@ -485,15 +486,46 @@ LedWiz::LedWizUnit::~LedWizUnit()
+@@ -51,9 +52,18 @@ LedWiz::LedWiz()
+    , m_minCommandIntervalMs(10)
+    , m_minCommandIntervalMsSet(false)
+ {
++}
++
++void LedWiz::Startup()
++{
++   // VPE: the devices are opened when the controller is initialized, not when it is made, so a controller that is
++   // skipped because its configuration cannot be read opens none.
++   if (m_startedUp)
++      return;
+    InitializeUnits();
+    Log::Write(StringExtensions::Build("Opening {0}-bit LedWiz driver...", sizeof(void*) == 8 ? "64" : "32"));
+    StartupLedWiz();
++   m_startedUp = true;
+ }
+ 
+ LedWiz::LedWiz(int number)
+@@ -65,7 +75,8 @@ LedWiz::LedWiz(int number)
+ LedWiz::~LedWiz()
+ {
+    Log::Debug(StringExtensions::Build("Disposing LedWiz instance {0:00}.", std::to_string(m_number)));
+-   TerminateLedWiz();
++   if (m_startedUp)
++      TerminateLedWiz();
+ }
+ 
+ void LedWiz::SetNumber(int value)
+@@ -89,7 +100,12 @@ void LedWiz::SetMinCommandIntervalMs(int value)
+    m_minCommandIntervalMsSet = true;
+ }
+ 
+-void LedWiz::Update() { s_ledWizUnits.at(m_number)->TriggerLedWizUpdaterThread(); }
++void LedWiz::Update()
++{
++   auto unit = s_ledWizUnits.find(m_number);
++   if (m_startedUp && unit != s_ledWizUnits.end())
++      unit->second->TriggerLedWizUpdaterThread();
++}
+ 
+ void LedWiz::Init(Cabinet* cabinet)
+ {
+@@ -106,6 +122,7 @@ void LedWiz::Init(Cabinet* cabinet)
+       {
+       }
+    }
++   Startup();
+    s_ledWizUnits.at(m_number)->Init(cabinet, m_minCommandIntervalMs);
+    Log::Write(StringExtensions::Build("LedWiz Nr. {0:00} initialized and updater thread initialized.", std::to_string(m_number)));
+ }
+@@ -160,7 +177,10 @@ void LedWiz::OnOutputValueChanged(IOutput* output)
+       return;
+    }
+ 
+-   LedWizUnit* s = s_ledWizUnits.at(m_number);
++   auto unit = s_ledWizUnits.find(m_number);
++   if (!m_startedUp || unit == s_ledWizUnits.end())
++      return;
++   LedWizUnit* s = unit->second;
+ 
+    IOutput* recalculatedOutput = ScheduledSettings::GetInstance().GetNewRecalculatedOutput(output, 1, m_number - 1);
+    LedWizOutput recalculatedLedWizOutput(lwo->GetLedWizOutputNumber());
+@@ -409,17 +429,20 @@ bool LedWiz::FromXml(const tinyxml2::XMLElement* element)
+    if (nameElement && nameElement->GetText())
+       SetName(nameElement->GetText());
+ 
++   // VPE: the number selects the unit; without one the controller would drive no unit and fail its Init, which fails
++   // the whole cabinet, so it is not read. The whole text is the number: one that only starts with a number ("2.5")
++   // selects no unit.
+    const tinyxml2::XMLElement* numberElement = element->FirstChildElement("Number");
+-   if (numberElement && numberElement->GetText())
++   int number = 0;
++   if (!numberElement || !numberElement->GetText() || !StringExtensions::TryParseInt(numberElement->GetText(), number))
++      return false;
++   try
+    {
+-      try
+-      {
+-         SetNumber(std::stoi(numberElement->GetText()));
+-      }
+-      catch (...)
+-      {
+-         return false;
+-      }
++      SetNumber(number);
++   }
++   catch (...)
++   {
++      return false;
+    }
+ 
+    const tinyxml2::XMLElement* intervalElement = element->FirstChildElement("MinCommandIntervalMs");
+@@ -485,15 +508,59 @@ LedWiz::LedWizUnit::~LedWizUnit()
  void LedWiz::LedWizUnit::Init(Cabinet* cabinet, int minCommandIntervalMs)
  {
     m_minCommandIntervalMs = minCommandIntervalMs;
@@ -2285,7 +2805,21 @@ index 21cda40..60eaab0 100644
 +   if (m_gateUnit)
 +      gate = m_gateUnit->Observe();
     m_writeFailed = false;
-    ShutdownLighting();
+-   ShutdownLighting();
++   // VPE: a blackout that throws is a failed one, and the unit still stops below.
++   try
++   {
++      ShutdownLighting();
++   }
++   catch (const std::exception& e)
++   {
++      Log::Exception(StringExtensions::Build("Turning the outputs of LedWiz Nr. {0:00} off failed: {1}", std::to_string(m_number), e.what()));
++      m_writeFailed = true;
++   }
++   catch (...)
++   {
++      m_writeFailed = true;
++   }
     m_shutdownFailed = m_writeFailed && (m_fp != nullptr || IsPresent());
 +   if (m_gateUnit)
 +   {
@@ -2296,11 +2830,11 @@ index 21cda40..60eaab0 100644
  }
  
  void LedWiz::LedWizUnit::UpdateValue(LedWizOutput* ledWizOutput)
-@@ -616,10 +648,16 @@ void LedWiz::LedWizUnit::LedWizUpdaterDoIt()
+@@ -616,35 +683,67 @@ void LedWiz::LedWizUnit::LedWizUpdaterDoIt()
  {
     Log::Write(StringExtensions::Build("Updater thread for LedWiz {0:00} started.", std::to_string(m_number)));
  
-+   OutputGate::Unit* gateUnit = m_gateUnit;
++   OutputGate::UnitHandle gateUnit = m_gateUnit;
     int failCnt = 0;
     while (m_keepLedWizUpdaterAlive)
     {
@@ -2313,22 +2847,41 @@ index 21cda40..60eaab0 100644
        try
        {
           if (IsPresent())
-@@ -634,17 +672,39 @@ void LedWiz::LedWizUnit::LedWizUpdaterDoIt()
-                m_inUseState = InUseStates::Running;
-             }
- 
--            if (m_inUseState == InUseStates::Running)
--               SendLedWizUpdate();
+          {
+-            if (m_inUseState == InUseStates::ValueChanged)
 +            bool wrote = true;
 +            if (!gate.open)
 +               ShutdownLighting();
-+            else if (m_inUseState == InUseStates::Running)
-+            {
-+               // VPE: WriteUSB stops before each write once a latch overtook this opening's transfer.
++            else if (m_inUseState != InUseStates::Startup)
+             {
+-               const uint8_t sba[4] = { 0, 0, 0, 0 };
+-               SBA(sba);
+-               std::array<uint8_t, 32> pba;
+-               pba.fill(49);
+-               PBA(pba.data());
+-               m_inUseState = InUseStates::Running;
++               // VPE: WriteUSB stops before each write once a latch overtook this opening's transfer. The startup
++               // sequence goes out with the first opening that has values, in its transfer too; the unit runs once the
++               // sequence got through, and sends it again on the next pass otherwise.
 +               OutputGate::Transfer transfer(gateUnit, gate);
-+               stale = !SendLedWizUpdate(gate);
++               if (m_inUseState == InUseStates::ValueChanged)
++               {
++                  const uint8_t sba[4] = { 0, 0, 0, 0 };
++                  SBA(sba);
++                  std::array<uint8_t, 32> pba;
++                  pba.fill(49);
++                  if (!m_writeFailed && !transfer.Cancelled())
++                     PBA(pba.data());
++                  if (!m_writeFailed && !transfer.Cancelled())
++                     m_inUseState = InUseStates::Running;
++               }
++               if (m_inUseState == InUseStates::Running && !m_writeFailed && !transfer.Cancelled())
++                  stale = !SendLedWizUpdate(gate);
 +               cancelled = transfer.Cancelled();
-+            }
+             }
+-
+-            if (m_inUseState == InUseStates::Running)
+-               SendLedWizUpdate();
 +            else
 +               wrote = false;
              if (m_writeFailed)
@@ -2355,7 +2908,7 @@ index 21cda40..60eaab0 100644
           failCnt++;
           if (failCnt > MAX_UPDATE_FAIL_COUNT)
           {
-@@ -654,13 +714,14 @@ void LedWiz::LedWizUnit::LedWizUpdaterDoIt()
+@@ -654,13 +753,14 @@ void LedWiz::LedWizUnit::LedWizUpdaterDoIt()
           }
        }
  
@@ -2372,7 +2925,7 @@ index 21cda40..60eaab0 100644
                 break;
           }
        }
-@@ -668,6 +729,33 @@ void LedWiz::LedWizUnit::LedWizUpdaterDoIt()
+@@ -668,6 +768,33 @@ void LedWiz::LedWizUnit::LedWizUpdaterDoIt()
     }
  
     Log::Write(StringExtensions::Build("Updater thread for LedWiz {0:00} terminated.", std::to_string(m_number)));
@@ -2406,7 +2959,7 @@ index 21cda40..60eaab0 100644
     m_updaterThreadFinished = true;
  }
  
-@@ -688,15 +776,20 @@ void LedWiz::LedWizUnit::UpdateDelay()
+@@ -688,15 +815,20 @@ void LedWiz::LedWizUnit::UpdateDelay()
     m_lastUpdate = std::chrono::steady_clock::now();
  }
  
@@ -2429,7 +2982,7 @@ index 21cda40..60eaab0 100644
           CopyNewToCurrent();
           m_updateRequired = false;
        }
-@@ -711,6 +804,7 @@ void LedWiz::LedWizUnit::SendLedWizUpdate()
+@@ -711,6 +843,7 @@ void LedWiz::LedWizUnit::SendLedWizUpdate()
        if (m_currentSwitchUpdateAfterValueUpdateRequired || (m_currentSwitchUpdateBeforeValueUpdateRequired && !m_currentValueUpdateRequired) || pbaTimeout)
           SBA(m_currentAfterValueSwitches.data());
     }
@@ -2437,7 +2990,7 @@ index 21cda40..60eaab0 100644
  }
  
  void LedWiz::LedWizUnit::ShutdownLighting()
-@@ -742,6 +836,8 @@ void LedWiz::LedWizUnit::WriteUSB(const uint8_t* buf, size_t length)
+@@ -742,6 +875,8 @@ void LedWiz::LedWizUnit::WriteUSB(const uint8_t* buf, size_t length)
        UpdateDelay();
        for (int tries = 0; tries < static_cast<int>(std::size(s_retryWait)); ++tries)
        {
@@ -2447,7 +3000,7 @@ index 21cda40..60eaab0 100644
              return;
           std::this_thread::sleep_for(std::chrono::milliseconds(s_retryWait[tries]));
 diff --git a/src/cab/out/lw/LedWiz.h b/src/cab/out/lw/LedWiz.h
-index 31bd9ca..1110829 100644
+index 31bd9ca..7bfc481 100644
 --- a/src/cab/out/lw/LedWiz.h
 +++ b/src/cab/out/lw/LedWiz.h
 @@ -1,6 +1,7 @@
@@ -2458,7 +3011,17 @@ index 31bd9ca..1110829 100644
  #include <hidapi/hidapi.h>
  #include <array>
  #include <atomic>
-@@ -118,7 +119,8 @@ private:
+@@ -73,6 +74,9 @@ private:
+    static std::mutex s_startupLocker;
+    static void StartupLedWiz();
+    static void TerminateLedWiz();
++   // VPE: opens the devices for this controller, once (Init).
++   void Startup();
++   bool m_startedUp = false;
+    static std::string GetDeviceProductName(hid_device_info* dev);
+    static std::string GetDeviceManufacturerName(hid_device_info* dev);
+    static int GetOutputReportByteLength(hid_device* dev);
+@@ -118,7 +122,8 @@ private:
  
        void LedWizUpdaterDoIt();
        void UpdateDelay();
@@ -2468,16 +3031,16 @@ index 31bd9ca..1110829 100644
        void SBA(const uint8_t* b, uint8_t globalFlashSpeed = 2);
        void PBA(const uint8_t* b);
        void WriteUSB(const uint8_t* buf, size_t length);
-@@ -158,6 +160,7 @@ private:
+@@ -158,6 +163,7 @@ private:
        int m_minCommandIntervalMs;
        std::chrono::steady_clock::time_point m_pbaTime;
        bool m_writeFailed = false;
-+      OutputGate::Unit* m_gateUnit = nullptr;
++      OutputGate::UnitHandle m_gateUnit;
        bool m_shutdownFailed = false;
  
     public:
 diff --git a/src/cab/out/pac/PacDrive.cpp b/src/cab/out/pac/PacDrive.cpp
-index e13a317..d40d4de 100644
+index e13a317..7c7f915 100644
 --- a/src/cab/out/pac/PacDrive.cpp
 +++ b/src/cab/out/pac/PacDrive.cpp
 @@ -1,5 +1,6 @@
@@ -2487,7 +3050,58 @@ index e13a317..d40d4de 100644
  #include "../../../Log.h"
  #include "../../../general/StringExtensions.h"
  #include "../../Cabinet.h"
-@@ -140,8 +141,12 @@ void PacDrive::PacDriveUnit::Init(Cabinet* cabinet)
+@@ -17,7 +18,12 @@ PacDrive::PacDriveUnit* PacDrive::s_pacDriveInstance = nullptr;
+ 
+ PacDrive::PacDrive() { SetName("PacDrive"); }
+ 
+-PacDrive::~PacDrive() { }
++PacDrive::~PacDrive()
++{
++   // VPE: one that was never finished (its cabinet failed) does not keep the unit in use for the next session.
++   if (m_usesUnit && s_pacDriveInstance)
++      s_pacDriveInstance->RemoveUser();
++}
+ 
+ void PacDrive::Init(Cabinet* cabinet)
+ {
+@@ -28,7 +34,15 @@ void PacDrive::Init(Cabinet* cabinet)
+       s_pacDriveInstance = new PacDriveUnit();
+    }
+ 
+-   s_pacDriveInstance->Init(cabinet);
++   // VPE: the physical unit is initialized once, by its first user: it registers with the gate once, as present or
++   // as missing, however many entries share it.
++   if (!s_pacDriveInstance->InUse())
++      s_pacDriveInstance->Init(cabinet);
++   if (!m_usesUnit)
++   {
++      m_usesUnit = true;
++      s_pacDriveInstance->AddUser();
++   }
+    Log::Write("PacDrive initialized and updater thread started.");
+ }
+ 
+@@ -37,8 +51,19 @@ void PacDrive::Finish()
+    bool shutdownFailed = false;
+    if (s_pacDriveInstance)
+    {
++      if (m_usesUnit)
++      {
++         m_usesUnit = false;
++         s_pacDriveInstance->RemoveUser();
++      }
++      if (s_pacDriveInstance->InUse())
++      {
++         Log::Write("PacDrive finished; another PacDrive entry still uses the unit, which finishes with it.");
++         return;
++      }
+       s_pacDriveInstance->Finish();
+       shutdownFailed = !s_pacDriveInstance->ShutdownLighting();
++      s_pacDriveInstance->ReleaseGateUnit();
+    }
+    Log::Write("PacDrive finished and updater thread stopped.");
+    if (shutdownFailed)
+@@ -140,8 +165,12 @@ void PacDrive::PacDriveUnit::Init(Cabinet* cabinet)
     }
     if (m_index >= 0)
     {
@@ -2500,16 +3114,30 @@ index e13a317..d40d4de 100644
  }
  
  void PacDrive::PacDriveUnit::Finish() { TerminatePacDriveUpdaterThread(); }
-@@ -181,7 +186,18 @@ bool PacDrive::PacDriveUnit::ShutdownLighting()
+@@ -181,7 +210,31 @@ bool PacDrive::PacDriveUnit::ShutdownLighting()
     bool ok = true;
     if (m_index >= 0)
     {
+-      ok = PacDriveSetLEDStates(0);
 +      // VPE: the final blackout confirms the closing published before it; the unit stops after it, not before, so it
-+      // is not counted as failed while the blackout is sent.
++      // is not counted as failed while the blackout is sent. It stops whatever the blackout does: one that throws (the
++      // USB claim) is a failed blackout.
 +      OutputGate::Snapshot before {};
 +      if (m_gateUnit)
 +         before = m_gateUnit->Observe();
-       ok = PacDriveSetLEDStates(0);
++      try
++      {
++         ok = PacDriveSetLEDStates(0);
++      }
++      catch (const std::exception& e)
++      {
++         Log::Exception(StringExtensions::Build("Turning the PacDrive outputs off failed: {0}", e.what()));
++         ok = false;
++      }
++      catch (...)
++      {
++         ok = false;
++      }
 +      if (m_gateUnit)
 +      {
 +         if (ok)
@@ -2519,11 +3147,11 @@ index e13a317..d40d4de 100644
        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     return ok;
-@@ -221,19 +237,36 @@ void PacDrive::PacDriveUnit::TerminatePacDriveUpdaterThread()
+@@ -221,19 +274,36 @@ void PacDrive::PacDriveUnit::TerminatePacDriveUpdaterThread()
  
  void PacDrive::PacDriveUnit::PacDriveUpdaterDoIt()
  {
-+   OutputGate::Unit* gateUnit = m_gateUnit;
++   OutputGate::UnitHandle gateUnit = m_gateUnit;
     int failCount = 0;
     while (m_keepPacDriveUpdaterAlive)
     {
@@ -2557,7 +3185,7 @@ index e13a317..d40d4de 100644
           Log::Exception(StringExtensions::Build("Error occurred when updating PacDrive: {0}", e.what()));
           failCount++;
  
-@@ -251,31 +284,46 @@ void PacDrive::PacDriveUnit::PacDriveUpdaterDoIt()
+@@ -251,31 +321,46 @@ void PacDrive::PacDriveUnit::PacDriveUpdaterDoIt()
        }
        m_triggerUpdate = false;
     }
@@ -2613,7 +3241,7 @@ index e13a317..d40d4de 100644
  
  void PacDrive::PacDriveUnit::CopyNewToCurrent() { m_currentValue = m_newValue; }
 diff --git a/src/cab/out/pac/PacDrive.h b/src/cab/out/pac/PacDrive.h
-index e04bb5c..472bd91 100644
+index e04bb5c..b2c7d04 100644
 --- a/src/cab/out/pac/PacDrive.h
 +++ b/src/cab/out/pac/PacDrive.h
 @@ -1,6 +1,7 @@
@@ -2624,15 +3252,40 @@ index e04bb5c..472bd91 100644
  #include <memory>
  #include <mutex>
  #include <thread>
-@@ -56,6 +57,7 @@ private:
+@@ -34,6 +35,8 @@ private:
+    static PacDriveUnit* s_pacDriveInstance;
+ 
+    void AddOutputs();
++   // VPE: this controller was initialized and counts as a user of the unit until it is finished.
++   bool m_usesUnit = false;
+ 
+    class PacDriveUnit
+    {
+@@ -46,6 +49,14 @@ private:
+       void UpdateValue(IOutput* output);
+       void TriggerPacDriveUpdaterThread();
+       bool ShutdownLighting();
++      // VPE: after the final blackout, so the session's gate is not kept until the next session registers.
++      void ReleaseGateUnit() { m_gateUnit.reset(); }
++      // VPE: the controllers configured for this unit (every PacDrive entry shares the one unit) that were initialized and not
++      // finished yet. The unit is finished with the last of them, so it keeps sending and confirming the gate's state
++      // until then, and its gate unit is stopped and released once.
++      void AddUser() { m_users++; }
++      void RemoveUser() { m_users--; }
++      bool InUse() const { return m_users > 0; }
+ 
+       bool GetUpdateRequired() const { return m_updateRequired; }
+ 
+@@ -56,6 +67,8 @@ private:
        uint16_t m_currentValue;
        std::atomic<bool> m_updateRequired;
        int m_index;
-+      OutputGate::Unit* m_gateUnit = nullptr;
++      OutputGate::UnitHandle m_gateUnit;
++      int m_users = 0;
  
        std::mutex m_pacDriveUpdateLocker;
        std::mutex m_valueChangeLocker;
-@@ -70,7 +72,8 @@ private:
+@@ -70,7 +83,8 @@ private:
        void StartPacDriveUpdaterThread();
        void TerminatePacDriveUpdaterThread();
        void PacDriveUpdaterDoIt();
@@ -2723,7 +3376,7 @@ index c71dc9d..01698a1 100644
     bool PacLed64SetLEDStates(int index, int group, uint8_t data);
     bool PacLed64SetLEDFadeTime(int index, uint8_t fadeTime);
 diff --git a/src/cab/out/pac/PacLed64.cpp b/src/cab/out/pac/PacLed64.cpp
-index 71fcd00..1ea552f 100644
+index 71fcd00..9841c6c 100644
 --- a/src/cab/out/pac/PacLed64.cpp
 +++ b/src/cab/out/pac/PacLed64.cpp
 @@ -1,4 +1,5 @@
@@ -2750,7 +3403,81 @@ index 71fcd00..1ea552f 100644
  std::map<int, PacLed64::PacLed64Unit*> PacLed64::s_pacLed64Units;
  bool PacLed64::s_unitsInitialized = false;
  
-@@ -221,14 +226,18 @@ void PacLed64::PacLed64Unit::Init(Cabinet* cabinet)
+@@ -46,7 +51,13 @@ PacLed64::PacLed64(int id)
+    SetId(id);
+ }
+ 
+-PacLed64::~PacLed64() { }
++PacLed64::~PacLed64()
++{
++   // VPE: one that was never finished (its cabinet failed) does not keep the unit in use for the next session.
++   auto unit = s_pacLed64Units.find(m_id);
++   if (m_usesUnit && unit != s_pacLed64Units.end())
++      unit->second->RemoveUser();
++}
+ 
+ void PacLed64::SetId(int value)
+ {
+@@ -94,17 +105,36 @@ void PacLed64::Init(Cabinet* cabinet)
+    InitializeUnits();
+    s_pacLed64Units.at(m_id)->SetFullUpdateThreshold(m_fullUpdateThreshold);
+    s_pacLed64Units.at(m_id)->SetMinUpdateInterval(std::chrono::milliseconds(m_minUpdateIntervalMs));
+-   s_pacLed64Units.at(m_id)->Init(cabinet);
++   // VPE: the physical unit is initialized once, by its first user: it registers with the gate once, as present or
++   // as missing, however many entries share it.
++   if (!s_pacLed64Units.at(m_id)->InUse())
++      s_pacLed64Units.at(m_id)->Init(cabinet);
++   if (!m_usesUnit)
++   {
++      m_usesUnit = true;
++      s_pacLed64Units.at(m_id)->AddUser();
++   }
+ 
+    Log::Write(StringExtensions::Build("PacLed64 Id:{0} initialized and updater thread started.", std::to_string(m_id)));
+ }
+ 
+ void PacLed64::Finish()
+ {
+-   if (s_pacLed64Units.find(m_id) != s_pacLed64Units.end())
++   auto unit = s_pacLed64Units.find(m_id);
++   if (unit != s_pacLed64Units.end())
+    {
+-      s_pacLed64Units[m_id]->Finish();
+-      s_pacLed64Units[m_id]->ShutdownLighting();
++      if (m_usesUnit)
++      {
++         m_usesUnit = false;
++         unit->second->RemoveUser();
++      }
++      if (unit->second->InUse())
++      {
++         Log::Write(StringExtensions::Build("PacLed64 Id:{0} finished; another entry with the Id still uses the unit, which finishes with it.", std::to_string(m_id)));
++         return;
++      }
++      unit->second->Finish();
++      unit->second->ShutdownLighting();
+    }
+    Log::Write(StringExtensions::Build("PacLed64 Id:{0} finished and updater thread stopped.", std::to_string(m_id)));
+ }
+@@ -183,9 +213,14 @@ bool PacLed64::FromXml(const tinyxml2::XMLElement* element)
+    if (name)
+       SetName(name);
+ 
+-   int id = element->IntAttribute("Id", -1);
+-   if (id != -1)
+-      SetId(id);
++   // VPE: the Id selects the unit; without one (or with one that is not a number) the controller would drive no unit
++   // and fail its Init, which fails the whole cabinet, so it is not read. The whole text is the number: one that only
++   // starts with a number ("0.5", "1old") selects no unit.
++   const char* idText = element->Attribute("Id");
++   int id = -1;
++   if (!idText || !StringExtensions::TryParseInt(idText, id))
++      return false;
++   SetId(id);
+ 
+    int minInterval = element->IntAttribute("MinUpdateIntervalMs", -1);
+    if (minInterval != -1)
+@@ -221,14 +256,18 @@ void PacLed64::PacLed64Unit::Init(Cabinet* cabinet)
  {
     m_index = PacDriveSingleton::GetInstance().PacLed64GetIndexForDeviceId(m_id);
  
@@ -2769,7 +3496,7 @@ index 71fcd00..1ea552f 100644
        Log::Warning(StringExtensions::Build("PacLed64 device {0} not found", std::to_string(m_id)));
     }
  }
-@@ -236,16 +245,27 @@ void PacLed64::PacLed64Unit::Init(Cabinet* cabinet)
+@@ -236,16 +275,30 @@ void PacLed64::PacLed64Unit::Init(Cabinet* cabinet)
  void PacLed64::PacLed64Unit::Finish()
  {
     TerminatePacLed64UpdaterThread();
@@ -2789,24 +3516,27 @@ index 71fcd00..1ea552f 100644
     {
 +      if (present)
 +         m_gateUnit->Stop();
++      m_gateUnit.reset();
        m_index = -1;
        throw;
     }
 -
 +   if (present)
 +      m_gateUnit->Stop();
++   // VPE: the unit outlives the session; it does not keep the session's gate until the next session registers.
++   m_gateUnit.reset();
     m_index = -1;
  }
  
-@@ -323,6 +343,7 @@ void PacLed64::PacLed64Unit::TerminatePacLed64UpdaterThread()
+@@ -323,6 +376,7 @@ void PacLed64::PacLed64Unit::TerminatePacLed64UpdaterThread()
  
  void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
  {
-+   OutputGate::Unit* gateUnit = m_gateUnit;
++   OutputGate::UnitHandle gateUnit = m_gateUnit;
     try
     {
        ResetFadeTime();
-@@ -330,6 +351,7 @@ void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
+@@ -330,6 +384,7 @@ void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
     catch (const std::exception& e)
     {
        Log::Exception(StringExtensions::Build("Exception occurred while setting fade time for PacLed64 {0} to 0: {1}", std::to_string(m_index), e.what()));
@@ -2814,7 +3544,7 @@ index 71fcd00..1ea552f 100644
        m_updaterThreadFinished = true;
        return;
     }
-@@ -337,16 +359,27 @@ void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
+@@ -337,16 +392,27 @@ void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
     int failCount = 0;
     while (m_keepPacLed64UpdaterAlive)
     {
@@ -2843,7 +3573,7 @@ index 71fcd00..1ea552f 100644
           Log::Exception(StringExtensions::Build("Error occurred when updating PacLed64 {0}: {1}", std::to_string(m_id), e.what()));
           failCount++;
  
-@@ -365,30 +398,78 @@ void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
+@@ -365,30 +431,78 @@ void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
        }
        m_triggerUpdate = false;
     }
@@ -2926,7 +3656,7 @@ index 71fcd00..1ea552f 100644
              updatesRequired++;
        }
     }
-@@ -396,41 +477,56 @@ void PacLed64::PacLed64Unit::SendPacLed64Update()
+@@ -396,41 +510,56 @@ void PacLed64::PacLed64Unit::SendPacLed64Update()
     if (m_forceFullUpdate || updatesRequired > m_fullUpdateThreshold)
     {
        EnforceMinUpdateInterval();
@@ -2999,7 +3729,7 @@ index 71fcd00..1ea552f 100644
  
  void PacLed64::PacLed64Unit::CopyNewToCurrent() { m_currentValue = m_newValue; }
 diff --git a/src/cab/out/pac/PacLed64.h b/src/cab/out/pac/PacLed64.h
-index 640daa8..da670ef 100644
+index 640daa8..7a6da19 100644
 --- a/src/cab/out/pac/PacLed64.h
 +++ b/src/cab/out/pac/PacLed64.h
 @@ -1,6 +1,7 @@
@@ -3010,15 +3740,38 @@ index 640daa8..da670ef 100644
  #include "../IOutputController.h"
  #include <hidapi/hidapi.h>
  #include <map>
-@@ -85,6 +86,7 @@ private:
+@@ -51,6 +52,8 @@ private:
+    bool m_minUpdateIntervalMsSet;
+    int m_minUpdateIntervalMs;
+    int m_fullUpdateThreshold;
++   // VPE: this controller was initialized and counts as a user of its unit until it is finished.
++   bool m_usesUnit = false;
+ 
+    static std::map<int, PacLed64Unit*> s_pacLed64Units;
+    static bool s_unitsInitialized;
+@@ -74,6 +77,12 @@ private:
+       void TriggerPacLed64UpdaterThread();
+       bool IsPresent() const;
+       void ShutdownLighting();
++      // VPE: the controllers configured for this unit (entries with the same Id share it) that were initialized and not
++      // finished yet. The unit is finished with the last of them, so it keeps sending and confirming the gate's state
++      // until then, and its gate unit is stopped and released once.
++      void AddUser() { m_users++; }
++      void RemoveUser() { m_users--; }
++      bool InUse() const { return m_users > 0; }
+ 
+       bool GetUpdateRequired() const { return m_updateRequired; }
+ 
+@@ -85,6 +94,8 @@ private:
        std::chrono::milliseconds m_minUpdateInterval;
        std::chrono::steady_clock::time_point m_lastCommand;
        int m_index;
-+      OutputGate::Unit* m_gateUnit = nullptr;
++      OutputGate::UnitHandle m_gateUnit;
++      int m_users = 0;
  
        std::vector<uint8_t> m_newValue;
        std::vector<uint8_t> m_currentValue;
-@@ -105,7 +107,10 @@ private:
+@@ -105,7 +116,10 @@ private:
        void StartPacLed64UpdaterThread();
        void TerminatePacLed64UpdaterThread();
        void PacLed64UpdaterDoIt();
@@ -3031,7 +3784,7 @@ index 640daa8..da670ef 100644
        void ResetFadeTime();
        void EnforceMinUpdateInterval();
 diff --git a/src/cab/out/pac/PacUIO.cpp b/src/cab/out/pac/PacUIO.cpp
-index e35bbf8..c6616c0 100644
+index e35bbf8..d2635df 100644
 --- a/src/cab/out/pac/PacUIO.cpp
 +++ b/src/cab/out/pac/PacUIO.cpp
 @@ -1,5 +1,6 @@
@@ -3051,7 +3804,77 @@ index e35bbf8..c6616c0 100644
  std::map<int, PacUIO::PacUIOUnit*> PacUIO::s_pacUIOUnits;
  bool PacUIO::s_unitsInitialized = false;
  
-@@ -162,13 +166,23 @@ void PacUIO::PacUIOUnit::Init(Cabinet* cabinet)
+@@ -56,14 +60,34 @@ void PacUIO::Init(Cabinet* cabinet)
+ {
+    AddOutputs();
+    InitializeUnits();
+-   s_pacUIOUnits.at(m_id)->Init(cabinet);
++   PacUIOUnit* unit = s_pacUIOUnits.at(m_id);
++   // VPE: the physical unit is initialized once, by its first user: it registers with the gate once, as present or
++   // as missing, however many entries share it.
++   if (!unit->InUse())
++      unit->Init(cabinet);
++   if (!m_usesUnit)
++   {
++      m_usesUnit = true;
++      unit->AddUser();
++   }
+    Log::Write(StringExtensions::Build("PacUIO Id:{0} initialized and updater thread started.", std::to_string(m_id)));
+ }
+ 
+ void PacUIO::Finish()
+ {
+    InitializeUnits();
+-   s_pacUIOUnits.at(m_id)->Finish();
++   PacUIOUnit* unit = s_pacUIOUnits.at(m_id);
++   if (m_usesUnit)
++   {
++      m_usesUnit = false;
++      unit->RemoveUser();
++   }
++   if (unit->InUse())
++   {
++      Log::Write(StringExtensions::Build("PacUIO Id:{0} finished; another entry with the Id still uses the unit, which finishes with it.", std::to_string(m_id)));
++      return;
++   }
++   unit->Finish();
+    Log::Write(StringExtensions::Build("PacUIO Id:{0} finished and updater thread stopped.", std::to_string(m_id)));
+ }
+ 
+@@ -112,7 +136,13 @@ PacUIO::PacUIO() { }
+ 
+ PacUIO::PacUIO(int id) { SetId(id); }
+ 
+-PacUIO::~PacUIO() { }
++PacUIO::~PacUIO()
++{
++   // VPE: one that was never finished (its cabinet failed) does not keep the unit in use for the next session.
++   auto unit = s_pacUIOUnits.find(m_id);
++   if (m_usesUnit && unit != s_pacUIOUnits.end())
++      unit->second->RemoveUser();
++}
+ 
+ tinyxml2::XMLElement* PacUIO::ToXml(tinyxml2::XMLDocument& doc) const
+ {
+@@ -135,9 +165,14 @@ bool PacUIO::FromXml(const tinyxml2::XMLElement* element)
+    if (name)
+       SetName(name);
+ 
+-   int id = element->IntAttribute("Id", -1);
+-   if (id != -1)
+-      SetId(id);
++   // VPE: the Id selects the unit; without one (or with one that is not a number) the controller would drive no unit
++   // and fail its Init, which fails the whole cabinet, so it is not read. The whole text is the number: one that only
++   // starts with a number ("0.5", "1old") selects no unit.
++   const char* idText = element->Attribute("Id");
++   int id = -1;
++   if (!idText || !StringExtensions::TryParseInt(idText, id))
++      return false;
++   SetId(id);
+ 
+    return true;
+ }
+@@ -162,13 +197,23 @@ void PacUIO::PacUIOUnit::Init(Cabinet* cabinet)
     {
        m_pdSingleton = &PacDriveSingleton::GetInstance();
        m_index = m_pdSingleton->PacUIOGetIndexForDeviceId(m_id);
@@ -3082,7 +3905,7 @@ index e35bbf8..c6616c0 100644
     }
     StartPacUIOUpdaterThread();
  }
-@@ -176,7 +190,26 @@ void PacUIO::PacUIOUnit::Init(Cabinet* cabinet)
+@@ -176,7 +221,29 @@ void PacUIO::PacUIOUnit::Init(Cabinet* cabinet)
  void PacUIO::PacUIOUnit::Finish()
  {
     TerminatePacUIOUpdaterThread();
@@ -3103,22 +3926,25 @@ index e35bbf8..c6616c0 100644
 +   {
 +      if (present)
 +         m_gateUnit->Stop();
++      m_gateUnit.reset();
 +      throw;
 +   }
 +   if (present)
 +      m_gateUnit->Stop();
++   // VPE: the unit outlives the session; it does not keep the session's gate until the next session registers.
++   m_gateUnit.reset();
  }
  
  void PacUIO::PacUIOUnit::UpdateValue(IOutput* output)
-@@ -237,6 +270,7 @@ void PacUIO::PacUIOUnit::TriggerPacUIOUpdaterThread()
+@@ -237,6 +304,7 @@ void PacUIO::PacUIOUnit::TriggerPacUIOUpdaterThread()
  
  void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
  {
-+   OutputGate::Unit* gateUnit = m_gateUnit;
++   OutputGate::UnitHandle gateUnit = m_gateUnit;
     try
     {
        ResetFadeTime();
-@@ -244,6 +278,7 @@ void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
+@@ -244,6 +312,7 @@ void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
     catch (const std::exception& e)
     {
        Log::Exception(StringExtensions::Build("A exception occurred while setting the fadetime for PacUIO {0} to 0.", std::to_string(m_index)));
@@ -3126,7 +3952,7 @@ index e35bbf8..c6616c0 100644
        m_updaterThreadFinished = true;
        return;
     }
-@@ -251,16 +286,27 @@ void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
+@@ -251,16 +320,27 @@ void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
     int failCnt = 0;
     while (m_keepPacUIOUpdaterAlive.load())
     {
@@ -3155,7 +3981,7 @@ index e35bbf8..c6616c0 100644
           Log::Exception(StringExtensions::Build("A error occurred when updating PacUIO {0}", std::to_string(m_id)));
           failCnt++;
  
-@@ -279,68 +325,129 @@ void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
+@@ -279,68 +359,129 @@ void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
        }
        m_triggerUpdate.store(false);
     }
@@ -3190,14 +4016,14 @@ index e35bbf8..c6616c0 100644
  
 -void PacUIO::PacUIOUnit::SendPacUIOUpdate()
 +void PacUIO::PacUIOUnit::RequestFullUpdate()
-+{
+ {
 +   std::lock_guard<std::mutex> valueLock(m_valueChangeLocker);
 +   m_forceFullUpdate = true;
 +   m_updateRequired = true;
 +}
 +
 +bool PacUIO::PacUIOUnit::SendPacUIOUpdate(OutputGate::Snapshot& gate, bool& failed, bool& cancelled)
- {
++{
 +   failed = false;
 +   cancelled = false;
     if (!IsPresent())
@@ -3306,7 +4132,7 @@ index e35bbf8..c6616c0 100644
  
  void PacUIO::PacUIOUnit::ShutdownLighting()
 diff --git a/src/cab/out/pac/PacUIO.h b/src/cab/out/pac/PacUIO.h
-index 0da2310..1be7c1a 100644
+index 0da2310..2d7cb23 100644
 --- a/src/cab/out/pac/PacUIO.h
 +++ b/src/cab/out/pac/PacUIO.h
 @@ -1,6 +1,7 @@
@@ -3317,15 +4143,38 @@ index 0da2310..1be7c1a 100644
  #include <map>
  #include <thread>
  #include <mutex>
-@@ -45,6 +46,7 @@ private:
+@@ -16,6 +17,8 @@ class PacUIO : public OutputControllerBase
+ private:
+    std::mutex m_idUpdateLocker;
+    int m_id = -1;
++   // VPE: this controller was initialized and counts as a user of its unit until it is finished.
++   bool m_usesUnit = false;
+ 
+ public:
+    int GetId() const { return m_id; }
+@@ -45,6 +48,8 @@ private:
        static const int MAX_UPDATE_FAIL_COUNT = 5;
        int m_id;
        int m_index = -1;
-+      OutputGate::Unit* m_gateUnit = nullptr;
++      OutputGate::UnitHandle m_gateUnit;
++      int m_users = 0;
        class PacDriveSingleton* m_pdSingleton = nullptr;
  
        uint8_t m_newValue[96];
-@@ -82,7 +84,10 @@ private:
+@@ -74,6 +79,12 @@ private:
+       void UpdateValue(class IOutput* output);
+       void TriggerPacUIOUpdaterThread();
+       void ShutdownLighting();
++      // VPE: the controllers configured for this unit (entries with the same Id share it) that were initialized and not
++      // finished yet. The unit is finished with the last of them, so it keeps sending and confirming the gate's state
++      // until then, and its gate unit is stopped and released once.
++      void AddUser() { m_users++; }
++      void RemoveUser() { m_users--; }
++      bool InUse() const { return m_users > 0; }
+ 
+       bool IsUpdaterThreadAlive();
+       void StartPacUIOUpdaterThread();
+@@ -82,7 +93,10 @@ private:
     private:
        void CopyNewToCurrent();
        void PacUIOUpdaterDoIt();
@@ -3338,7 +4187,7 @@ index 0da2310..1be7c1a 100644
        void InitUnit();
  
 diff --git a/src/cab/out/pinone/PinOne.cpp b/src/cab/out/pinone/PinOne.cpp
-index 4fedb04..c329712 100644
+index 4fedb04..de74817 100644
 --- a/src/cab/out/pinone/PinOne.cpp
 +++ b/src/cab/out/pinone/PinOne.cpp
 @@ -241,18 +241,13 @@ void PinOne::ConnectToController()
@@ -3364,6 +4213,18 @@ index 4fedb04..c329712 100644
        }
     }
     catch (const std::exception& e)
+@@ -296,7 +291,10 @@ bool PinOne::FromXml(const tinyxml2::XMLElement* element)
+    {
+       try
+       {
+-         int number = std::stoi(numberElement->GetText());
++         // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board.
++         int number = 0;
++         if (!StringExtensions::TryParseInt(numberElement->GetText(), number))
++            return false;
+          SetNumber(number);
+       }
+       catch (...)
 diff --git a/src/cab/out/pinone/PinOneAutoConfigurator.cpp b/src/cab/out/pinone/PinOneAutoConfigurator.cpp
 index 912cb2e..1ced542 100644
 --- a/src/cab/out/pinone/PinOneAutoConfigurator.cpp
@@ -3825,7 +4686,7 @@ index c26b815..b4d7c33 100644
        if (actual < 0)
        {
 diff --git a/src/cab/out/ps/Pinscape.cpp b/src/cab/out/ps/Pinscape.cpp
-index f257bbe..3a0edd5 100644
+index f257bbe..ef90abb 100644
 --- a/src/cab/out/ps/Pinscape.cpp
 +++ b/src/cab/out/ps/Pinscape.cpp
 @@ -155,6 +155,11 @@ void Pinscape::UpdateOutputs(const std::vector<uint8_t>& newOutputValues)
@@ -3840,8 +4701,20 @@ index f257bbe..3a0edd5 100644
  
              uint8_t buf[9] = { 0 };
              buf[0] = 0;
+@@ -274,7 +279,10 @@ bool Pinscape::FromXml(const tinyxml2::XMLElement* element)
+    {
+       try
+       {
+-         int number = std::stoi(numberElement->GetText());
++         // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board.
++         int number = 0;
++         if (!StringExtensions::TryParseInt(numberElement->GetText(), number))
++            return false;
+          SetNumber(number);
+       }
+       catch (...)
 diff --git a/src/cab/out/pspico/PinscapePico.cpp b/src/cab/out/pspico/PinscapePico.cpp
-index 8beea61..9630287 100644
+index 8beea61..7ca843f 100644
 --- a/src/cab/out/pspico/PinscapePico.cpp
 +++ b/src/cab/out/pspico/PinscapePico.cpp
 @@ -1,4 +1,5 @@
@@ -3927,7 +4800,19 @@ index 8beea61..9630287 100644
     m_cacheInvalid = false;
  
     if (firstChangedIndex >= 0)
-@@ -647,11 +658,17 @@ uint8_t* PinscapePico::Device::ReadUSB(uint32_t timeoutMs)
+@@ -482,7 +493,10 @@ bool PinscapePico::FromXml(const tinyxml2::XMLElement* element)
+    {
+       try
+       {
+-         int number = std::stoi(numberElement->GetText());
++         // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board.
++         int number = 0;
++         if (!StringExtensions::TryParseInt(numberElement->GetText(), number))
++            return false;
+          SetNumber(number);
+       }
+       catch (...)
+@@ -647,11 +661,17 @@ uint8_t* PinscapePico::Device::ReadUSB(uint32_t timeoutMs)
     return nullptr;
  }
  
@@ -3947,7 +4832,7 @@ index 8beea61..9630287 100644
     std::string hexString;
     for (size_t i = 0; i < m_outputReportLength; ++i)
     {
-@@ -666,6 +683,9 @@ bool PinscapePico::Device::WriteUSB(const std::string& desc, uint8_t* buf, uint3
+@@ -666,6 +686,9 @@ bool PinscapePico::Device::WriteUSB(const std::string& desc, uint8_t* buf, uint3
     uint32_t actual = 0;
     for (int tries = 0; tries < 3; ++tries)
     {
@@ -4119,16 +5004,20 @@ index b6baeda..6b7ca12 100644
  
 diff --git a/src/general/PathConfinement.cpp b/src/general/PathConfinement.cpp
 new file mode 100644
-index 0000000..d713659
+index 0000000..cf5c187
 --- /dev/null
 +++ b/src/general/PathConfinement.cpp
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,339 @@
 +#include "PathConfinement.h"
 +
 +#include <filesystem>
 +#include <mutex>
++#include <vector>
 +#ifdef _WIN32
++#include <cwctype>
++#include <iterator>
 +#include <wchar.h>
++#include <windows.h>
 +#endif
 +
 +#include "../Log.h"
@@ -4148,9 +5037,15 @@ index 0000000..d713659
 +   // The root resolved; until it does, nothing is allowed.
 +   bool valid = false;
 +   fs::path path;
-+   // The root as written, made absolute and normalized without the file system: a path written through it (and not
-+   // through the resolved form) passes the lexical check too.
-+   fs::path lexical;
++#ifdef _WIN32
++   // The volumes of the root as given and as resolved (VolumeOf). Only a path on one of them is looked up.
++   std::vector<std::wstring> volumes;
++#else
++   // The root as given (made absolute and normalized without the file system, so through the link the root was given
++   // through) and as resolved. Only a path written through one of them is looked up: a POSIX path does not tell whether
++   // it is on a network mount.
++   std::vector<fs::path> spellings;
++#endif
 +   // As given, so that a root that did not resolve (a folder not created yet) is looked up again on the next access.
 +   std::string given;
 +};
@@ -4171,6 +5066,126 @@ index 0000000..d713659
 +   return absolute.lexically_normal();
 +}
 +
++#ifdef _WIN32
++bool SameName(const std::wstring& a, const std::wstring& b) { return _wcsicmp(a.c_str(), b.c_str()) == 0; }
++
++// The volume a drive letter ("C:") names, from the object manager alone: QueryDosDevice does not touch the volume, so
++// a mapped network drive that is gone does not block. A subst drive is followed to the drive it points into. Empty when
++// it is not a drive letter or names nothing.
++std::wstring Volume(const std::wstring& rootName)
++{
++   std::wstring drive = rootName;
++   for (int depth = 0; depth < 8; depth++)
++   {
++      if (drive.size() != 2 || drive[1] != L':' || !iswalpha(drive[0]))
++         return std::wstring();
++      wchar_t target[1024];
++      if (QueryDosDeviceW(drive.c_str(), target, static_cast<DWORD>(std::size(target))) == 0)
++         return std::wstring();
++      std::wstring device(target);
++      // A subst drive: \??\C:\folder.
++      if (device.size() >= 6 && device.compare(0, 4, L"\\??\\") == 0 && device[5] == L':')
++      {
++         drive = device.substr(4, 2);
++         continue;
++      }
++      return device;
++   }
++   return std::wstring();
++}
++
++bool StartsWith(const std::wstring& text, const wchar_t* prefix, bool ignoreCase = false)
++{
++   size_t length = wcslen(prefix);
++   if (text.size() < length)
++      return false;
++   return ignoreCase ? _wcsnicmp(text.c_str(), prefix, length) == 0 : text.compare(0, length, prefix) == 0;
++}
++
++// "server\share" of a UNC path after its leading backslashes, both required.
++std::wstring Share(const std::wstring& text)
++{
++   size_t server = text.find(L'\\');
++   if (server == 0 || server == std::wstring::npos)
++      return std::wstring();
++   size_t share = text.find(L'\\', server + 1);
++   std::wstring name = text.substr(0, share);
++   if (name.size() == server + 1)
++      return std::wstring();
++   return L"share:" + name;
++}
++
++std::wstring Drive(const std::wstring& text)
++{
++   if (text.size() < 2 || text[1] != L':' || !iswalpha(text[0]) || (text.size() > 2 && text[2] != L'\\'))
++      return std::wstring();
++   std::wstring drive = text.substr(0, 2);
++   std::wstring volume = Volume(drive);
++   return volume.empty() ? L"drive:" + drive : L"volume:" + volume;
++}
++
++// The volume an absolute path is on, from the path alone, so that nothing is looked up on a volume the root is not on:
++// the volume a drive letter names (a subst drive followed), or a share (server and share) for a UNC path. Paths in the
++// device namespaces are classified explicitly: "\\?\C:\" is drive C and "\\?\UNC\server\share\" that share; every other
++// one ("\\.\", "\??\", "\\?\Volume{...}\", "\\?\GLOBALROOT\") has none. Empty when the path has none, which refuses it.
++std::wstring Backslashed(const fs::path& path)
++{
++   std::wstring text = path.native();
++   for (wchar_t& c : text)
++   {
++      if (c == L'/')
++         c = L'\\';
++   }
++   return text;
++}
++
++std::wstring VolumeOf(const fs::path& path)
++{
++   std::wstring text = Backslashed(path);
++   if (StartsWith(text, L"\\\\?\\"))
++   {
++      std::wstring rest = text.substr(4);
++      if (StartsWith(rest, L"UNC\\", true))
++         return Share(rest.substr(4));
++      return Drive(rest);
++   }
++   if (StartsWith(text, L"\\\\.\\") || StartsWith(text, L"\\??\\"))
++      return std::wstring();
++   if (StartsWith(text, L"\\\\"))
++      return Share(text.substr(2));
++   return Drive(text);
++}
++
++void AddVolume(Root& r, const fs::path& path)
++{
++   std::wstring volume = VolumeOf(path);
++   if (volume.empty())
++      return;
++   for (const std::wstring& known : r.volumes)
++   {
++      if (SameName(known, volume))
++         return;
++   }
++   r.volumes.push_back(volume);
++}
++
++// Whether a path is on the volume of the root (as given or as resolved), decided without touching the file system.
++// Refuses other shares, also on the root's server, other volumes, and the device namespaces that name no volume, so
++// only a path that can be inside the root is looked up.
++bool OnRootVolume(const fs::path& lexical, const Root& root)
++{
++   std::wstring volume = VolumeOf(lexical);
++   if (volume.empty())
++      return false;
++   for (const std::wstring& known : root.volumes)
++   {
++      if (SameName(known, volume))
++         return true;
++   }
++   return false;
++}
++#endif
++
 +Root MakeRoot(const std::string& root)
 +{
 +   Root r;
@@ -4184,7 +5199,17 @@ index 0000000..d713659
 +   {
 +      r.valid = true;
 +      r.path = canonical;
-+      r.lexical = Lexical(root);
++      fs::path given = Lexical(root);
++#ifdef _WIN32
++      AddVolume(r, given);
++      AddVolume(r, canonical);
++#else
++      for (const fs::path& spelling : { given, canonical })
++      {
++         if (!spelling.empty() && spelling.is_absolute())
++            r.spellings.push_back(spelling);
++      }
++#endif
 +   }
 +   return r;
 +}
@@ -4204,25 +5229,15 @@ index 0000000..d713659
 +}
 +
 +// Compares whole components, so neither a sibling with the same prefix ("config-other") nor a component that contains
-+// a backslash on POSIX passes. Resolved paths compare exactly, since canonical paths have the case of the file system;
-+// paths as written compare without case on Windows, whose file systems ignore it.
-+bool IsWithin(const fs::path& path, const fs::path& root, bool ignoreCase)
++// a backslash on POSIX passes. Exactly: resolved paths have the spelling and case of the file system.
++bool IsWithin(const fs::path& path, const fs::path& root)
 +{
-+   auto same = [ignoreCase](const fs::path& a, const fs::path& b) {
-+#ifdef _WIN32
-+      if (ignoreCase)
-+         return _wcsicmp(a.native().c_str(), b.native().c_str()) == 0;
-+#else
-+      (void)ignoreCase;
-+#endif
-+      return a == b;
-+   };
 +   auto p = path.begin();
 +   for (auto r = root.begin(); r != root.end(); ++r)
 +   {
 +      if (r->empty())
 +         continue;
-+      if (p == path.end() || !same(*p, *r))
++      if (p == path.end() || *p != *r)
 +         return false;
 +      ++p;
 +   }
@@ -4234,18 +5249,38 @@ index 0000000..d713659
 +   return true;
 +}
 +
-+// The decision for a path: first on the path as written, made absolute and normalized without the file system, so a
-+// path outside the root (a network share, a device) is refused before anything looks it up. Only a path inside is
-+// resolved, which follows its symbolic links, and must still be inside. The resolved path stays a path: converting it
-+// to a narrow string can fail on Windows (a long name behind a short 8.3 path).
++// The decision for a path. First on the path as written, made absolute and normalized without the file system: a path
++// that must not be looked up is refused (see PathConfinement::IsReadAllowed). Then by identity: the path
++// is resolved and must be inside the resolved root. Two paths name the same folder when they resolve to the same path,
++// whatever their spelling (8.3 or long names per component, case, junctions, links, subst drives), so no spelling is
++// compared. What is resolved is the path the caller opens, not its normalized form: on POSIX a ".." after a symbolic
++// link leaves the link's target ("link/../x" is next to the target, not next to the link), so the normalized path can
++// be inside while the file opened is not. Resolving the path as written follows its links in the order the system does
++// when it opens it. The resolved path stays a path: converting it to a narrow string can fail on Windows (a long name
++// behind a short 8.3 path).
 +bool IsInside(const std::string& path, const Root& root)
 +{
 +   fs::path lexical = Lexical(path);
-+   if (lexical.empty() || !(IsWithin(lexical, root.lexical, true) || IsWithin(lexical, root.path, true)))
++   if (lexical.empty())
 +      return false;
++#ifdef _WIN32
++   // "\??\" is the NT namespace, checked on the path as written: GetFullPathName takes it for a folder on the current
++   // drive, while the file is opened through it.
++   if (StartsWith(Backslashed(fs::path(path)), L"\\??\\") || !OnRootVolume(lexical, root))
++      return false;
++#else
++   bool written = false;
++   for (const fs::path& spelling : root.spellings)
++      written = written || IsWithin(lexical, spelling);
++   if (!written)
++      return false;
++#endif
 +   std::error_code ec;
-+   fs::path resolved = fs::weakly_canonical(lexical, ec);
-+   return !ec && !resolved.empty() && IsWithin(resolved, root.path, false);
++   fs::path absolute = fs::absolute(fs::path(path), ec);
++   if (ec || absolute.empty())
++      return false;
++   fs::path resolved = fs::weakly_canonical(absolute, ec);
++   return !ec && !resolved.empty() && IsWithin(resolved, root.path);
 +}
 +
 +bool IsAllowed(const std::string& path)
@@ -4314,10 +5349,10 @@ index 0000000..d713659
 +}
 diff --git a/src/general/PathConfinement.h b/src/general/PathConfinement.h
 new file mode 100644
-index 0000000..7df1473
+index 0000000..d0402db
 --- /dev/null
 +++ b/src/general/PathConfinement.h
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,44 @@
 +#pragma once
 +
 +#include <string>
@@ -4336,9 +5371,13 @@ index 0000000..7df1473
 +   // refused while a root is set. A root that does not resolve allows nothing, and is looked up again on every access.
 +   static void SetRoot(const std::string& root);
 +   static bool HasRoot();
-+   // Whether the path lies inside the root. It is decided on the path as written first, without touching the file
-+   // system, so a path outside (a network share among them) is refused without being looked up; a path inside is then
-+   // resolved (symbolic links, dot components) and must still be inside. Any error denies. Logs a refusal.
++   // Whether the path names a file or folder inside the root. Some paths are refused from the path as written, without
++   // being looked up, so a network share is never touched: on Windows one on another volume or share (server and share
++   // compared, "\\?\" and "\\?\UNC\" paths by the drive or share they name) or in a device namespace that names neither
++   // ("\\.\"), on POSIX, where a path does not tell whether it is on a network mount, one not written through the root
++   // as given or as resolved. Every other path is resolved (symbolic links, junctions, dot components, on Windows also
++   // 8.3 short names and case) and must be inside the resolved root: any spelling of the root's folder counts. Any error
++   // denies. Logs a refusal.
 +   static bool IsReadAllowed(const std::string& path);
 +   // The same check without the log line, for lookups (whether a file exists, its size, a folder's entries).
 +   static bool IsLookupAllowed(const std::string& path);
@@ -4397,7 +5436,7 @@ index 023ce64..c2f72fd 100644
     if (!file)
     {
 diff --git a/src/globalconfiguration/GlobalConfig.cpp b/src/globalconfiguration/GlobalConfig.cpp
-index 96ea59f..7f23bf5 100644
+index 96ea59f..0c5dcd3 100644
 --- a/src/globalconfiguration/GlobalConfig.cpp
 +++ b/src/globalconfiguration/GlobalConfig.cpp
 @@ -6,6 +6,7 @@
@@ -4439,7 +5478,19 @@ index 96ea59f..7f23bf5 100644
  
     return nullptr;
  }
-@@ -359,7 +365,7 @@ GlobalConfig* GlobalConfig::GetGlobalConfigFromConfigXmlFile(const std::string&
+@@ -314,7 +320,10 @@ std::unordered_map<std::string, std::string> GlobalConfig::GetReplaceValuesDicti
+    {
+       FileInfo fi(tableFilename);
+       DirectoryInfo tableDir = fi.Directory();
+-      if (tableDir.Exists())
++      // VPE: a table folder outside the configuration folder is not looked up; its names come from the filename, and a
++      // file a pattern makes of them is checked when it is looked up or read.
++      bool confined = PathConfinement::HasRoot() && !PathConfinement::IsLookupAllowed(tableDir.FullName());
++      if (confined ? !tableDir.Name().empty() : tableDir.Exists())
+       {
+          d.emplace("TableDirectory", tableDir.FullName());
+          d.emplace("TableDir", tableDir.FullName());
+@@ -359,7 +368,7 @@ GlobalConfig* GlobalConfig::GetGlobalConfigFromConfigXmlFile(const std::string&
  {
     try
     {
@@ -4448,7 +5499,7 @@ index 96ea59f..7f23bf5 100644
        {
           std::string xml = FileReader::ReadFileToString(globalConfigFileName);
  
-@@ -388,6 +394,10 @@ void GlobalConfig::SaveGlobalConfig(const std::string& globalConfigFilename)
+@@ -388,6 +397,10 @@ void GlobalConfig::SaveGlobalConfig(const std::string& globalConfigFilename)
     if (StringExtensions::IsNullOrWhiteSpace(gcFileName))
        throw std::runtime_error("No filename for GlobalConfig file has been supplied. Looking up the filename from the property GlobalConfigFilename failed as well");
  

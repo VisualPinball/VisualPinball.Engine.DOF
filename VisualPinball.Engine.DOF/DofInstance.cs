@@ -214,13 +214,18 @@ namespace VisualPinball.Engine.DOF
 		}
 
 		/// <summary>
-		/// Closes or opens the output gate. While closed, every output sends 0 and keeps the value effects set for when it
-		/// opens again. Before <see cref="Init"/> it applies at once; afterwards it is applied by DOF's main thread and this
-		/// returns at once. It never waits for DOF's main thread or a device, only for short internal locks. A change made
-		/// just before <see cref="Finish"/> is still applied, after the table element changes made before it; once finish
-		/// started, an opening returns -1 and a closing latches the gate (<see cref="LatchOutputGate"/>).
+		/// Closes or opens the output gate. While closed, every output sends 0 and keeps the value effects set for when
+		/// it opens again. Before <see cref="Init"/> it applies at once, so a session can start closed: every
+		/// controller then turns its outputs off before an opening reaches it, also one whose first update comes after
+		/// the gate opened. Afterwards it is applied by DOF's main thread and this returns at once. It never waits for
+		/// DOF's main thread or a device, only for short internal locks. A change made just before <see cref="Finish"/>
+		/// is still applied, after the table element changes made before it; once finish started, a closing latches the
+		/// gate (<see cref="LatchOutputGate"/>) and returns the latch's generation.
 		/// </summary>
-		/// <returns>The gate generation to pass to <see cref="GetGateState"/>, or -1 while init or finish runs or after finish.</returns>
+		/// <returns>
+		/// The gate generation to pass to <see cref="GetGateState"/>, or -1 while init runs, for an opening once finish
+		/// started, and after finish.
+		/// </returns>
 		public long SetOutputGate(bool open)
 		{
 			var handle = _handle;
@@ -228,10 +233,12 @@ namespace VisualPinball.Engine.DOF
 		}
 
 		/// <summary>
-		/// Turns the controllers' connect test sequences (TestOnConnect of Wemos D1 and UMX controllers) off for the rest
-		/// of the instance, or on again. They run only while the output gate is open; turned off, a controller that
-		/// connects late or reconnects while the gate is open does not light its whole strip. Call before
-		/// <see cref="Init"/> to cover the controllers it connects. Every new instance allows them.
+		/// Turns the controllers' connect test sequences (TestOnConnect of Wemos D1 and UMX controllers) off for the
+		/// rest of the instance, or on again. They run only while the output gate is open for the controller (one
+		/// connected while it was closed turned its outputs off first), and once: a test the gate skipped does not run
+		/// on a reconnect. Turned off, a controller that connects late or reconnects while the gate is open does not
+		/// light its whole strip. Call before <see cref="Init"/> to cover the controllers it connects. Every new
+		/// instance allows them.
 		/// </summary>
 		public void SetConnectTests(bool allowed) => DofException.ThrowIfFailed(DofNative.SetConnectTests(Handle, allowed ? 1 : 0), "Setting DOF's connect tests");
 
@@ -244,10 +251,12 @@ namespace VisualPinball.Engine.DOF
 		/// is a closing, and a state once reported does not change when a later latch returns. The closing reaches the
 		/// controllers without waiting for DOF's main thread: an idle updater checks the gate every 50 ms, its polling
 		/// interval, which bounds how long it takes to notice; a busy one stops the opening's transfer before its next
-		/// write to the device (each report, packet, command or retry), so nothing of the opening goes out after the
-		/// latch returned, and then sends the closing to every output. Takes no lock and never allocates, so the
-		/// simulation thread or a fault handler may call it. Once it returned, the gate reports closed, also to an
-		/// opening DOF's main thread is applying at that moment. It never reaches a later instance's gate.
+		/// write to the device (each report, packet, command or retry), and then sends the closing to every output. A
+		/// write that was already past that check when the latch came can still reach the device after the latch returned:
+		/// at most that one write per controller, followed by the closing. Nothing else of the opening goes out. Takes no
+		/// lock and never allocates, so the simulation thread or a fault handler may call it. Once it returned, the gate
+		/// reports closed, also to an opening DOF's main thread is applying at that moment. It never reaches a later
+		/// instance's gate.
 		/// </summary>
 		/// <returns>The closing's generation, or -1 after <see cref="Dispose"/>.</returns>
 		public long LatchOutputGate()

@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -64,8 +65,9 @@ enum class State
 struct vpe_dof
 {
 	DOF::Pinball* pinball = nullptr;
-	// The gate of the session this instance began. It outlives the instance (OutputGate::BeginSession).
-	DOF::OutputGate* gate = nullptr;
+	// The gate of the session this instance began, held until the instance is freed. The controllers' unit handles keep
+	// it too, so an updater thread that still runs never reaches a freed gate.
+	std::shared_ptr<DOF::OutputGate> gate;
 	std::string basePath;
 	std::atomic<State> state { State::Created };
 	std::mutex lifecycle;
@@ -324,9 +326,10 @@ VPE_DOF_API vpe_dof* VPE_DOF_CALL vpe_dof_create(const char* base_path, int32_t*
 			DOF::Config::GetInstance()->SetBasePath(base_path);
 			DOF::PathConfinement::SetRoot(base_path);
 			// A configuration that cannot be used fails init instead of falling back to defaults or auto-configuring
-			// whatever hardware is connected.
+			// whatever hardware is connected. An output controller that cannot be read is skipped (the patch), as the
+			// importer, which does not have libdof read cabinets, cannot tell.
 			DOF::Config::GetInstance()->SetStrictSetup(true);
-			dof->gate = &DOF::OutputGate::BeginSession();
+			dof->gate = DOF::OutputGate::BeginSession().shared_from_this();
 			{
 				std::lock_guard<std::mutex> hid(VpeDofHidLock());
 				DOF::IOConfigurator::Initialize();
@@ -512,8 +515,13 @@ VPE_DOF_API int64_t VPE_DOF_CALL vpe_dof_set_output_gate(vpe_dof* dof, int32_t o
 		return -1;
 	try
 	{
-		if (dof->state.load() == State::Running)
+		State state = dof->state.load();
+		if (state == State::Running)
 			return dof->pinball->SetOutputGate(open != 0);
+		// Once finish started, DOF's main thread takes no change: a closing latches the gate, which the controllers send
+		// without it and the final blackout confirms, and an opening is refused.
+		if (state == State::Finishing)
+			return open ? -1 : dof->gate->Latch();
 		// Never waits for a running init or finish.
 		std::unique_lock<std::mutex> lock(dof->lifecycle, std::try_to_lock);
 		if (!lock.owns_lock() || dof->state.load() != State::Created)

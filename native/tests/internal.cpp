@@ -11,14 +11,19 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "Pinball.h"
@@ -30,16 +35,25 @@
 #include "cab/schedules/ScheduledSettings.h"
 #include "cab/toys/IMatrixToy.h"
 #include "cab/toys/ToyList.h"
+#include "DOF/Config.h"
 #include "fx/EffectBase.h"
 #include "fx/EffectList.h"
 #include "fx/matrixfx/RGBAMatrixShiftEffect.h"
 #include "fx/timmedfx/DelayEffect.h"
 #include "general/FileInfo.h"
+#include "general/FilePattern.h"
+#include "general/FileReader.h"
 #include "general/PathConfinement.h"
+#include "globalconfiguration/GlobalConfig.h"
 #include "general/color/RGBAColor.h"
 #include "pinballsupport/InputQueue.h"
 #include "table/Table.h"
 #include "table/TableElementData.h"
+
+#include <tinyxml2/tinyxml2.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 using namespace DOF;
 
@@ -78,15 +92,16 @@ public:
 		pinball.m_commands.push_back({ pinball.m_inputQueue->Count(), [] { } });
 	}
 
-	// 'C' for a command, 'I' for input, '-' for nothing.
-	static std::string Take(Pinball& pinball, int count)
+	// 'C' for a command, 'I' for input, '-' for nothing. `drain`: as the main thread takes its work once asked to stop
+	// (DrainCommands), only what the queued commands wait for.
+	static std::string Take(Pinball& pinball, int count, bool drain = false)
 	{
 		std::string order;
 		for (int i = 0; i < count; i++)
 		{
 			std::function<void()> command;
 			TableElementData data;
-			Pinball::Work work = pinball.TakeWork(false, command, data);
+			Pinball::Work work = pinball.TakeWork(drain, command, data);
 			order += work == Pinball::Work::Command ? 'C' : work == Pinball::Work::Input ? 'I' : '-';
 		}
 		return order;
@@ -243,11 +258,20 @@ public:
 	}
 
 	std::function<void(int, const std::vector<uint8_t>&)> beforeReport;
+	std::function<void()> onDisconnect;
 	std::atomic<bool> failNextWrite { false };
 	std::atomic<bool> failReconnect { false };
 	std::atomic<bool> blackoutWorks { true };
 	std::atomic<int> connects { 0 };
 	std::atomic<int> blackouts { 0 };
+	// The connect sends a connect test as the Wemos D1 controller does: decided by TakeConnectTest, and checked again
+	// at the write. failAfterTest makes the connect fail once the device took it (the controller did not answer);
+	// beforeTest runs between the decision and the write (the log line). handshakeFailsOnce makes the first connect
+	// return before the test, as a failed Teensy handshake does, keeping testOnConnect for a reconnect.
+	std::atomic<bool> testOnConnect { false };
+	std::atomic<bool> failAfterTest { false };
+	std::atomic<bool> handshakeFailsOnce { false };
+	std::function<void()> beforeTest;
 
 protected:
 	int GetNumberOfConfiguredOutputs() override { return 2; }
@@ -255,12 +279,33 @@ protected:
 
 	void ConnectToController() override
 	{
-		if (connects++ > 0 && failReconnect)
+		int attempt = connects++;
+		if (attempt > 0 && failReconnect)
 			throw std::runtime_error("the device is gone");
+		if (attempt == 0 && handshakeFailsOnce)
+			return;
+		bool test = testOnConnect && TakeConnectTest();
+		testOnConnect = false;
+		if (!test)
+			return;
+		if (beforeTest)
+			beforeTest();
+		OutputGate::Snapshot gate = ObserveGate();
+		if (!gate.open)
+			return;
+		OutputGate::Transfer transfer(GateUnit(), gate);
+		if (TransferCancelled())
+			return;
+		Note("test");
+		ConnectTestSent(gate);
+		if (failAfterTest)
+			throw std::runtime_error("the device does not answer");
 	}
 
 	void DisconnectFromController() override
 	{
+		if (onDisconnect)
+			onDisconnect();
 		if (m_inUseState != InUseState::Running)
 			return;
 		blackouts++;
@@ -290,8 +335,8 @@ private:
 void UntouchedUnitsAreCountedApart()
 {
 	OutputGate& gate = OutputGate::BeginSession();
-	OutputGate::Unit* used = gate.Register("used");
-	OutputGate::Unit* unused = gate.Register("unused");
+	OutputGate::UnitHandle used = gate.Register("used");
+	OutputGate::UnitHandle unused = gate.Register("unused");
 
 	int64_t open = gate.Request(true);
 	CHECK(gate.Apply(true), "the gate opens");
@@ -317,7 +362,7 @@ void UntouchedUnitsAreCountedApart()
 void LatchOvertakesAQueuedOpening()
 {
 	OutputGate& gate = OutputGate::BeginSession();
-	OutputGate::Unit* unit = gate.Register("unit");
+	OutputGate::UnitHandle unit = gate.Register("unit");
 	Change(gate, false);
 	unit->Ack(gate.Current());
 
@@ -353,7 +398,7 @@ void LatchOvertakesAQueuedOpening()
 void OpeningReservedBeforeALatchIsSuperseded()
 {
 	OutputGate& gate = OutputGate::BeginSession();
-	OutputGate::Unit* unit = gate.Register("unit");
+	OutputGate::UnitHandle unit = gate.Register("unit");
 	Change(gate, false);
 	unit->Ack(gate.Current());
 
@@ -376,7 +421,7 @@ void OpeningReservedBeforeALatchIsSuperseded()
 void OpeningPublishedDuringALatchIsSuperseded()
 {
 	OutputGate& gate = OutputGate::BeginSession();
-	OutputGate::Unit* unit = gate.Register("unit");
+	OutputGate::UnitHandle unit = gate.Register("unit");
 	int64_t open = gate.Request(true);
 	int64_t latched = OutputGateTestAccess::BeginLatch(gate);
 	CHECK(!gate.Apply(true), "the opening applies as a closing");
@@ -397,7 +442,7 @@ void OpeningPublishedDuringALatchIsSuperseded()
 void ResultsAreDecidedWhenPublished()
 {
 	OutputGate& gate = OutputGate::BeginSession();
-	OutputGate::Unit* unit = gate.Register("unit");
+	OutputGate::UnitHandle unit = gate.Register("unit");
 	int64_t open = Change(gate, true);
 	unit->Ack(gate.Current());
 	OutputGate::Counts counts;
@@ -416,7 +461,7 @@ void ResultsAreDecidedWhenPublished()
 void EarliestLatchDecides()
 {
 	OutputGate& gate = OutputGate::BeginSession();
-	OutputGate::Unit* unit = gate.Register("unit");
+	OutputGate::UnitHandle unit = gate.Register("unit");
 	int64_t first = OutputGateTestAccess::BeginLatch(gate);
 	int64_t second = OutputGateTestAccess::BeginLatch(gate);
 	CHECK(second > first, "latches take their generations in order");
@@ -434,7 +479,7 @@ void EarliestLatchDecides()
 void OpeningBetweenTwoLatchesIsAClosing()
 {
 	OutputGate& gate = OutputGate::BeginSession();
-	OutputGate::Unit* unit = gate.Register("unit");
+	OutputGate::UnitHandle unit = gate.Register("unit");
 	int64_t first = OutputGateTestAccess::BeginLatch(gate);
 	int64_t open = gate.Request(true);
 	CHECK(!gate.Apply(true), "the opening applies as a closing");
@@ -455,7 +500,7 @@ void OpeningBetweenTwoLatchesIsAClosing()
 void PausedLatchChangesNothingReported()
 {
 	OutputGate& gate = OutputGate::BeginSession();
-	OutputGate::Unit* unit = gate.Register("unit");
+	OutputGate::UnitHandle unit = gate.Register("unit");
 	int64_t earlier = gate.Request(true);
 	int64_t first = OutputGateTestAccess::BeginLatch(gate);
 	int64_t open = gate.Request(true);
@@ -486,9 +531,9 @@ void PausedLatchChangesNothingReported()
 void LatchesStayInTheirSession()
 {
 	OutputGate& ended = OutputGate::BeginSession();
-	OutputGate::Unit* old = ended.Register("old");
+	OutputGate::UnitHandle old = ended.Register("old");
 	OutputGate& current = OutputGate::BeginSession();
-	OutputGate::Unit* unit = current.Register("unit");
+	OutputGate::UnitHandle unit = current.Register("unit");
 	CHECK(&OutputGate::Instance() == &current, "the new session is the current one");
 	CHECK(old->BelongsTo(ended) && !old->BelongsTo(current), "a unit keeps its session");
 	{
@@ -508,7 +553,7 @@ void LatchesStayInTheirSession()
 void LatchCancelsTheTransferOfAnOpening()
 {
 	OutputGate& gate = OutputGate::BeginSession();
-	OutputGate::Unit* unit = gate.Register("unit");
+	OutputGate::UnitHandle unit = gate.Register("unit");
 	CHECK(!OutputGate::TransferCancelled(), "nothing to cancel outside a transfer");
 	{
 		OutputGate::Transfer transfer(unit, unit->Observe());
@@ -565,7 +610,7 @@ void LatchStopsAControllerAtTheNextWrite()
 void FinalBlackoutConfirmsTheClosing()
 {
 	OutputGate& gate = OutputGate::BeginSession();
-	OutputGate::Unit* unit = gate.Register("unit");
+	OutputGate::UnitHandle unit = gate.Register("unit");
 	int64_t closed = Change(gate, false);
 	OutputGate::Snapshot before = unit->Observe();
 	int64_t latched = gate.Latch();
@@ -577,7 +622,7 @@ void FinalBlackoutConfirmsTheClosing()
 	CHECK(NamesAgree(gate, latched), "names agree with the counts");
 
 	OutputGate& next = OutputGate::BeginSession();
-	OutputGate::Unit* other = next.Register("unit");
+	OutputGate::UnitHandle other = next.Register("unit");
 	int64_t open = Change(next, true);
 	other->AckOff(other->Observe());
 	other->Stop();
@@ -627,6 +672,160 @@ void LostDeviceStillGetsItsBlackout()
 	}
 }
 
+// A connect test lights the device before any value changed: the unit confirmed the opening it went out with, not as
+// untouched, and the session ends with the blackout. It confirms that opening only: after a closing turned the device
+// off, a later opening it wrote nothing for is untouched.
+void ConnectTestCountsAsUse()
+{
+	OutputGate& gate = OutputGate::BeginSession();
+	int64_t open = Change(gate, true);
+	ScriptedController controller;
+	controller.SetName("scripted");
+	controller.testOnConnect = true;
+	controller.Init(nullptr);
+	OutputGate::Counts counts;
+	CHECK(WaitFor([&]() { return gate.GetState(open, counts) == OutputGate::Status::Applied && counts.confirmed == 1; }), "the opening counts the tested unit as used");
+	CHECK(controller.HasWritten("test") && counts.untouched == 0, "not as untouched");
+	int64_t closed = Change(gate, false);
+	CHECK(WaitFor([&]() { return gate.GetState(closed, counts) == OutputGate::Status::Applied && counts.confirmed == 1; }), "the closing is written");
+	size_t written = controller.Written().size();
+	int64_t reopened = Change(gate, true);
+	CHECK(WaitFor([&]() { return gate.GetState(reopened, counts) == OutputGate::Status::Applied && counts.pending == 0; }), "the opening after it is settled");
+	CHECK(counts.untouched == 1 && counts.confirmed == 0, "the test does not confirm an opening after a closing");
+	CHECK(controller.Written().size() == written, "nothing was written for it");
+	controller.Finish();
+	CHECK(controller.HasWritten("0=0") && controller.HasWritten("1=0"), "the session ends with the blackout");
+}
+
+// A connect that fails after the device took its connect test ends as a session does: with the blackout, and with an
+// error unless the blackout got there. The unit fails either way.
+void ConnectThatFailsAfterItsTestEndsDark()
+{
+	for (bool blackoutWorks : { true, false })
+	{
+		OutputGate& gate = OutputGate::BeginSession();
+		int64_t open = Change(gate, true);
+		ScriptedController controller;
+		controller.SetName("scripted");
+		controller.testOnConnect = true;
+		controller.failAfterTest = true;
+		controller.failNextWrite = !blackoutWorks;
+		controller.Init(nullptr);
+		OutputGate::Counts counts;
+		CHECK(WaitFor([&]() { return gate.GetState(open, counts) == OutputGate::Status::Applied && counts.failed == 1; }), "the unit fails");
+		std::string error;
+		try
+		{
+			controller.Finish();
+		}
+		catch (const std::exception& e)
+		{
+			error = e.what();
+		}
+		std::vector<std::string> log = controller.Written();
+		auto test = std::find(log.begin(), log.end(), "test");
+		CHECK(test != log.end(), "the test was sent");
+		if (blackoutWorks)
+		{
+			CHECK(std::find(test, log.end(), "0=0") != log.end() && std::find(test, log.end(), "1=0") != log.end(), "the blackout follows it");
+			CHECK(error.empty(), "a blackout that got there finishes cleanly");
+		}
+		else
+			CHECK(error.find("after its connect test") != std::string::npos, "one that did not fails the finish");
+	}
+}
+
+// A unit registered while the gate is closed turns its device off first, also when the gate opened before its first
+// update: a session that starts closed starts dark on every unit, whatever an earlier one left lit. A connect test
+// does not go out before that.
+void SessionThatStartsClosedStartsDark()
+{
+	OutputGate& gate = OutputGate::BeginSession();
+	int64_t closed = Change(gate, false);
+	ScriptedController controller;
+	controller.SetName("scripted");
+	controller.testOnConnect = true;
+	controller.Init(nullptr);
+	int64_t open = Change(gate, true);
+	OutputGate::Counts counts;
+	// The opening supersedes the closing; the unit still has to confirm it.
+	CHECK(WaitFor([&]() {
+		gate.GetState(closed, counts);
+		return counts.confirmed == 1;
+	}),
+		  "the closing the unit was registered under is written");
+	CHECK(controller.HasWritten("0=0") && controller.HasWritten("1=0"), "to every output");
+	CHECK(WaitFor([&]() { return gate.GetState(open, counts) == OutputGate::Status::Applied && counts.pending == 0; }) && counts.untouched == 1, "the opening after it leaves the unit alone");
+	CHECK(!controller.HasWritten("test"), "no connect test went out before the closing was written");
+	controller.Finish();
+}
+
+// A session that starts closed sends no connect test, also not on a reconnect once the gate opened: the test was used
+// up when the unit registered under the closing, though the first connect never got to it.
+void SessionThatStartsClosedTestsOnNoReconnect()
+{
+	OutputGate& gate = OutputGate::BeginSession();
+	Change(gate, false);
+	ScriptedController controller;
+	controller.SetName("scripted");
+	controller.testOnConnect = true;
+	controller.handshakeFailsOnce = true;
+	controller.failNextWrite = true;
+	controller.Init(nullptr);
+	Change(gate, true);
+	controller.Set(255, 0);
+	CHECK(WaitFor([&controller]() { return controller.connects.load() >= 2 && controller.HasWritten("0=255"); }), "the controller reconnects and writes");
+	CHECK(!controller.HasWritten("test"), "without a connect test");
+	controller.Finish();
+}
+
+// A connect test is checked again at its write: a latch between the decision and the write (one in the log line)
+// keeps it from going out.
+void LatchBeforeTheConnectTestSkipsIt()
+{
+	OutputGate& gate = OutputGate::BeginSession();
+	Change(gate, true);
+	ScriptedController controller;
+	controller.SetName("scripted");
+	controller.testOnConnect = true;
+	int64_t latched = -1;
+	controller.beforeTest = [&]() { latched = gate.Latch(); };
+	controller.Init(nullptr);
+	OutputGate::Counts counts;
+	CHECK(WaitFor([&]() { return latched >= 0 && gate.GetState(latched, counts) == OutputGate::Status::Applied && counts.confirmed == 1; }), "the latch is written");
+	CHECK(!controller.HasWritten("test"), "the test after it is not");
+	controller.Finish();
+}
+
+// The final blackout confirms the closings published before and while it was sent, at the blackout: a closing published
+// later, while the controller disconnects, was not carried by it and fails as one after the unit stopped does, unless
+// the disconnect sends a blackout of its own after it.
+void BlackoutConfirmsWhereItIsSent()
+{
+	for (bool disconnectBlackout : { false, true })
+	{
+		OutputGate& gate = OutputGate::BeginSession();
+		ScriptedController controller;
+		controller.SetName("scripted");
+		controller.blackoutWorks = disconnectBlackout;
+		controller.Init(nullptr);
+		controller.Set(255, 0);
+		CHECK(WaitFor([&controller]() { return controller.HasWritten("0=255"); }), "the opening's value goes out");
+		int64_t latched = -1;
+		controller.onDisconnect = [&]() {
+			if (latched < 0)
+				latched = gate.Latch();
+		};
+		controller.Finish();
+		OutputGate::Counts counts;
+		CHECK(latched >= 0 && gate.GetState(latched, counts) == OutputGate::Status::Applied, "the latch came while the controller disconnected");
+		if (disconnectBlackout)
+			CHECK(counts.confirmed == 1 && counts.failed == 0, "a blackout the disconnect sends after it confirms it");
+		else
+			CHECK(counts.confirmed == 0 && counts.failed == 1, "the final blackout before it does not");
+	}
+}
+
 // Once Finish started, the session takes no opening; a closing latches the gate.
 void FinishTakesNoOpening()
 {
@@ -644,7 +843,7 @@ void FinishTakesNoOpening()
 void PermanentFailureOutranksAnAck()
 {
 	OutputGate& gate = OutputGate::BeginSession();
-	OutputGate::Unit* unit = gate.Register("unit");
+	OutputGate::UnitHandle unit = gate.Register("unit");
 	int64_t closed = Change(gate, false);
 	unit->Ack(gate.Current());
 	OutputGate::Counts counts;
@@ -660,9 +859,9 @@ void PermanentFailureOutranksAnAck()
 void CleanFinishKeepsTheSettledResult()
 {
 	OutputGate& gate = OutputGate::BeginSession();
-	OutputGate::Unit* used = gate.Register("used");
-	OutputGate::Unit* unused = gate.Register("unused");
-	OutputGate::Unit* failing = gate.Register("failing");
+	OutputGate::UnitHandle used = gate.Register("used");
+	OutputGate::UnitHandle unused = gate.Register("unused");
+	OutputGate::UnitHandle failing = gate.Register("failing");
 	int64_t open = Change(gate, true);
 	OutputGate::Snapshot snapshot = gate.Current();
 	used->Ack(snapshot);
@@ -689,12 +888,28 @@ void CleanFinishKeepsTheSettledResult()
 	CHECK(NamesAgree(gate, closed), "names agree with the counts");
 }
 
+// A folder this run created, so the test writes and removes nothing it did not make. Empty if none could be created.
+std::filesystem::path NewTempDirectory(const std::string& prefix)
+{
+	std::random_device random;
+	for (int attempt = 0; attempt < 100; attempt++)
+	{
+		std::filesystem::path path = std::filesystem::temp_directory_path() / (prefix + "-" + std::to_string(random()) + std::to_string(random()));
+		std::error_code ec;
+		if (std::filesystem::create_directory(path, ec) && !ec)
+			return path;
+	}
+	return std::filesystem::path();
+}
+
 // Path confinement decides on the path as written first: a path outside the root, a network share among them, is
 // refused without being looked up, and the lookups (whether a file exists, its size) go through the check.
 void LookupsOutsideTheRootAreRefused()
 {
-	std::filesystem::path root = std::filesystem::temp_directory_path() / "vpe-dof-internal-confinement";
-	std::filesystem::create_directories(root);
+	std::filesystem::path root = NewTempDirectory("vpe-dof-internal-confinement");
+	CHECK(!root.empty(), "the test has a folder of its own");
+	if (root.empty())
+		return;
 	std::string inside = (root / "inside.ini").string();
 	FILE* file = std::fopen(inside.c_str(), "wb");
 	if (file)
@@ -728,6 +943,307 @@ void LookupsOutsideTheRootAreRefused()
 	PathConfinement::SetRoot("");
 	std::error_code ec;
 	std::filesystem::remove_all(root, ec);
+}
+
+// The check decides on the path the reader opens. On POSIX a ".." after a symbolic link leaves the link's target, so
+// "link/../secret.ini" opens the file next to the target, outside the root, while its normalized form ("secret.ini" in
+// the root) is inside. Windows removes ".." from a path before it follows any link, as the check does, and creating a
+// link needs a privilege there, so this runs on POSIX only.
+void PathThroughALinkIsCheckedAsItIsOpened()
+{
+#ifndef _WIN32
+	std::filesystem::path root = NewTempDirectory("vpe-dof-internal-root");
+	std::filesystem::path outside = NewTempDirectory("vpe-dof-internal-outside");
+	CHECK(!root.empty() && !outside.empty(), "the test has folders of its own");
+	if (root.empty() || outside.empty())
+		return;
+	std::error_code ec;
+	std::filesystem::create_directory(outside / "target", ec);
+	for (const std::filesystem::path& file : { outside / "secret.ini", root / "secret.ini" })
+	{
+		FILE* handle = std::fopen(file.c_str(), "wb");
+		if (handle)
+		{
+			std::fputs(file == root / "secret.ini" ? "inside" : "outside", handle);
+			std::fclose(handle);
+		}
+	}
+	std::filesystem::create_directory_symlink(outside / "target", root / "link", ec);
+	CHECK(!ec, "the link is created");
+	const std::string through = (root / "link" / ".." / "secret.ini").string();
+	PathConfinement::SetRoot(root.string());
+	CHECK(!PathConfinement::IsLookupAllowed(through), "a path that leaves the root through a link is refused");
+	CHECK(!FileInfo(through).Exists(), "and does not exist for libdof");
+	std::string read;
+	try
+	{
+		read = FileReader::ReadFileToString(through);
+	}
+	catch (const std::exception&)
+	{
+	}
+	CHECK(read.empty(), "nor is it read");
+	CHECK(FileReader::ReadFileToString((root / "secret.ini").string()) == "inside", "the file inside the root still is");
+	PathConfinement::SetRoot("");
+	std::filesystem::remove_all(root, ec);
+	std::filesystem::remove_all(outside, ec);
+#endif
+}
+
+// A path inside the root is read whatever its spelling: through the junction the root was given through or another
+// one, in 8.3 or long names per component, in any case (non-ASCII too). A path on another share, in a device namespace
+// or a UNC path is refused without being looked up, also when it names a file inside. Windows only, and the 8.3 checks
+// only where the volume has short names.
+void RootSpellingsAreOneFolder()
+{
+#ifdef _WIN32
+	std::filesystem::path base = NewTempDirectory("vpe-dof-internal-spellings");
+	CHECK(!base.empty(), "the test has a folder of its own");
+	if (base.empty())
+		return;
+	std::filesystem::path store = base / std::filesystem::path(L"St\u00f6re Unic\u00f8de");
+	std::error_code ec;
+	std::filesystem::create_directories(store / "rev" / "config", ec);
+	for (const std::filesystem::path& file : { store / "rev" / "config" / "Cabinet.xml", base / "outside.xml" })
+	{
+		FILE* handle = _wfopen(file.c_str(), L"wb");
+		if (handle)
+			std::fclose(handle);
+	}
+	bool junction = true;
+	for (const char* name : { "link", "other" })
+	{
+		std::wstring command = L"cmd /c mklink /J \"" + (base / name).wstring() + L"\" \"" + store.wstring() + L"\" >nul";
+		junction = junction && _wsystem(command.c_str()) == 0 && std::filesystem::exists(base / name / "rev");
+	}
+	CHECK(junction, "the junctions are created");
+	auto shortForm = [](const std::filesystem::path& path) {
+		wchar_t buffer[2048];
+		DWORD length = GetShortPathNameW(path.c_str(), buffer, 2048);
+		return length && length < 2048 ? std::wstring(buffer, length) : std::wstring();
+	};
+	auto ascii = [](const std::wstring& text) {
+		std::string result;
+		for (wchar_t c : text)
+		{
+			if (c > 0x7F)
+				return std::string();
+			result += static_cast<char>(c);
+		}
+		return result;
+	};
+	std::string shortRoot = ascii(shortForm(store / "rev"));
+	std::string shortCabinet = ascii(shortForm(store / "rev" / "config" / "Cabinet.xml"));
+	std::string shortOutside = ascii(shortForm(base / "outside.xml"));
+	std::string junctionRoot = ascii((base / "link" / "rev").wstring());
+	std::string junctionCabinet = junctionRoot + "\\config\\Cabinet.xml";
+	std::string otherCabinet = ascii((base / "other" / "rev" / "config" / "Cabinet.xml").wstring());
+	// The folder in 8.3, the junction and what is inside it long: spellings mixed per component.
+	std::string shortBase = ascii(shortForm(base));
+	auto upper = [](std::string text) {
+		for (char& c : text)
+			c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+		return text;
+	};
+	if (junction && !junctionRoot.empty())
+	{
+		PathConfinement::SetRoot(junctionRoot);
+		CHECK(FileInfo(junctionCabinet).Exists(), "a file through the junction the root was given through is found");
+		CHECK(FileInfo(upper(junctionCabinet)).Exists(), "in any case");
+		CHECK(!FileInfo(junctionRoot + "\\..\\..\\outside.xml").Exists(), "a path leading out of it is refused");
+		if (!shortCabinet.empty())
+		{
+			CHECK(FileInfo(shortCabinet).Exists(), "a file through the 8.3 spelling of the resolved root is found");
+			CHECK(!FileInfo(shortRoot + "\\..\\..\\outside.xml").Exists(), "a path leading out of that spelling is refused");
+		}
+		if (!shortOutside.empty())
+			CHECK(!FileInfo(shortOutside).Exists(), "an 8.3 path outside the root is refused");
+		CHECK(FileInfo(otherCabinet).Exists(), "a file through another junction to the root is found");
+		CHECK(!FileInfo(ascii((base / "other" / "rev").wstring()) + "\\..\\..\\outside.xml").Exists(), "a path leading out of it is refused");
+		if (!shortBase.empty() && shortBase != ascii(base.wstring()))
+		{
+			CHECK(FileInfo(shortBase + "\\link\\rev\\config\\Cabinet.xml").Exists(), "a file through an 8.3 folder above a long one is found");
+			PathConfinement::SetRoot(shortBase + "\\link\\rev");
+			CHECK(FileInfo(junctionCabinet).Exists(), "and with that root, the long spelling");
+			PathConfinement::SetRoot(junctionRoot);
+		}
+		// The same file, written so that only the volume it is on decides: refused without being looked up.
+		std::string drive = junctionCabinet.substr(0, 1);
+		std::string rest = junctionCabinet.substr(2);
+		for (const std::string& written : { "\\\\.\\" + junctionCabinet, "\\??\\" + junctionCabinet,"\\\\localhost\\" + drive + "$" + rest, "\\\\?\\UNC\\localhost\\" + drive + "$" + rest })
+			CHECK(!FileInfo(written).Exists(), ("a device or UNC path to a file inside is refused: " + written).c_str());
+		// An extended-length path names its drive: it is checked as the drive's path is.
+		CHECK(FileInfo("\\\\?\\" + junctionCabinet).Exists(), "an extended-length path inside is found");
+		CHECK(!FileInfo("\\\\?\\" + junctionRoot + "\\..\\..\\outside.xml").Exists(), "one leading out is refused");
+		DWORD drives = GetLogicalDrives();
+		for (char letter = 'A'; letter <= 'Z'; letter++)
+		{
+			if (letter == std::toupper(static_cast<unsigned char>(drive[0])) || !(drives & (1u << (letter - 'A'))))
+				continue;
+			std::string other = std::string(1, letter) + ":" + rest;
+			CHECK(!FileInfo(other).Exists(), ("a path on another drive is refused: " + other).c_str());
+			CHECK(!FileInfo("\\\\?\\" + other).Exists(), ("also extended-length: " + other).c_str());
+			break;
+		}
+	}
+	// A folder with a non-ASCII name, given and read in another case. Paths are narrow strings in the active code page,
+	// so only where it has the name.
+	std::filesystem::path accented = base / std::filesystem::path(L"\u00e9t\u00e9");
+	std::filesystem::create_directories(accented / "config", ec);
+	FILE* accentedFile = _wfopen((accented / "config" / "Cabinet.xml").c_str(), L"wb");
+	if (accentedFile)
+		std::fclose(accentedFile);
+	auto narrow = [](const std::wstring& text) {
+		char buffer[2048];
+		BOOL lossy = FALSE;
+		int length = WideCharToMultiByte(CP_ACP, 0, text.c_str(), static_cast<int>(text.size()), buffer, sizeof(buffer), nullptr, GetACP() == CP_UTF8 ? nullptr : &lossy);
+		return length > 0 && !lossy ? std::string(buffer, length) : std::string();
+	};
+	std::string accentedRoot = narrow(accented.wstring());
+	std::string accentedUpper = narrow((base / std::filesystem::path(L"\u00c9T\u00c9") / "config" / "Cabinet.xml").wstring());
+	if (!accentedRoot.empty() && !accentedUpper.empty())
+	{
+		PathConfinement::SetRoot(accentedRoot);
+		CHECK(FileInfo(accentedUpper).Exists(), "a non-ASCII root finds its files in another case");
+	}
+	else
+		std::printf("RootSpellingsAreOneFolder: the code page has no accented names, their case not checked\n");
+	if (!shortRoot.empty() && !shortCabinet.empty())
+	{
+		PathConfinement::SetRoot(shortRoot);
+		CHECK(FileInfo(shortCabinet).Exists(), "a root given in 8.3 finds its files in 8.3");
+		CHECK(FileInfo(upper(shortCabinet)).Exists(), "in any case");
+	}
+	else
+		std::printf("RootSpellingsAreOneFolder: no 8.3 names on this volume, short spellings not checked\n");
+	PathConfinement::SetRoot("");
+	std::filesystem::remove(base / "link", ec);
+	std::filesystem::remove(base / "other", ec);
+	std::filesystem::remove_all(base, ec);
+#endif
+}
+
+// A table folder outside the configuration folder is not looked up, but its names still make the table config's path,
+// which is checked as any other.
+void TableFolderNamesComeFromTheFilename()
+{
+	std::filesystem::path root = NewTempDirectory("vpe-dof-internal-tableroot");
+	std::filesystem::path tables = NewTempDirectory("vpe-dof-internal-tables");
+	CHECK(!root.empty() && !tables.empty(), "the test has folders of its own");
+	if (root.empty() || tables.empty())
+		return;
+	std::string name = tables.filename().string();
+	FILE* handle = std::fopen((root / (name + ".xml")).string().c_str(), "wb");
+	if (handle)
+		std::fclose(handle);
+	handle = std::fopen((tables / "Table.xml").string().c_str(), "wb");
+	if (handle)
+		std::fclose(handle);
+	std::string table = (tables / "Table.vpx").string();
+	PathConfinement::SetRoot(root.string());
+	GlobalConfig config;
+	std::unordered_map<std::string, std::string> values = config.GetReplaceValuesDictionary(table);
+	CHECK(values.count("TableDirName") && values["TableDirName"] == name, "the table folder's name comes from the filename");
+	config.GetTableConfigFilePatterns().push_back(FilePattern((root / "{TableDirName}.xml").string()));
+	FileInfo* inside = config.GetTableConfigFile(table);
+	CHECK(inside != nullptr, "a table config it names inside the root is found");
+	delete inside;
+	config.GetTableConfigFilePatterns().clear();
+	config.GetTableConfigFilePatterns().push_back(FilePattern((tables / "{TableName}.xml").string()));
+	FileInfo* outside = config.GetTableConfigFile(table);
+	CHECK(outside == nullptr, "one outside the root is not, though it exists");
+	delete outside;
+	PathConfinement::SetRoot("");
+	std::error_code ec;
+	std::filesystem::remove_all(root, ec);
+	std::filesystem::remove_all(tables, ec);
+}
+
+// A controller libdof cannot read is skipped in strict setup too, as a toy is, and the others load: VPE activates
+// cabinets without libdof reading them, so setup must not refuse one as a whole for it.
+void UnreadableControllerIsSkipped()
+{
+	bool strict = Config::GetInstance()->IsStrictSetup();
+	Config::GetInstance()->SetStrictSetup(true);
+	tinyxml2::XMLDocument doc;
+	// Unreadable XML (FromXml returns false), a setting a setter refuses (it throws), and a unit selector that is missing or
+	// not a number, which would fail Init and so the whole cabinet.
+	doc.Parse("<OutputControllers><ArtNet><Name>unset</Name><Universe>unset</Universe></ArtNet>"
+			  "<PacUIO Name=\"out of range\" Id=\"2\" />"
+			  "<PacLed64 Name=\"out of range\" Id=\"5\" /><PacUIO Name=\"no Id\" /><PacLed64 Name=\"no Id\" />"
+			  "<PacLed64 Name=\"bad Id\" Id=\"one\" /><LedWiz><Name>no number</Name></LedWiz>"
+			  "<LedWiz><Name>bad number</Name><Number>one</Number></LedWiz>"
+			  "<PacUIO Name=\"fraction\" Id=\"0.5\" /><PacLed64 Name=\"suffix\" Id=\"1old\" />"
+			  "<LedWiz><Name>fraction</Name><Number>2.5</Number></LedWiz>"
+			  "<ArtNet><Name>suffix</Name><Universe>1old</Universe></ArtNet>"
+			  "<ArtNet><Name>valid</Name><Universe>1</Universe></ArtNet></OutputControllers>");
+	OutputControllerList controllers;
+	bool threw = false;
+	try
+	{
+		controllers.FromXml(doc.RootElement());
+	}
+	catch (const std::exception&)
+	{
+		threw = true;
+	}
+	CHECK(!threw, "setup does not refuse the cabinet");
+	CHECK(controllers.size() == 1 && controllers.front()->GetName() == "valid", "the readable controller loads");
+	Config::GetInstance()->SetStrictSetup(strict);
+}
+
+// A session's gate is freed, with its history and units, once nothing holds it: not when the next session begins while
+// a unit handle (a controller, an updater thread that still runs) or an instance holds it, and as soon as the last one
+// lets go. A host that runs many sessions keeps no gate nothing uses.
+void EndedSessionsAreFreed()
+{
+	std::weak_ptr<OutputGate> ended;
+	OutputGate::UnitHandle handle;
+	{
+		OutputGate& gate = OutputGate::BeginSession();
+		ended = gate.shared_from_this();
+		handle = gate.Register("updater");
+		for (int i = 0; i < 100; i++)
+			gate.Publish(gate.Request(i % 2 == 0));
+	}
+	std::weak_ptr<OutputGate> current = OutputGate::BeginSession().shared_from_this();
+	CHECK(!ended.expired(), "a gate stays while a unit handle holds it");
+	handle->Ack(handle->Observe());
+	CHECK(handle->Observe().generation > 0, "and its unit still works");
+	handle.reset();
+	CHECK(ended.expired(), "and is freed with the last handle");
+	CHECK(!current.expired(), "the current session's gate stays");
+
+	std::shared_ptr<OutputGate> instance = OutputGate::Instance().shared_from_this();
+	OutputGate::BeginSession();
+	CHECK(!current.expired(), "an instance keeps its gate after the next session began");
+	instance.reset();
+	CHECK(current.expired(), "and frees it");
+
+	// Many sessions keep only the current one.
+	std::vector<std::weak_ptr<OutputGate>> sessions;
+	for (int i = 0; i < 1000; i++)
+	{
+		OutputGate& gate = OutputGate::BeginSession();
+		gate.Register("unit")->Stop();
+		gate.Publish(gate.Request(false));
+		sessions.push_back(gate.shared_from_this());
+	}
+	CHECK(std::count_if(sessions.begin(), sessions.end(), [](const std::weak_ptr<OutputGate>& gate) { return !gate.expired(); }) == 1, "only the current session's gate is kept");
+}
+
+// Finish drains what the main thread has left the same way: an opening that came with input still queued before it, as
+// one posted right before finish, runs after that input, and input queued after the last command is left. The order is
+// decided by the queue, not by how fast the main thread takes it, so this holds the input in place instead of racing it.
+void FinishRunsTheInputQueuedBeforeAnOpening()
+{
+	Pinball pinball;
+	pinball.ReceiveData('S', 1, 0);
+	pinball.ReceiveData('S', 2, 0);
+	PinballTestAccess::Post(pinball);
+	pinball.ReceiveData('S', 1, 1);
+	PinballTestAccess::Stop(pinball);
+	CHECK(PinballTestAccess::Take(pinball, 4, true) == "IIC-", "the input before the opening first, the input after it left");
 }
 
 // A command runs after the input queued before it and before the input queued after it: a closing followed by an on
@@ -860,12 +1376,24 @@ int main()
 	FinalBlackoutConfirmsTheClosing();
 	LostDeviceStillGetsItsBlackout();
 	FinishTakesNoOpening();
+	ConnectTestCountsAsUse();
+	ConnectThatFailsAfterItsTestEndsDark();
+	SessionThatStartsClosedStartsDark();
+	SessionThatStartsClosedTestsOnNoReconnect();
+	LatchBeforeTheConnectTestSkipsIt();
+	BlackoutConfirmsWhereItIsSent();
 	PermanentFailureOutranksAnAck();
 	CleanFinishKeepsTheSettledResult();
 	ScheduleAppliesToTheOutputsItLists();
 	CommandsAndInputKeepTheirOrder();
+	FinishRunsTheInputQueuedBeforeAnOpening();
 	GateChangeIsPublishedWhateverAnOutputThrows();
 	LookupsOutsideTheRootAreRefused();
+	PathThroughALinkIsCheckedAsItIsOpened();
+	RootSpellingsAreOneFolder();
+	TableFolderNamesComeFromTheFilename();
+	UnreadableControllerIsSkipped();
+	EndedSessionsAreFreed();
 	if (failures)
 	{
 		std::fprintf(stderr, "%d check(s) failed\n", failures);

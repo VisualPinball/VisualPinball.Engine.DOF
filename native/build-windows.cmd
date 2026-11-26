@@ -24,14 +24,14 @@ if "%VPE_DOF_GENERATOR%"=="" (
 	cmake -S "%~dp0." -B "%BUILD%" -G "%VPE_DOF_GENERATOR%" -A x64 -DVPE_DOF_OUTPUT_DIR="%OUT%" || exit /b 1
 )
 cmake --build "%BUILD%" --config %CONFIG% --parallel || exit /b 1
-"%BUILD%\%CONFIG%\vpe_dof_smoke.exe" "%~dp0tests\fixtures\artnet" "%~dp0tests\fixtures\artnet\tables\smoke.vpx" vpetest > "%BUILD%\smoke.log" 2>&1
-if not "%errorlevel%"=="0" (
+rem "||" reads the exit code itself: a crash exits below 0, which "if errorlevel 1" misses, and an ERRORLEVEL variable
+rem inherited from the environment would hide it from %errorlevel%.
+"%BUILD%\%CONFIG%\vpe_dof_smoke.exe" "%~dp0tests\fixtures\artnet" "%~dp0tests\fixtures\artnet\tables\smoke.vpx" vpetest > "%BUILD%\smoke.log" 2>&1 || (
 	type "%BUILD%\smoke.log"
 	echo The native smoke test failed.
 	exit /b 1
 )
-"%BUILD%\%CONFIG%\vpe_dof_internal.exe" > "%BUILD%\internal.log" 2>&1
-if not "%errorlevel%"=="0" (
+"%BUILD%\%CONFIG%\vpe_dof_internal.exe" > "%BUILD%\internal.log" 2>&1 || (
 	type "%BUILD%\internal.log"
 	echo The native internal tests failed.
 	exit /b 1
