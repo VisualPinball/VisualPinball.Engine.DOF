@@ -19,9 +19,11 @@ namespace VisualPinball.Engine.DOF.Configuration
 	/// </summary>
 	/// <remarks>
 	/// Settings of an imported global config that are not file patterns are kept. The cabinet file and the shapes file
-	/// are the imported ones the original patterns name; table XML configs are looked up only in the revision's
-	/// <c>tables</c> folder as <c>{TableName}.xml</c>, which is how the session binds one (see
-	/// <see cref="DofRevision.TableFileFor"/>). Logging goes to the host: no log file is configured.
+	/// are the imported ones the original patterns name. No table XML config is loaded: the list of table config
+	/// patterns is empty, and a game session passes libdof no table file, which also covers revisions imported with a
+	/// pattern. libdof reads a table config's effects but not the effects it assigns to the table elements,
+	/// so loading one would leave the table's effects without a trigger and, without <c>AddLedControlConfig</c>, drop
+	/// the ini rows as well. Logging goes to the host: no log file is configured.
 	/// </remarks>
 	public static class DofGlobalConfig
 	{
@@ -87,7 +89,7 @@ namespace VisualPinball.Engine.DOF.Configuration
 			root.AddFirst(
 				new XElement("IniFilesPath", configDir),
 				new XElement("CabinetConfigFilePattern", cabinetFile == null ? string.Empty : Path.Combine(configDir, cabinetFile)),
-				new XElement("TableConfigFilePatterns", new XElement("FilePattern", Path.Combine(tablesDir, "{TableName}.xml"))),
+				new XElement("TableConfigFilePatterns"),
 				new XElement("ShapeDefinitionFilePattern", shapesFile == null ? string.Empty : Path.Combine(configDir, shapesFile)),
 				new XElement("LogFilePattern", string.Empty),
 				new XElement("ClearLogOnSessionStart", "false"));

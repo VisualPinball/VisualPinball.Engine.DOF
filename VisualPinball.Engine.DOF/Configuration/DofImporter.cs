@@ -818,7 +818,7 @@ namespace VisualPinball.Engine.DOF.Configuration
 						break;
 					}
 					case "TableConfigFilePatterns":
-						report.Info(DofReportTopic.Relocation, $"Table config pattern \"{pattern}\": table configs are the imported table XML files, chosen per game.");
+						report.Info(DofReportTopic.Relocation, $"Table config pattern \"{pattern}\": the player loads no table configs; the ini rows drive the outputs.");
 						break;
 					case "LogFilePattern":
 						report.Info(DofReportTopic.Relocation, "The log goes to the player's log instead of a file.");
@@ -849,10 +849,7 @@ namespace VisualPinball.Engine.DOF.Configuration
 				AnalyseCabinet(config.Cabinet, windowsPorts, report);
 			}
 			foreach (var table in config.TableConfigs.Values) {
-				var xml = table.Xml ?? DofXml.Load(table.Path);
-				if (xml.Descendants("AssignedEffects").Any(e => e.HasElements)) {
-					report.Warning(DofReportTopic.Unsupported, $"Table config {table.Name} assigns effects to table elements; libdof uses only its effects and LedControl settings, not the assignments.");
-				}
+				report.Warning(DofReportTopic.Unsupported, $"Table config {table.Name} is kept but not loaded: libdof does not read the effects it assigns to table elements, so the ini rows drive the outputs instead.");
 			}
 		}
 

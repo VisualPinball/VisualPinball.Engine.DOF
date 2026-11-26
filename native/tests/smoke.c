@@ -10,7 +10,23 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <time.h>
+#endif
+
 #include "vpe_dof.h"
+
+static void SleepMs(int ms)
+{
+#ifdef _WIN32
+	Sleep((DWORD)ms);
+#else
+	struct timespec delay = { ms / 1000, (long)(ms % 1000) * 1000000L };
+	nanosleep(&delay, NULL);
+#endif
+}
 
 static int failures = 0;
 
@@ -48,8 +64,10 @@ static void RunSession(const char* basePath, const char* table, const char* rom)
 
 	int64_t closed = vpe_dof_set_output_gate(dof, 0);
 	CHECK(closed > 0, "gate closes before init");
-	int32_t confirmed, pending, failed;
-	CHECK(vpe_dof_gate_state(dof, closed, &confirmed, &pending, &failed) == 1, "gate applied before init");
+	int32_t confirmed, pending, failed, untouched;
+	CHECK(vpe_dof_gate_state(dof, closed, &confirmed, &pending, &failed, &untouched) == 1, "gate applied before init");
+	CHECK(confirmed == 0 && pending == 0 && failed == 0 && untouched == 0, "no units before init");
+	CHECK(vpe_dof_gate_state(dof, closed, NULL, NULL, NULL, NULL) == 1, "the counts are optional");
 	CHECK(vpe_dof_set_connect_tests(NULL, 0) == VPE_DOF_INVALID_ARGUMENT, "connect tests need an instance");
 	CHECK(vpe_dof_set_connect_tests(dof, 0) == VPE_DOF_OK, "connect tests turned off before init");
 
@@ -68,7 +86,19 @@ static void RunSession(const char* basePath, const char* table, const char* rom)
 
 	int64_t latched = vpe_dof_latch_output_gate(dof);
 	CHECK(latched > open, "gate latches closed");
-	CHECK(vpe_dof_set_output_gate(dof, 1) > latched, "an opening after the latch still gets a generation");
+	int64_t after = vpe_dof_set_output_gate(dof, 1);
+	CHECK(after > latched, "an opening after the latch still gets a generation");
+	// The opening after the latch applies as a closing: every unit writes it, none is left alone.
+	int32_t gateStatus = 0;
+	for (int i = 0; i < 400; i++)
+	{
+		gateStatus = vpe_dof_gate_state(dof, after, &confirmed, &pending, &failed, &untouched);
+		if (gateStatus == 1 && pending == 0)
+			break;
+		SleepMs(5);
+	}
+	CHECK(gateStatus == 1 && pending == 0, "the opening after the latch settles");
+	CHECK(untouched == 0, "a closing leaves no unit untouched");
 
 	result = vpe_dof_finish(dof, error, (int32_t)sizeof(error));
 	CHECK(result == VPE_DOF_OK, error[0] ? error : "finish");

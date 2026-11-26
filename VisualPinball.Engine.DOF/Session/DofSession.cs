@@ -31,8 +31,6 @@ namespace VisualPinball.Engine.DOF.Session
 	{
 		/// <summary>The revision folder (<see cref="Configuration.DofRevision.BasePath"/>).</summary>
 		public string BasePath { get; set; }
-		/// <summary>See <see cref="Configuration.DofRevision.TableFileFor"/>; null when no table XML config is bound.</summary>
-		public string TableFile { get; set; }
 		public string RomName { get; set; }
 		/// <summary>The game session this DOF session belongs to; events published for another one are rejected.</summary>
 		public int GameSession { get; set; }
@@ -195,7 +193,7 @@ namespace VisualPinball.Engine.DOF.Session
 	/// The gate is closed before DOF initialises: the session starts dark, and opens once the snapshot is in and DOF
 	/// has processed it. It closes on pause, on a fault and before finishing. A stop, an emergency stop and a fault
 	/// latch it closed, in DOF too (<see cref="DofInstance.LatchOutputGate"/>), so an opening DOF has not applied yet
-	/// applies as a closing and none follows. <see cref="StopAsync"/> and <see cref="Completion"/> complete only when DOF has finished
+	/// never goes out and none follows. <see cref="StopAsync"/> and <see cref="Completion"/> complete only when DOF has finished
 	/// and been freed, however long that takes; until then no other session can start in the process, and the
 	/// session's owner keeps what DOF uses (device leases, the configuration). <see cref="StopOverdue"/> tells when
 	/// that takes longer than it should.
@@ -611,7 +609,10 @@ namespace VisualPinball.Engine.DOF.Session
 				return false;
 			}
 			try {
-				native.Init(_options.TableFile, _options.RomName);
+				// No table file: libdof then looks up no table XML config, whatever the revision's global config names.
+				// It reads a table config's effects but not the effects it assigns to the table elements, so a loaded one
+				// leaves the table's effects without a trigger and can drop the ini rows (AddLedControlConfig).
+				native.Init(null, _options.RomName);
 			} catch (Exception e) {
 				Fail($"DOF could not start: {e.Message}");
 				return false;

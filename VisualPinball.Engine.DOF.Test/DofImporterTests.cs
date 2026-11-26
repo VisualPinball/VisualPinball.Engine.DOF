@@ -140,7 +140,7 @@ namespace VisualPinball.Engine.DOF.Test
 			var global = XDocument.Load(revision.GlobalConfigFile).Root;
 			Assert.That(global.Element("IniFilesPath").Value, Is.EqualTo(revision.ConfigDir));
 			Assert.That(global.Element("CabinetConfigFilePattern").Value, Is.EqualTo(Path.Combine(revision.ConfigDir, "cabinet.xml")));
-			Assert.That(global.Element("TableConfigFilePatterns").Element("FilePattern").Value, Is.EqualTo(Path.Combine(revision.TablesDir, "{TableName}.xml")));
+			Assert.That(global.Element("TableConfigFilePatterns").Elements(), Is.Empty, "no table config is loaded");
 			Assert.That(global.Element("LogFilePattern").Value, Is.Empty);
 			Assert.That(global.Element("ClearLogOnSessionStart").Value, Is.EqualTo("false"));
 			Assert.That(global.Element("LedWizDefaultMinCommandIntervalMs").Value, Is.EqualTo("1"), "other settings are kept");
@@ -426,16 +426,10 @@ namespace VisualPinball.Engine.DOF.Test
 		}
 
 		[Test]
-		public void TableFileSelectsTheBoundTableConfig()
+		public void TableConfigsAreKeptAsAnInventory()
 		{
-			Accepted(_importer.Import(Folder("tables", ("directoutputconfig.ini", MainIni), ("afm.xml", TableXml))));
-			var revision = _store.Active;
-			Assert.That(revision.TableConfigs, Is.EqualTo(new[] { "afm" }));
-			Assert.That(Path.GetFileName(revision.TableFileFor("afm", "Attack From Mars")), Is.EqualTo("afm.vpx"));
-			// Unbound: no table file at all, so libdof looks up no table config, whatever the platform's name comparison.
-			Assert.That(revision.TableFileFor(null, "afm"), Is.Null);
-			Assert.That(revision.TableFileFor(null, "AFM"), Is.Null);
-			Assert.Throws<ArgumentException>(() => revision.TableFileFor("missing", "x"));
+			Accepted(_importer.Import(Folder("tables", ("directoutputconfig.ini", MainIni), ("table.xml", TableXml))));
+			Assert.That(_store.Active.TableConfigs, Is.EqualTo(new[] { "table" }));
 		}
 
 		[Test]
@@ -621,7 +615,6 @@ namespace VisualPinball.Engine.DOF.Test
 			foreach (var element in new[] { "IniFilesPath", "CabinetConfigFilePattern" }) {
 				Assert.That(DofPaths.IsAscii(global.Element(element).Value), Is.True, global.Element(element).Value);
 			}
-			Assert.That(DofPaths.IsAscii(global.Element("TableConfigFilePatterns").Element("FilePattern").Value), Is.True);
 		}
 	}
 }

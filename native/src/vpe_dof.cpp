@@ -558,7 +558,7 @@ VPE_DOF_API int64_t VPE_DOF_CALL vpe_dof_latch_output_gate(vpe_dof* dof)
 	}
 }
 
-VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_gate_state(vpe_dof* dof, int64_t generation, int32_t* confirmed, int32_t* pending, int32_t* failed)
+VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_gate_state(vpe_dof* dof, int64_t generation, int32_t* confirmed, int32_t* pending, int32_t* failed, int32_t* untouched)
 {
 	if (confirmed)
 		*confirmed = 0;
@@ -566,19 +566,23 @@ VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_gate_state(vpe_dof* dof, int64_t genera
 		*pending = 0;
 	if (failed)
 		*failed = 0;
+	if (untouched)
+		*untouched = 0;
 	if (!dof || generation < 0)
 		return 0;
 	try
 	{
 		DOF::OutputGate& gate = DOF::OutputGate::Instance();
-		int c = 0, p = 0, f = 0;
-		DOF::OutputGate::Status status = gate.GetState(generation, c, p, f);
+		DOF::OutputGate::Counts counts;
+		DOF::OutputGate::Status status = gate.GetState(generation, counts);
 		if (confirmed)
-			*confirmed = c;
+			*confirmed = counts.confirmed;
 		if (pending)
-			*pending = p;
+			*pending = counts.pending;
 		if (failed)
-			*failed = f;
+			*failed = counts.failed;
+		if (untouched)
+			*untouched = counts.untouched;
 		switch (status)
 		{
 		case DOF::OutputGate::Status::Applied: return 1;

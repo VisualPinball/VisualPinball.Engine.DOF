@@ -19,6 +19,8 @@ namespace VisualPinball.Engine.DOF.Test
 
 		/// <summary>Thrown by <see cref="Init"/> when set.</summary>
 		public string InitError;
+		/// <summary>The table file of each <see cref="Init"/>.</summary>
+		public readonly List<string> InitTableFiles = new List<string>();
 		/// <summary>How long <see cref="Finish"/> takes.</summary>
 		public TimeSpan FinishDelay = TimeSpan.Zero;
 		/// <summary>Reported as <see cref="PendingInput"/>.</summary>
@@ -74,6 +76,9 @@ namespace VisualPinball.Engine.DOF.Test
 
 		public void Init(string tableFile, string romName)
 		{
+			lock (_lock) {
+				InitTableFiles.Add(tableFile);
+			}
 			Record("init");
 			if (InitError != null) {
 				throw new DofException(DofStatus.Error, InitError);

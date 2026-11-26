@@ -65,7 +65,7 @@ The engines run in different processes with their own timers, so a sample in the
 
 ## Differences found
 
-Against libdof d92f8fc (0.5.4). Each one was fixed in the patch unless noted.
+Against libdof d92f8fc (0.5.4). Each one is fixed in libdof since 5e90261 unless noted.
 
 | Difference | Effect | Scenario |
 | --- | --- | --- |

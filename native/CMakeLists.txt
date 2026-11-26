@@ -28,7 +28,7 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
 set(TP "${CMAKE_CURRENT_SOURCE_DIR}/../third-party")
 set(GEN "${CMAKE_BINARY_DIR}/generated")
-option(VPE_DOF_BUILD_TESTS "Build the native smoke test" ON)
+option(VPE_DOF_BUILD_TESTS "Build the native smoke and internal tests" ON)
 set(VPE_DOF_OUTPUT_DIR "" CACHE PATH "Folder the library is copied to after the build (the Unity package's Plugins/<rid>)")
 
 if(MSVC)
@@ -212,23 +212,28 @@ target_link_libraries(vpe_ftdi PUBLIC vpe_libusb)
 # ---------------------------------------------------------------------------------------------------------------------
 # VpeDof
 
-add_library(VpeDof SHARED
-	${LIBDOF_SOURCES}
-	src/vpe_dof.cpp
-	src/vpe_dof_devices.cpp)
-target_include_directories(VpeDof PRIVATE
-	"${CMAKE_CURRENT_SOURCE_DIR}/include"
+# libdof is compiled once, as objects that both the library and the internal tests link.
+add_library(vpe_libdof OBJECT ${LIBDOF_SOURCES})
+target_include_directories(vpe_libdof PUBLIC
 	"${LIBDOF}/include"
 	"${LIBDOF}/src"
 	"${LIBDOF}/third-party/include"
 	"${GEN}/include")
-target_compile_definitions(VpeDof PRIVATE VPE_DOF_BUILD)
+target_compile_definitions(vpe_libdof PUBLIC VPE_DOF_BUILD LIBDOF_STATIC)
 if(WIN32)
-	target_compile_definitions(VpeDof PRIVATE NOMINMAX)
+	target_compile_definitions(vpe_libdof PUBLIC NOMINMAX)
 endif()
-target_link_libraries(VpeDof PRIVATE vpe_hidapi vpe_libusb vpe_serialport vpe_ftdi)
+target_link_libraries(vpe_libdof PUBLIC vpe_hidapi vpe_libusb vpe_serialport vpe_ftdi)
 if(WIN32)
-	target_link_libraries(VpeDof PRIVATE ws2_32 setupapi cfgmgr32 hid)
+	target_link_libraries(vpe_libdof PUBLIC ws2_32 setupapi cfgmgr32 hid)
+endif()
+
+add_library(VpeDof SHARED
+	src/vpe_dof.cpp
+	src/vpe_dof_devices.cpp)
+target_include_directories(VpeDof PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(VpeDof PRIVATE vpe_libdof)
+if(WIN32)
 	set_target_properties(VpeDof PROPERTIES PREFIX "" OUTPUT_NAME "VpeDof")
 elseif(APPLE)
 	set_target_properties(VpeDof PROPERTIES OUTPUT_NAME "VpeDof" INSTALL_NAME_DIR "@rpath" BUILD_WITH_INSTALL_NAME_DIR ON
@@ -246,7 +251,7 @@ endif()
 
 if(MSVC)
 	# libserialport defines these itself.
-	foreach(_target vpe_libusb vpe_hidapi vpe_ftdi VpeDof)
+	foreach(_target vpe_libusb vpe_hidapi vpe_ftdi vpe_libdof VpeDof)
 		target_compile_definitions(${_target} PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE)
 	endforeach()
 endif()
@@ -275,4 +280,11 @@ if(VPE_DOF_BUILD_TESTS)
 	add_executable(vpe_dof_smoke tests/smoke.c)
 	target_include_directories(vpe_dof_smoke PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 	target_link_libraries(vpe_dof_smoke PRIVATE VpeDof)
+
+	# libdof's internals, without the C ABI: what no configuration can reach, such as a toy that fails.
+	add_executable(vpe_dof_internal tests/internal.cpp)
+	target_link_libraries(vpe_dof_internal PRIVATE vpe_libdof)
+	if(NOT WIN32 AND NOT APPLE)
+		target_link_options(vpe_dof_internal PRIVATE -static-libstdc++ -static-libgcc)
+	endif()
 endif()

@@ -43,7 +43,10 @@ namespace VisualPinball.Engine.DOF.Configuration
 			BasePath = basePath;
 		}
 
-		/// <summary>The table XML configs of the revision, by name (without extension).</summary>
+		/// <summary>
+		/// The table XML configs the import kept, by name (without extension). An inventory only: a game session loads
+		/// none of them (see <see cref="DofGlobalConfig"/>).
+		/// </summary>
 		public string[] TableConfigs
 		{
 			get {
@@ -58,28 +61,6 @@ namespace VisualPinball.Engine.DOF.Configuration
 				Array.Sort(names, StringComparer.OrdinalIgnoreCase);
 				return names;
 			}
-		}
-
-		/// <summary>
-		/// The table file name to pass to <see cref="DofInstance.Init"/>. The file does not exist; its base name is what
-		/// libdof substitutes for <c>{TableName}</c>, so it selects the table XML config.
-		/// </summary>
-		/// <param name="tableConfig">The bound table XML config (a name from <see cref="TableConfigs"/>), or null for none.</param>
-		/// <param name="tableName">The table's name. Not used for the lookup: an unbound game loads no table XML config.</param>
-		/// <returns>
-		/// The table file, or null without a binding: libdof then looks up no table XML config at all, whatever the
-		/// table is called and however the platform compares file names.
-		/// </returns>
-		/// <exception cref="ArgumentException">The bound table XML config is not part of the revision.</exception>
-		public string TableFileFor(string tableConfig, string tableName)
-		{
-			if (tableConfig == null) {
-				return null;
-			}
-			if (!File.Exists(Path.Combine(TablesDir, tableConfig + ".xml"))) {
-				throw new ArgumentException($"The DOF configuration has no table config named \"{tableConfig}\".", nameof(tableConfig));
-			}
-			return Path.Combine(TablesDir, tableConfig + ".vpx");
 		}
 
 		/// <summary>

@@ -15,7 +15,7 @@ namespace VisualPinball.Engine.DOF.Native
 	internal static class DofNative
 	{
 		public const string Library = "VpeDof";
-		public const int AbiVersion = 3;
+		public const int AbiVersion = 4;
 
 		[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
 		public delegate void LogCallback(int level, IntPtr message, IntPtr user);
@@ -63,7 +63,7 @@ namespace VisualPinball.Engine.DOF.Native
 		public static extern long LatchOutputGate(IntPtr dof);
 
 		[DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "vpe_dof_gate_state")]
-		public static extern int GateState(IntPtr dof, long generation, out int confirmed, out int pending, out int failed);
+		public static extern int GateState(IntPtr dof, long generation, out int confirmed, out int pending, out int failed, out int untouched);
 
 		[DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "vpe_dof_gate_pending")]
 		public static extern int GatePending(IntPtr dof, long generation, StringCallback callback, IntPtr user);

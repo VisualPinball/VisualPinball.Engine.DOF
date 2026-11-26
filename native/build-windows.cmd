@@ -30,4 +30,10 @@ if errorlevel 1 (
 	echo The native smoke test failed.
 	exit /b 1
 )
+"%BUILD%\%CONFIG%\vpe_dof_internal.exe" > "%BUILD%\internal.log" 2>&1
+if errorlevel 1 (
+	type "%BUILD%\internal.log"
+	echo The native internal tests failed.
+	exit /b 1
+)
 echo VpeDof %CONFIG% built and copied to %OUT%
