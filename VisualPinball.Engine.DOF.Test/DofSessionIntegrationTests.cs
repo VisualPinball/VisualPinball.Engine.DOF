@@ -88,7 +88,6 @@ namespace VisualPinball.Engine.DOF.Test
 
 		private static DofSession Session(DofRevision revision, bool waitForSnapshot = true) => new DofSession(new DofSessionOptions {
 			BasePath = revision.BasePath,
-			TableFile = revision.TableFileFor(null, "Test Table"),
 			RomName = "vpetest_l1",
 			GameSession = Game,
 			WaitForSnapshot = waitForSnapshot,
@@ -113,6 +112,55 @@ namespace VisualPinball.Engine.DOF.Test
 			var mark = _capture.Count(universe);
 			Expect(universe, f => f[1] == 0, "the knocker goes off, however it is spelled", mark);
 			Assert.That(_capture.Frames(universe).All(f => f[0] == 0), Is.True, "\"S1\" as a name never drives solenoid 1");
+			Wait(session.StopAsync());
+		}
+
+		[Test]
+		public void TableConfigsDoNotSilenceTheIniRows()
+		{
+			// libdof reads no effect assignments from a table config: loaded, one without AddLedControlConfig would leave
+			// the game without effects. A session passes no table file, so none is looked up, also in a revision whose
+			// global config still names a table config pattern, as earlier imports wrote it, and after a rollback to one.
+			const int universe = 304;
+			var source = Path.Combine(_dir, "source");
+			Directory.CreateDirectory(source);
+			foreach (var name in new[] { "bound", "vpetest_l1" }) {
+				File.WriteAllText(Path.Combine(source, name + ".xml"),
+					$"<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<Table><TableName>{name}</TableName><AddLedControlConfig>false</AddLedControlConfig></Table>\r\n");
+			}
+			string earlier;
+			using (var lease = Import(universe, "vpetest,S1")) {
+				var revision = lease.Revision;
+				earlier = revision.Id;
+				Assert.That(revision.TableConfigs, Is.EqualTo(new[] { "bound", "vpetest_l1" }));
+				var global = System.Xml.Linq.XDocument.Load(revision.GlobalConfigFile);
+				var patterns = global.Root.Element("TableConfigFilePatterns");
+				Assert.That(patterns.Elements(), Is.Empty, "a new import names no pattern");
+				DrivesTheIniRow(revision, universe, "a new import");
+
+				patterns.Add(new System.Xml.Linq.XElement("FilePattern", Path.Combine(revision.TablesDir, "{TableName}.xml")));
+				global.Save(revision.GlobalConfigFile);
+				DrivesTheIniRow(revision, universe, "a revision with a pattern");
+			}
+
+			using (Import(universe, "vpetest,S2")) {
+			}
+			var store = new DofConfigStore(Path.Combine(_dir, "store"));
+			Assert.That(store.Rollback(), Is.True);
+			using (var lease = store.Acquire()) {
+				Assert.That(lease.Revision.Id, Is.EqualTo(earlier));
+				DrivesTheIniRow(lease.Revision, universe, "the revision a rollback restored");
+			}
+		}
+
+		private void DrivesTheIniRow(DofRevision revision, int universe, string what)
+		{
+			var session = Session(revision, false);
+			var started = Wait(session.StartAsync());
+			Assert.That(started.Started, Is.True, started.Error);
+			var mark = _capture.Count(universe);
+			session.Publish(Game, DofElementKind.Solenoid, 1, 255);
+			Expect(universe, f => f[0] == 255, $"the ini row drives the port ({what})", mark);
 			Wait(session.StopAsync());
 		}
 

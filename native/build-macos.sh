@@ -41,6 +41,11 @@ for arch in "${ARCHES[@]}"; do
 		echo "The native smoke test failed ($arch)."
 		exit 1
 	fi
+	if ! arch "-$arch" "$BUILD/vpe_dof_internal" > "$BUILD/internal-$arch.log" 2>&1; then
+		cat "$BUILD/internal-$arch.log"
+		echo "The native internal tests failed ($arch)."
+		exit 1
+	fi
 	echo "Smoke test passed ($arch)"
 done
 echo "VpeDof $CONFIG built and copied to $OUT"

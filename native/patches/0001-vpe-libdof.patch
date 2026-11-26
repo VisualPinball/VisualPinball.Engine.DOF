@@ -1,47 +1,8 @@
-diff --git a/include/DOF/Config.h b/include/DOF/Config.h
-index d07f8b9..80ac11e 100644
---- a/include/DOF/Config.h
-+++ b/include/DOF/Config.h
-@@ -1,6 +1,14 @@
- #pragma once
- 
-+#if defined(VPE_DOF_BUILD)
-+// Linked into VpeDof, which exports its own C ABI only.
-+#define LIBDOFAPI
- #ifdef _MSC_VER
-+#define LIBDOFCALLBACK __stdcall
-+#else
-+#define LIBDOFCALLBACK
-+#endif
-+#elif defined(_MSC_VER)
- #define LIBDOFAPI __declspec(dllexport)
- #define LIBDOFCALLBACK __stdcall
- #else
-diff --git a/include/DOF/DOF.h b/include/DOF/DOF.h
-index 329ee41..fdfbe4a 100644
---- a/include/DOF/DOF.h
-+++ b/include/DOF/DOF.h
-@@ -10,7 +10,15 @@
- #define LIBDOF_VERSION LIBDOF_STR(LIBDOF_VERSION_MAJOR) "." LIBDOF_STR(LIBDOF_VERSION_MINOR) "." LIBDOF_STR(LIBDOF_VERSION_PATCH)
- #define LIBDOF_MINOR_VERSION LIBDOF_STR(LIBDOF_VERSION_MAJOR) "." LIBDOF_STR(LIBDOF_VERSION_MINOR)
- 
-+#if defined(VPE_DOF_BUILD)
-+// Linked into VpeDof, which exports its own C ABI only.
-+#define LIBDOFAPI
- #ifdef _MSC_VER
-+#define LIBDOFCALLBACK __stdcall
-+#else
-+#define LIBDOFCALLBACK
-+#endif
-+#elif defined(_MSC_VER)
- #define LIBDOFAPI __declspec(dllexport)
- #define LIBDOFCALLBACK __stdcall
- #else
 diff --git a/src/Pinball.cpp b/src/Pinball.cpp
-index 0711626..dea04b1 100644
+index fca1659..8e9771b 100644
 --- a/src/Pinball.cpp
 +++ b/src/Pinball.cpp
-@@ -11,7 +11,12 @@
+@@ -11,6 +11,9 @@
  #include "cab/ICabinetOwner.h"
  #include "cab/CabinetOwner.h"
  #include "cab/out/OutputControllerList.h"
@@ -49,24 +10,9 @@ index 0711626..dea04b1 100644
 +#include "cab/out/OutputGate.h"
 +#include "cab/out/OutputList.h"
  #include "cab/overrides/TableOverrideSettings.h"
-+#include "cab/schedules/ScheduledSettings.h"
-+#include "cab/sequencer/SequentialOutputSettings.h"
- #include "cab/toys/ToyList.h"
- #include "globalconfiguration/GlobalConfig.h"
- #include "pinballsupport/AlarmHandler.h"
-@@ -52,6 +57,11 @@ void Pinball::Setup(const std::string& globalConfigFileName, const std::string&
- {
-    bool globalConfigLoaded = true;
- 
-+   // These settings are process-wide and only loaded when a cabinet config has them: forget the previous session's.
-+   ScheduledSettings::GetInstance().Clear();
-+   SequentialOutputSettings::GetInstance().Clear();
-+   TableOverrideSettings::GetInstance()->ClearSettings();
-+
-    try
-    {
-       Log::Write(StringExtensions::Build("Global config filename is \"{0}\"", globalConfigFileName));
-@@ -59,12 +69,11 @@ void Pinball::Setup(const std::string& globalConfigFileName, const std::string&
+ #include "cab/schedules/ScheduledSettings.h"
+ #include "cab/sequencer/SequentialOutputSettings.h"
+@@ -66,12 +69,11 @@ void Pinball::Setup(const std::string& globalConfigFileName, const std::string&
        {
           FileInfo* globalConfigFile = new FileInfo(globalConfigFileName);
           GlobalConfig* newGlobalConfig = GlobalConfig::GetGlobalConfigFromConfigXmlFile(globalConfigFile->FullName());
@@ -82,16 +28,7 @@ index 0711626..dea04b1 100644
           }
           delete m_globalConfig;
           m_globalConfig = newGlobalConfig;
-@@ -80,7 +89,7 @@ void Pinball::Setup(const std::string& globalConfigFileName, const std::string&
-    }
-    catch (const std::exception& e)
-    {
--      throw std::runtime_error("DirectOutput framework could not initialize global config.");
-+      throw std::runtime_error(std::string("DirectOutput framework could not initialize global config: ") + e.what());
-    }
- 
-    try
-@@ -88,19 +97,8 @@ void Pinball::Setup(const std::string& globalConfigFileName, const std::string&
+@@ -95,19 +97,8 @@ void Pinball::Setup(const std::string& globalConfigFileName, const std::string&
        Log::SetFilename(m_globalConfig->GetLogFilename(!StringExtensions::IsNullOrWhiteSpace(tableFilename) ? FileInfo(tableFilename).FullName() : "", romName));
        Log::SetInstrumentations(m_globalConfig->GetInstrumentation());
  
@@ -113,16 +50,7 @@ index 0711626..dea04b1 100644
  
        Log::Init(m_globalConfig->IsEnableLogging());
     }
-@@ -144,6 +142,8 @@ void Pinball::Setup(const std::string& globalConfigFileName, const std::string&
-             try
-             {
-                m_cabinet = Cabinet::GetCabinetFromConfigXmlFile(cabinetConfigFile);
-+               if (!m_cabinet)
-+                  throw std::runtime_error("the file is not a valid cabinet config");
- 
-                Log::Write(StringExtensions::Build("{0} output controller definitions and {1} toy definitions loaded from cabinet config.",
-                   std::to_string(static_cast<int>(m_cabinet->GetOutputControllers()->size())), std::to_string(static_cast<int>(m_cabinet->GetToys()->size()))));
-@@ -166,15 +166,30 @@ void Pinball::Setup(const std::string& globalConfigFileName, const std::string&
+@@ -175,15 +166,30 @@ void Pinball::Setup(const std::string& globalConfigFileName, const std::string&
              }
              catch (const std::exception& e)
              {
@@ -153,18 +81,20 @@ index 0711626..dea04b1 100644
        if (m_cabinet == nullptr)
        {
           Log::Write("No cabinet config file loaded. Will use AutoConfig.");
-@@ -200,7 +215,9 @@ void Pinball::Setup(const std::string& globalConfigFileName, const std::string&
+@@ -209,9 +215,10 @@ void Pinball::Setup(const std::string& globalConfigFileName, const std::string&
              Log::Write(StringExtensions::Build("Will load table config from {0}", tableConfigFile->FullName()));
              try
              {
 -               Table* newTable = Table::GetTableFromConfigXmlFile(tableFile->FullName());
++               // VPE: the table config, not the table file it was found for.
 +               Table* newTable = Table::GetTableFromConfigXmlFile(tableConfigFile->FullName());
-+               if (!newTable)
-+                  throw std::runtime_error("the file is not a valid table config");
+                if (!newTable)
+-                  throw std::runtime_error(StringExtensions::Build("{0} is not a valid table config", tableFile->FullName()));
++                  throw std::runtime_error(StringExtensions::Build("{0} is not a valid table config", tableConfigFile->FullName()));
                 delete m_table;
                 m_table = newTable;
                 m_table->SetTableConfigurationFilename(tableConfigFile->FullName());
-@@ -258,32 +275,6 @@ void Pinball::Setup(const std::string& globalConfigFileName, const std::string&
+@@ -269,32 +276,6 @@ void Pinball::Setup(const std::string& globalConfigFileName, const std::string&
                 c->SetEffectRGBMinDurationMs(m_globalConfig->GetLedControlMinimumRGBEffectDurationMs());
                 c->Setup(l, m_table, m_cabinet, romName);
                 delete c;
@@ -197,124 +127,43 @@ index 0711626..dea04b1 100644
              }
              delete l;
           }
-@@ -314,7 +305,7 @@ void Pinball::Setup(const std::string& globalConfigFileName, const std::string&
-    catch (const std::exception& e)
-    {
-       Log::Exception(StringExtensions::Build("DirectOutput framework has encountered an exception during setup: {0}", e.what()));
--      throw std::runtime_error("DirectOutput framework has encountered a exception during setup.");
-+      throw std::runtime_error(std::string("DirectOutput framework has encountered a exception during setup: ") + e.what());
-    }
- }
- 
-@@ -329,10 +320,22 @@ void Pinball::Init()
-       co->GetConfigurationSettings().emplace("LedControlMinimumEffectDurationMs", std::to_string(m_globalConfig->GetLedControlMinimumEffectDurationMs()));
-       co->GetConfigurationSettings().emplace("LedWizDefaultMinCommandIntervalMs", std::to_string(m_globalConfig->GetLedWizDefaultMinCommandIntervalMs()));
-       co->GetConfigurationSettings().emplace("PacLedDefaultMinCommandIntervalMs", std::to_string(m_globalConfig->GetPacLedDefaultMinCommandIntervalMs()));
--      m_cabinet->Init(co);
-+      // VPE: Finish unwinds what was started, also when an Init below fails half-way.
-+      m_cabinetStarted = true;
-+      try
-+      {
-+         m_cabinet->Init(co);
-+      }
-+      catch (...)
-+      {
-+         delete co;
-+         throw;
-+      }
-       delete co;
- 
-+      m_tableStarted = true;
-       m_table->Init(this);
-+      m_alarmsStarted = true;
-       m_alarms->Init(this);
-       m_table->TriggerStaticEffects();
-       m_cabinet->Update();
-@@ -344,29 +347,46 @@ void Pinball::Init()
-    catch (const std::exception& e)
-    {
-       Log::Exception(StringExtensions::Build("DirectOutput framework has encountered an exception during initialization: {0}", e.what()));
--      throw std::runtime_error("DirectOutput framework has encountered a exception during initialization.");
-+      throw std::runtime_error(std::string("DirectOutput framework has encountered a exception during initialization: ") + e.what());
-    }
- }
- 
- void Pinball::Finish()
- {
--   try
--   {
--      Log::Write("Finishing framework");
--      FinishMainThread();
--
--      m_alarms->Finish();
--      m_table->Finish();
--      m_cabinet->Finish();
--
--      Log::Write("DirectOutput framework finished.");
--      Log::Write("Bye and thanks for using!");
--   }
--   catch (const std::exception& e)
--   {
--      Log::Exception(StringExtensions::Build("An exception occured while finishing the DirectOutput framework: {0}", e.what()));
--      throw std::runtime_error("DirectOutput framework has encountered while finishing.");
--   }
-+   // Every step runs even if an earlier one failed, so the output controllers always get to turn their outputs off.
-+   Log::Write("Finishing framework");
-+   std::string firstError;
-+   auto step = [&firstError](const char* name, const std::function<void()>& action) {
-+      try
-+      {
-+         action();
-+      }
-+      catch (const std::exception& e)
-+      {
-+         Log::Exception(StringExtensions::Build("An exception occured while finishing the {0}: {1}", name, e.what()));
-+         if (firstError.empty())
-+            firstError = StringExtensions::Build("{0}: {1}", name, e.what());
-+      }
-+      catch (...)
-+      {
-+         Log::Exception(StringExtensions::Build("An unknown exception occured while finishing the {0}", name));
-+         if (firstError.empty())
-+            firstError = name;
-+      }
-+   };
-+   step("main thread", [this]() { FinishMainThread(); });
-+   if (m_alarmsStarted && m_alarms)
-+      step("alarms", [this]() { m_alarms->Finish(); });
-+   if (m_tableStarted && m_table)
-+      step("table", [this]() { m_table->Finish(); });
-+   if (m_cabinetStarted && m_cabinet)
-+      step("cabinet", [this]() { m_cabinet->Finish(); });
-+   m_alarmsStarted = m_tableStarted = m_cabinetStarted = false;
-+   if (!firstError.empty())
-+      throw std::runtime_error("DirectOutput framework failed to finish: " + firstError);
-+
-+   Log::Write("DirectOutput framework finished.");
-+   Log::Write("Bye and thanks for using!");
- }
- 
- void Pinball::InitMainThread()
-@@ -422,6 +442,18 @@ void Pinball::MainThreadDoIt()
-       while (m_keepMainThreadAlive)
-       {
+@@ -460,19 +441,23 @@ void Pinball::MainThreadDoIt()
           bool updateRequired = false;
-+
-+         bool hasCommands;
-+         {
-+            std::lock_guard<std::mutex> lock(m_mainThreadMutex);
-+            hasCommands = !m_commands.empty();
-+         }
-+         if (hasCommands)
-+         {
-+            RunCommands();
-+            updateRequired = true;
-+         }
-+
           auto start = std::chrono::steady_clock::now();
  
-          while (m_inputQueue->Count() > 0 && std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() <= MAX_INPUT_DATA_PROCESSING_TIME_MS
-@@ -471,12 +503,12 @@ void Pinball::MainThreadDoIt()
+-         while (m_inputQueue->Count() > 0 && std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() <= MAX_INPUT_DATA_PROCESSING_TIME_MS
+-            && m_keepMainThreadAlive)
++         // VPE: host commands and table element changes are processed in the order they came: a command runs once the
++         // changes queued before it are processed, so a gate that opens does not send a value that was already turned off,
++         // and a change queued after a closing does not go out before it.
++         while (m_keepMainThreadAlive)
+          {
+-            try
+-            {
+-               TableElementData data = m_inputQueue->Dequeue();
+-               m_table->UpdateTableElement(&data);
+-               updateRequired = true;
+-            }
+-            catch (const std::exception& e)
+-            {
+-               Log::Exception(StringExtensions::Build("An unhandled exception occured while processing table element data: {0}", e.what()));
+-            }
++            std::function<void()> command;
++            TableElementData data;
++            Work work = TakeWork(false, command, data);
++            if (work == Work::None)
++               break;
++            if (work == Work::Command)
++               RunCommand(command);
++            else
++               ProcessInput(data);
++            updateRequired = true;
++            if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() > MAX_INPUT_DATA_PROCESSING_TIME_MS)
++               break;
+          }
+ 
+          if (m_keepMainThreadAlive)
+@@ -507,12 +492,12 @@ void Pinball::MainThreadDoIt()
  
              std::unique_lock<std::mutex> lock(m_mainThreadMutex);
  
@@ -329,41 +178,97 @@ index 0711626..dea04b1 100644
  
                 now = std::chrono::steady_clock::now();
                 nextAlarm = m_alarms->GetNextAlarmTime();
-@@ -489,6 +521,33 @@ void Pinball::MainThreadDoIt()
+@@ -525,6 +510,89 @@ void Pinball::MainThreadDoIt()
     {
        Log::Exception(StringExtensions::Build("An unexpected exception occured in the DirectOutput MainThread: {0}", e.what()));
     }
 +   // VPE: commands posted before the thread was asked to stop still run, so a gate change queued just before Finish is
 +   // applied (and its generation published) before the controllers turn everything off.
-+   RunCommands();
++   DrainCommands();
 +}
 +
-+void Pinball::RunCommands()
++void Pinball::DrainCommands()
 +{
-+   std::vector<std::function<void()>> commands;
++   // The input a command waits for is processed first, so an opening does not restore an output whose off came before it.
++   // Input queued after the last command is left: Finish turns everything off.
++   while (true)
 +   {
-+      std::lock_guard<std::mutex> lock(m_mainThreadMutex);
-+      commands.swap(m_commands);
++      std::function<void()> command;
++      TableElementData data;
++      Work work = TakeWork(true, command, data);
++      if (work == Work::None)
++         break;
++      if (work == Work::Command)
++         RunCommand(command);
++      else
++         ProcessInput(data);
 +   }
-+   for (auto& command : commands)
++   // Commands whose input is gone.
++   while (true)
 +   {
-+      try
++      std::function<void()> command;
 +      {
-+         command();
++         std::lock_guard<std::mutex> lock(m_mainThreadMutex);
++         if (m_commands.empty())
++            return;
++         command = std::move(m_commands.front().run);
++         m_commands.pop_front();
 +      }
-+      catch (const std::exception& e)
-+      {
-+         Log::Exception(StringExtensions::Build("An unhandled exception occured while running a host command: {0}", e.what()));
-+      }
-+      catch (...)
-+      {
-+         Log::Exception("An unhandled exception occured while running a host command");
-+      }
++      RunCommand(command);
++   }
++}
++
++Pinball::Work Pinball::TakeWork(bool onlyForCommands, std::function<void()>& command, TableElementData& data)
++{
++   // One lock for the choice and the dequeue: what the host queues in between waits for the next call.
++   std::lock_guard<std::mutex> lock(m_mainThreadMutex);
++   if (!m_commands.empty() && m_commands.front().inputsBefore <= 0)
++   {
++      command = std::move(m_commands.front().run);
++      m_commands.pop_front();
++      return Work::Command;
++   }
++   if ((onlyForCommands && m_commands.empty()) || m_inputQueue->Count() == 0)
++      return Work::None;
++   data = m_inputQueue->Dequeue();
++   for (Command& queued : m_commands)
++   {
++      if (queued.inputsBefore > 0)
++         queued.inputsBefore--;
++   }
++   return Work::Input;
++}
++
++void Pinball::RunCommand(std::function<void()>& command)
++{
++   try
++   {
++      command();
++   }
++   catch (const std::exception& e)
++   {
++      Log::Exception(StringExtensions::Build("An unhandled exception occured while running a host command: {0}", e.what()));
++   }
++   catch (...)
++   {
++      Log::Exception("An unhandled exception occured while running a host command");
++   }
++}
++
++void Pinball::ProcessInput(TableElementData& data)
++{
++   try
++   {
++      m_table->UpdateTableElement(&data);
++   }
++   catch (const std::exception& e)
++   {
++      Log::Exception(StringExtensions::Build("An unhandled exception occured while processing table element data: {0}", e.what()));
 +   }
  }
  
  void Pinball::ReceiveData(char type, int number, int value)
-@@ -509,4 +568,62 @@ void Pinball::ReceiveData(const TableElementData& tableElementData)
+@@ -545,4 +613,68 @@ void Pinball::ReceiveData(const TableElementData& tableElementData)
     MainThreadSignal();
  }
  
@@ -373,7 +278,7 @@ index 0711626..dea04b1 100644
 +      std::lock_guard<std::mutex> lock(m_mainThreadMutex);
 +      if (!m_keepMainThreadAlive || !IsMainThreadActive())
 +         return false;
-+      m_commands.push_back(std::move(command));
++      m_commands.push_back({ m_inputQueue->Count(), std::move(command) });
 +      m_mainThreadDoWork = true;
 +   }
 +   m_mainThreadCV.notify_one();
@@ -386,7 +291,7 @@ index 0711626..dea04b1 100644
 +   if (!m_keepMainThreadAlive || !IsMainThreadActive())
 +      return -1;
 +   int64_t generation = OutputGate::Instance().Request(open);
-+   m_commands.push_back([this, open, generation]() { ApplyOutputGate(open, generation); });
++   m_commands.push_back({ m_inputQueue->Count(), [this, open, generation]() { ApplyOutputGate(open, generation); } });
 +   m_mainThreadDoWork = true;
 +   m_mainThreadCV.notify_one();
 +   return generation;
@@ -396,8 +301,14 @@ index 0711626..dea04b1 100644
 +{
 +   OutputGate& gate = OutputGate::Instance();
 +   bool wasOpen = gate.IsOpen();
++   // The toys get the input processed before this change. An opening updates them while the gate is still closed, a
++   // closing once it is closed, so neither sends a value the gate should hold back.
++   if (open && m_cabinet && m_cabinet->GetToys())
++      m_cabinet->GetToys()->UpdateOutputs();
 +   // A latched gate applies an opening as a closing.
 +   open = gate.Apply(open);
++   if (!open && m_cabinet && m_cabinet->GetToys())
++      m_cabinet->GetToys()->UpdateOutputs();
 +   if (wasOpen != open)
 +   {
 +      // Outputs with a value now report another one: tell their controllers. Outputs at 0 report 0 either way.
@@ -427,22 +338,23 @@ index 0711626..dea04b1 100644
 +
  }
 diff --git a/src/Pinball.h b/src/Pinball.h
-index a48d4e7..433d804 100644
+index 4bf85b5..d45e4df 100644
 --- a/src/Pinball.h
 +++ b/src/Pinball.h
-@@ -3,8 +3,11 @@
+@@ -3,9 +3,12 @@
  #include <atomic>
  #include <chrono>
  #include <condition_variable>
 +#include <cstdint>
-+#include <functional>
++#include <deque>
+ #include <functional>
  #include <mutex>
  #include <thread>
 +#include <vector>
  
  #include "DOF/DOF.h"
  
-@@ -40,6 +43,15 @@ public:
+@@ -42,7 +45,18 @@ public:
     void ReceiveData(const std::string& tableElementName, int value);
     void ReceiveData(const TableElementData& tableElementData);
  
@@ -456,55 +368,105 @@ index a48d4e7..433d804 100644
 +   int GetPendingInputCount() const;
 +
  private:
++   friend class PinballTestAccess;
++
     void SetAlarms(AlarmHandler* alarms) { m_alarms = alarms; }
     void SetGlobalConfig(GlobalConfig* globalConfig) { m_globalConfig = globalConfig; }
-@@ -59,6 +71,15 @@ private:
+ 
+@@ -61,6 +75,29 @@ private:
     std::condition_variable m_mainThreadCV;
     std::atomic<bool> m_keepMainThreadAlive;
     std::atomic<bool> m_mainThreadDoWork;
-+   std::vector<std::function<void()>> m_commands;
++   // A host command waits for the table element changes that were queued before it (inputsBefore of them are left).
++   struct Command
++   {
++      int inputsBefore;
++      std::function<void()> run;
++   };
++   std::deque<Command> m_commands;
++
++   enum class Work
++   {
++      None,
++      Command,
++      Input,
++   };
 +
 +   void ApplyOutputGate(bool open, int64_t generation);
-+   void RunCommands();
-+
-+   // What Init started, so that Finish stops only that.
-+   bool m_cabinetStarted = false;
-+   bool m_tableStarted = false;
-+   bool m_alarmsStarted = false;
++   // Takes the next thing to do: the first command once the input queued before it was processed, or else the next
++   // input (only while a command waits for it, if `onlyForCommands`).
++   Work TakeWork(bool onlyForCommands, std::function<void()>& command, TableElementData& data);
++   void RunCommand(std::function<void()>& command);
++   void ProcessInput(TableElementData& data);
++   // When the main thread stops: runs the commands still queued, each after the input that was queued before it.
++   void DrainCommands();
  
-    static const int MAX_INPUT_DATA_PROCESSING_TIME_MS = 10;
- };
+    bool m_tableStarted = false;
+    bool m_alarmsStarted = false;
 diff --git a/src/cab/Cabinet.cpp b/src/cab/Cabinet.cpp
-index cbb4552..9dbd29c 100644
+index 75f454d..d528403 100644
 --- a/src/cab/Cabinet.cpp
 +++ b/src/cab/Cabinet.cpp
-@@ -16,6 +16,7 @@
- #include "sequencer/SequentialOutputSettings.h"
- #include "overrides/TableOverrideSettings.h"
- #include <sstream>
-+#include <exception>
+@@ -4,6 +4,7 @@
+ #include "../general/StringExtensions.h"
+ #include "../general/FileInfo.h"
+ #include "../general/FileReader.h"
++#include "../general/PathConfinement.h"
+ #include "../general/CurveList.h"
+ #include "../general/color/ColorList.h"
+ #include "CabinetOutputList.h"
+@@ -151,6 +152,9 @@ std::string Cabinet::GetConfigXml()
  
- #ifdef __HIDAPI__
- #include "out/ps/Pinscape.h"
-@@ -267,8 +268,19 @@ void Cabinet::Finish()
+ void Cabinet::SaveConfigXmlFile(const std::string& filename)
  {
-    Log::Write("Finishing cabinet");
++   // VPE: tinyxml2 writes the file itself, past the check in WriteToFile.
++   if (!PathConfinement::IsWriteAllowed(filename))
++      return;
+    std::string xml = GetConfigXml();
+    if (xml.empty())
+    {
+@@ -387,20 +391,6 @@ bool Cabinet::FromXml(const tinyxml2::XMLElement* element)
+       m_autoConfigEnabled = (autoConfigText == "true");
+    }
  
--   m_toys->Finish();
-+   // VPE: the controllers are finished (and turned off) even when a toy fails to finish.
-+   std::exception_ptr toyError;
-+   try
+-   const tinyxml2::XMLElement* scheduledElement = element->FirstChildElement("ScheduledSettings");
+-   if (scheduledElement)
+-   {
+-      ScheduledSettings& scheduledSettings = ScheduledSettings::GetInstance();
+-      scheduledSettings.FromXml(scheduledElement);
+-   }
+-
+-   const tinyxml2::XMLElement* sequentialElement = element->FirstChildElement("SequentialOutputSettings");
+-   if (sequentialElement)
+-   {
+-      SequentialOutputSettings& sequentialSettings = SequentialOutputSettings::GetInstance();
+-      sequentialSettings.FromXml(sequentialElement);
+-   }
+-
+    const tinyxml2::XMLElement* controllersElement = element->FirstChildElement("OutputControllers");
+    if (controllersElement && m_outputControllers)
+    {
+@@ -460,6 +450,22 @@ bool Cabinet::FromXml(const tinyxml2::XMLElement* element)
+       }
+    }
+ 
++   // VPE: the process-wide settings go in last, so a cabinet config that fails while its controllers or toys load does
++   // not leave its schedules behind.
++   const tinyxml2::XMLElement* scheduledElement = element->FirstChildElement("ScheduledSettings");
++   if (scheduledElement)
 +   {
-+      m_toys->Finish();
++      ScheduledSettings& scheduledSettings = ScheduledSettings::GetInstance();
++      scheduledSettings.FromXml(scheduledElement);
 +   }
-+   catch (...)
++
++   const tinyxml2::XMLElement* sequentialElement = element->FirstChildElement("SequentialOutputSettings");
++   if (sequentialElement)
 +   {
-+      toyError = std::current_exception();
++      SequentialOutputSettings& sequentialSettings = SequentialOutputSettings::GetInstance();
++      sequentialSettings.FromXml(sequentialElement);
 +   }
-    m_outputControllers->Finish();
-+   if (toyError)
-+      std::rethrow_exception(toyError);
-    Log::Write("Cabinet finished");
++
+    return true;
  }
  
 diff --git a/src/cab/out/IOutput.cpp b/src/cab/out/IOutput.cpp
@@ -571,7 +533,7 @@ index f222f0c..bdd8bf0 100644
  }
  
 diff --git a/src/cab/out/OutputControllerCompleteBase.cpp b/src/cab/out/OutputControllerCompleteBase.cpp
-index f4958df..4d709cb 100644
+index f4958df..101b3cb 100644
 --- a/src/cab/out/OutputControllerCompleteBase.cpp
 +++ b/src/cab/out/OutputControllerCompleteBase.cpp
 @@ -1,5 +1,6 @@
@@ -632,7 +594,7 @@ index f4958df..4d709cb 100644
     try
     {
        try
-@@ -277,19 +299,27 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -277,19 +299,29 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
           catch (...)
           {
           }
@@ -644,6 +606,8 @@ index f4958df..4d709cb 100644
        Log::Write(StringExtensions::Build("Updater thread connected to {0} {1}", GetXmlElementName(), GetName()));
  
 +      bool died = false;
++      // VPE: the outputs were turned off by the blackout sent while reconnecting, the last thing a unit that died got.
++      bool offWhenDied = false;
        while (m_keepUpdaterThreadAlive)
        {
 +         // The generation and its state are read together, before the values: the main thread stores the values of a
@@ -660,20 +624,21 @@ index f4958df..4d709cb 100644
  
           bool updateOK = true;
           try
-@@ -302,13 +332,20 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -302,18 +334,27 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
                 m_inUseState = InUseState::Running;
              }
  
 -            if (m_inUseState == InUseState::Running)
 -               UpdateOutputs(valuesToSend);
-+            bool delivered;
 +            if (m_inUseState == InUseState::Running || !gate.open)
-+               delivered = Transfer(valuesToSend, !gateUnit->IsAcked(gate));
++            {
++               if (Transfer(valuesToSend, !gateUnit->IsAcked(gate)))
++                  gateUnit->Ack(gate);
++            }
 +            else
-+               // Open, and DOF never used this controller: it leaves the hardware alone, so there is nothing to send.
-+               delivered = true;
-+            if (delivered)
-+               gateUnit->Ack(gate);
++               // Open, and DOF never used this controller: it leaves the hardware alone, so there is nothing to send, and
++               // nothing is confirmed either.
++               gateUnit->Untouched(gate);
           }
           catch (const std::exception& e)
           {
@@ -683,47 +648,88 @@ index f4958df..4d709cb 100644
           }
  
           if (!updateOK)
-@@ -328,6 +365,7 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+          {
+             Log::Warning("Trying to reconnect to controller...");
++            m_disconnectSentZeros = false;
+             try
+             {
+                DisconnectFromController();
+@@ -328,6 +369,8 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
              }
              catch (...)
              {
++               offWhenDied = m_disconnectSentZeros;
 +               died = true;
                 break;
              }
              Log::Write("Reconnected to controller");
-@@ -343,15 +381,22 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -341,33 +384,93 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+          m_updateRequired = false;
+       }
  
++      // Whether the final transfer is skipped: open, and DOF never used the controller.
++      bool untouched = m_inUseState == InUseState::Startup && OutputGate::Instance().IsOpen();
++      // VPE: read before the zeros go out, so a closing published just before Finish is confirmed by them.
++      OutputGate::Snapshot finalGate = gateUnit->Observe();
++      bool zerosSent = false;
++      bool finalFailed = false;
        try
        {
 -         if (m_inUseState != InUseState::Startup)
 +         if (died)
 +         {
-+            if (m_inUseState != InUseState::Startup || !OutputGate::Instance().IsOpen())
++            if (!untouched && !offWhenDied)
 +               m_finishError = StringExtensions::Build("{0} {1} lost its connection; its outputs may still be on", GetXmlElementName(), GetName());
 +         }
-+         else if (m_inUseState != InUseState::Startup || !OutputGate::Instance().IsOpen())
++         else if (!untouched)
           {
              std::vector<uint8_t> zeroValues(m_outputValues.size(), 0);
 -            UpdateOutputs(zeroValues);
-+            if (!Transfer(zeroValues, true))
++            zerosSent = Transfer(zeroValues, true);
++            if (!zerosSent)
++            {
 +               m_finishError = StringExtensions::Build("{0} {1} could not send its final update", GetXmlElementName(), GetName());
++               finalFailed = true;
++            }
           }
        }
        catch (const std::exception& e)
        {
           Log::Exception(StringExtensions::Build("Exception occurred while trying to turn off all outputs: {0}", e.what()));
 +         m_finishError = StringExtensions::Build("{0} {1} could not turn its outputs off: {2}", GetXmlElementName(), GetName(), e.what());
++         finalFailed = true;
        }
  
        try
-@@ -361,13 +406,36 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+       {
++         m_disconnectSentZeros = false;
+          DisconnectFromController();
++         // VPE: a blackout the disconnect sent turns the outputs off as well. One that sends nothing changes nothing.
++         if (m_disconnectSentZeros)
++         {
++            zerosSent = true;
++            if (finalFailed || died)
++               m_finishError.clear();
++         }
++      }
++      catch (const std::exception& e)
++      {
++         // VPE: without a final transfer, what the controller sends as it disconnects (a blackout) is the last word.
++         Log::Exception(StringExtensions::Build("Disconnecting from {0} {1} failed: {2}", GetXmlElementName(), GetName(), e.what()));
++         if (untouched && !died && m_finishError.empty())
++            m_finishError = StringExtensions::Build("{0} {1} could not turn its outputs off: {2}", GetXmlElementName(), GetName(), e.what());
+       }
        catch (...)
        {
        }
 +      if (died)
 +         gateUnit->Die();
 +      else
++      {
++         if (zerosSent && !finalGate.open)
++            gateUnit->Ack(finalGate);
 +         gateUnit->Stop();
++      }
        Log::Write("Updater thread disconnected and will terminate");
     }
     catch (const std::exception& e)
@@ -754,7 +760,7 @@ index f4958df..4d709cb 100644
 +
  }
 diff --git a/src/cab/out/OutputControllerCompleteBase.h b/src/cab/out/OutputControllerCompleteBase.h
-index 48b8eb9..27f0886 100644
+index 48b8eb9..7d04351 100644
 --- a/src/cab/out/OutputControllerCompleteBase.h
 +++ b/src/cab/out/OutputControllerCompleteBase.h
 @@ -3,8 +3,10 @@
@@ -768,7 +774,7 @@ index 48b8eb9..27f0886 100644
  #include <vector>
  #include <thread>
  
-@@ -44,7 +46,12 @@ protected:
+@@ -44,7 +46,15 @@ protected:
     virtual bool VerifySettings() = 0;
     virtual void ConnectToController() = 0;
     virtual void DisconnectFromController() = 0;
@@ -778,10 +784,13 @@ index 48b8eb9..27f0886 100644
     virtual void UpdateOutputs(const std::vector<uint8_t>& outputValues) = 0;
 +   bool m_forceFullTransfer = false;
 +   bool m_transferSkipped = false;
++   // VPE: set by a DisconnectFromController that turned every output off (a blackout that got to the device), which
++   // counts as the final update the updater sends when it ends.
++   bool m_disconnectSentZeros = false;
  
  
     void InitUpdaterThread();
-@@ -72,7 +79,12 @@ private:
+@@ -72,7 +82,12 @@ private:
     mutable std::mutex m_conditionMutex;
     bool m_keepUpdaterThreadAlive;
     std::atomic<bool> m_updaterThreadFinished { false };
@@ -795,62 +804,35 @@ index 48b8eb9..27f0886 100644
  
  }
 diff --git a/src/cab/out/OutputControllerList.cpp b/src/cab/out/OutputControllerList.cpp
-index a52dbe7..7343139 100644
+index 89138e9..4c92600 100644
 --- a/src/cab/out/OutputControllerList.cpp
 +++ b/src/cab/out/OutputControllerList.cpp
-@@ -1,4 +1,5 @@
- #include "OutputControllerList.h"
-+#include <stdexcept>
+@@ -215,7 +215,18 @@ bool OutputControllerList::FromXml(const tinyxml2::XMLElement* element)
  
- #include "../../Log.h"
- #include "../../general/StringExtensions.h"
-@@ -60,8 +61,30 @@ void OutputControllerList::Finish()
- {
-    Log::Write("Finishing output controllers");
- 
-+   // VPE: every controller is finished, and the ones that failed (a final all-off that did not get there) are reported
-+   // together once all are done.
-+   std::string failures;
-    for (IOutputController* controller : *this)
--      controller->Finish();
-+   {
-+      std::string error;
-+      try
-+      {
-+         controller->Finish();
-+      }
-+      catch (const std::exception& e)
-+      {
-+         error = e.what();
-+      }
-+      catch (...)
-+      {
-+         error = "unknown error";
-+      }
-+      if (!error.empty())
-+      {
-+         Log::Exception(StringExtensions::Build("Finishing output controller {0} failed: {1}", controller->GetName(), error));
-+         failures += (failures.empty() ? "" : "; ") + controller->GetName() + ": " + error;
-+      }
-+   }
- 
- #ifdef __HIDAPI__
-    DudesCab::ClearDevices();
-@@ -69,6 +92,8 @@ void OutputControllerList::Finish()
- #endif
- 
-    Log::Write("Output controllers finished");
-+   if (!failures.empty())
-+      throw std::runtime_error("output controllers failed to finish: " + failures);
- }
- 
- void OutputControllerList::Update()
+       if (controller)
+       {
+-         if (controller->FromXml(controllerElement))
++         // VPE: a controller whose settings throw is freed before the error goes on.
++         bool loaded;
++         try
++         {
++            loaded = controller->FromXml(controllerElement);
++         }
++         catch (...)
++         {
++            delete controller;
++            throw;
++         }
++         if (loaded)
+          {
+             push_back(controller);
+             Log::Write(StringExtensions::Build("Loaded output controller: {0} ({1})", controller->GetName(), typeName));
 diff --git a/src/cab/out/OutputGate.cpp b/src/cab/out/OutputGate.cpp
 new file mode 100644
-index 0000000..824f940
+index 0000000..41909e6
 --- /dev/null
 +++ b/src/cab/out/OutputGate.cpp
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,291 @@
 +#include "OutputGate.h"
 +
 +#include <cstdint>
@@ -876,14 +858,24 @@ index 0000000..824f940
 +bool OutputGate::Unit::IsAcked(const Snapshot& snapshot) const
 +{
 +   const std::atomic<int64_t>& acked = snapshot.open ? m_ackedOpen : m_ackedClosed;
-+   return acked.load(std::memory_order_acquire) >= snapshot.generation;
++   return acked.load(std::memory_order_acquire) >= snapshot.generation || (snapshot.open && m_untouched.load(std::memory_order_acquire) >= snapshot.generation);
 +}
 +
 +void OutputGate::Unit::Ack(const Snapshot& snapshot) { RaiseTo(snapshot.open ? m_ackedOpen : m_ackedClosed, snapshot.generation); }
 +
++void OutputGate::Unit::Untouched(const Snapshot& snapshot)
++{
++   if (snapshot.open)
++      RaiseTo(m_untouched, snapshot.generation);
++}
++
 +void OutputGate::Unit::Fail(int64_t generation) { RaiseTo(m_failed, generation); }
 +
-+void OutputGate::Unit::Die() { Fail(INT64_MAX); }
++void OutputGate::Unit::Die()
++{
++   m_dead.store(true, std::memory_order_release);
++   Fail(INT64_MAX);
++}
 +
 +void OutputGate::Unit::Stop() { m_stopped.store(true, std::memory_order_release); }
 +
@@ -903,10 +895,13 @@ index 0000000..824f940
 +{
 +   std::lock_guard<std::mutex> lock(m_mutex);
 +   m_session++;
-+   int64_t generation = ++m_requested;
-+   Record(generation, true);
-+   Reserve();
++   m_history.clear();
++   // The new session's first generation, with the latch flag cleared.
++   int64_t generation = (m_requested.load(std::memory_order_acquire) >> 1) + 1;
++   m_requested.store(generation << 1, std::memory_order_release);
++   Record(generation, true, true);
 +   m_latched.store(false, std::memory_order_release);
++   m_latchGeneration.store(0, std::memory_order_release);
 +   m_open.store(true, std::memory_order_release);
 +   m_connectTests.store(true, std::memory_order_release);
 +   m_published.store(Pack(generation, true), std::memory_order_release);
@@ -930,142 +925,199 @@ index 0000000..824f940
 +
 +void OutputGate::RegisterFailed(const std::string& name) { Register(name)->Die(); }
 +
++int64_t OutputGate::Reserve(bool& latched)
++{
++   // The latch flag shares the word with the counter, so a generation is taken either before the session's first latch
++   // or after it, never in between.
++   int64_t word = m_requested.fetch_add(2, std::memory_order_acq_rel);
++   latched = (word & 1) != 0;
++   return (word >> 1) + 1;
++}
++
 +int64_t OutputGate::Request(bool open)
 +{
 +   std::lock_guard<std::mutex> lock(m_mutex);
-+   int64_t generation = ++m_requested;
-+   Record(generation, open && !m_latched.load(std::memory_order_relaxed));
-+   Reserve();
++   bool latched;
++   int64_t generation = Reserve(latched);
++   // A change requested once a latch took its generation is a closing, from the start. One taken before stays what it
++   // asked for, also when a latch comes before it is recorded.
++   Record(generation, open && !latched, false);
 +   return generation;
 +}
 +
-+void OutputGate::Record(int64_t generation, bool open)
++void OutputGate::Record(int64_t generation, bool open, bool published)
 +{
-+   m_history[generation] = open;
++   m_history[generation] = { open, published };
 +   while (m_history.size() > MaxHistory)
 +      m_history.erase(m_history.begin());
-+}
-+
-+void OutputGate::Reserve()
-+{
-+   while (m_spares.size() < SpareNodes)
-+   {
-+      std::map<int64_t, bool> scratch;
-+      scratch.emplace(0, false);
-+      m_spares.push_back(scratch.extract(scratch.begin()));
-+   }
 +}
 +
 +bool OutputGate::Apply(bool open)
 +{
 +   std::lock_guard<std::mutex> lock(m_mutex);
-+   if (m_latched.load(std::memory_order_relaxed))
++   if (m_latched.load(std::memory_order_acquire))
 +      open = false;
 +   m_open.store(open, std::memory_order_release);
++   // A latch that came after the check above wins: it does not take the mutex.
++   if (open && m_latched.load(std::memory_order_acquire))
++   {
++      m_open.store(false, std::memory_order_release);
++      open = false;
++   }
 +   return open;
++}
++
++int64_t OutputGate::BeginLatch()
++{
++   m_latched.store(true, std::memory_order_release);
++   m_open.store(false, std::memory_order_release);
++   // Takes the generation and sets the latch flag in one step: every generation taken after it is recorded as a closing
++   // (Request), so what a change reports does not depend on when this latch gets to install its generation below.
++   int64_t word = m_requested.load(std::memory_order_acquire);
++   while (!m_requested.compare_exchange_weak(word, (((word >> 1) + 1) << 1) | 1, std::memory_order_acq_rel, std::memory_order_acquire))
++   {
++   }
++   return (word >> 1) + 1;
++}
++
++void OutputGate::FinishLatch(int64_t generation)
++{
++   // The earliest latch generation of the session, whichever latch gets here first. Only latch generations are decided
++   // by it: requested ones carry their state in the history. Until it is installed, the latch's generation is not
++   // published either, so it reports as not applied.
++   int64_t current = m_latchGeneration.load(std::memory_order_acquire);
++   while ((current == 0 || current > generation)
++      && !m_latchGeneration.compare_exchange_weak(current, generation, std::memory_order_acq_rel, std::memory_order_acquire))
++   {
++   }
++   // Published at once, so the updaters send zeros without waiting for the main thread.
++   RaisePublished(generation, false);
 +}
 +
 +int64_t OutputGate::Latch()
 +{
-+   int64_t generation;
-+   {
-+      std::lock_guard<std::mutex> lock(m_mutex);
-+      m_latched.store(true, std::memory_order_release);
-+      m_open.store(false, std::memory_order_release);
-+      // Openings still queued for the main thread are obsolete: they apply as closings.
-+      for (auto it = m_history.upper_bound(Applied()); it != m_history.end(); ++it)
-+         it->second = false;
-+      generation = ++m_requested;
-+      // Never allocates: a reserved node, or the oldest entry once the history is full or the reserve ran out (more
-+      // than SpareNodes latches in a row). A forgotten generation reports as superseded, which an old one is anyway.
-+      std::map<int64_t, bool>::node_type node;
-+      if (m_history.size() < MaxHistory && !m_spares.empty())
-+      {
-+         node = std::move(m_spares.back());
-+         m_spares.pop_back();
-+      }
-+      else if (!m_history.empty())
-+         node = m_history.extract(m_history.begin());
-+      // Without a node the generation goes unrecorded, and Publish takes the closed state from m_open.
-+      if (node)
-+      {
-+         node.key() = generation;
-+         node.mapped() = false;
-+         m_history.insert(std::move(node));
-+      }
-+   }
-+   // Published at once, so the updaters send zeros without waiting for the main thread.
-+   Publish(generation);
++   // No lock: a fault handler may run while another thread holds the gate's mutex. The history is not touched; the
++   // latch generation tells which generations are closings (StateOf), and an opening that the main thread applies after
++   // this is not published as an opening.
++   int64_t generation = BeginLatch();
++   FinishLatch(generation);
 +   return generation;
 +}
 +
-+void OutputGate::Publish(int64_t generation)
++bool OutputGate::RaisePublished(int64_t generation, bool open)
 +{
-+   bool open;
-+   {
-+      std::lock_guard<std::mutex> lock(m_mutex);
-+      auto it = m_history.find(generation);
-+      open = it != m_history.end() ? it->second : m_open.load(std::memory_order_acquire);
-+   }
 +   int64_t current = m_published.load(std::memory_order_relaxed);
 +   int64_t word = Pack(generation, open);
-+   while ((current >> 1) < generation && !m_published.compare_exchange_weak(current, word, std::memory_order_release, std::memory_order_relaxed))
++   while ((current >> 1) < generation)
 +   {
-+   }
-+}
-+
-+bool OutputGate::IsSuperseded(int64_t generation, bool open, int64_t applied) const
-+{
-+   for (auto it = m_history.upper_bound(generation); it != m_history.end() && it->first <= applied; ++it)
-+   {
-+      if (it->second != open)
++      if (m_published.compare_exchange_weak(current, word, std::memory_order_release, std::memory_order_relaxed))
 +         return true;
 +   }
 +   return false;
 +}
 +
-+bool OutputGate::IsConfirmed(const Unit& unit, int64_t generation, bool open) const
++void OutputGate::Publish(int64_t generation)
 +{
-+   // A later generation of the same state confirms this one too: the hardware has that state.
-+   return (open ? unit.m_ackedOpen : unit.m_ackedClosed).load(std::memory_order_acquire) >= generation;
++   std::lock_guard<std::mutex> lock(m_mutex);
++   auto it = m_history.find(generation);
++   bool requested = it != m_history.end() ? it->second.open : m_open.load(std::memory_order_acquire);
++   bool open = requested && !m_latched.load(std::memory_order_acquire);
++   // Only a generation that became the published one with the state it asked for counts as published: an opening a
++   // latch turned into a closing, or one a latch overtook, never reached a unit as an opening.
++   if (RaisePublished(generation, open) && it != m_history.end() && open == requested)
++      it->second.published = true;
 +}
 +
-+OutputGate::Status OutputGate::GetState(int64_t generation, int& confirmed, int& pending, int& failed) const
++bool OutputGate::StateOf(int64_t generation, bool& open) const
 +{
-+   confirmed = pending = failed = 0;
-+   std::lock_guard<std::mutex> lock(m_mutex);
-+   int64_t applied = Applied();
++   int64_t latchGeneration = m_latchGeneration.load(std::memory_order_acquire);
++   if (latchGeneration > 0 && generation >= latchGeneration)
++   {
++      open = false;
++      return true;
++   }
 +   auto it = m_history.find(generation);
 +   if (it == m_history.end())
-+      // Never requested, or forgotten long ago.
-+      return generation > applied ? Status::NotApplied : Status::Superseded;
-+   bool open = it->second;
++      return false;
++   open = it->second.open;
++   return true;
++}
++
++bool OutputGate::IsSuperseded(int64_t generation, bool open, int64_t applied) const
++{
++   // An opening the latch overtook.
++   int64_t latchGeneration = m_latchGeneration.load(std::memory_order_acquire);
++   if (open && latchGeneration > generation && latchGeneration <= applied)
++      return true;
++   // Only changes that were published supersede: one that never reached a unit changed nothing.
++   for (auto it = m_history.upper_bound(generation); it != m_history.end() && it->first <= applied; ++it)
++   {
++      bool state;
++      if (it->second.published && StateOf(it->first, state) && state != open)
++         return true;
++   }
++   return false;
++}
++
++OutputGate::UnitState OutputGate::Classify(const Unit& unit, int64_t generation, bool open, bool known) const
++{
++   // An updater that ended on its own delivers nothing any more, whatever it confirmed before.
++   if (unit.m_dead.load(std::memory_order_acquire))
++      return UnitState::Failed;
++   // A later generation of the same state confirms this one too: the hardware has that state.
++   if (known && (open ? unit.m_ackedOpen : unit.m_ackedClosed).load(std::memory_order_acquire) >= generation)
++      return UnitState::Confirmed;
++   if (unit.m_failed.load(std::memory_order_acquire) >= generation)
++      return UnitState::Failed;
++   if (known && open && unit.m_untouched.load(std::memory_order_acquire) >= generation)
++      return UnitState::Untouched;
++   // Finished cleanly: what it confirmed or left alone stays so, and it delivers nothing later.
++   if (unit.m_stopped.load(std::memory_order_acquire))
++      return UnitState::Failed;
++   return UnitState::Pending;
++}
++
++OutputGate::Status OutputGate::GetState(int64_t generation, Counts& counts) const
++{
++   counts = Counts();
++   std::lock_guard<std::mutex> lock(m_mutex);
++   int64_t applied = Applied();
++   bool open = false;
++   bool recorded = StateOf(generation, open);
++   bool known = recorded && generation <= applied;
 +   for (const auto& unit : m_units)
 +   {
 +      if (unit->m_session != m_session)
 +         continue;
-+      if (IsConfirmed(*unit, generation, open))
-+         confirmed++;
-+      else if (unit->m_stopped.load(std::memory_order_acquire) || unit->m_failed.load(std::memory_order_acquire) >= generation)
-+         failed++;
-+      else
-+         pending++;
++      switch (Classify(*unit, generation, open, known))
++      {
++      case UnitState::Confirmed: counts.confirmed++; break;
++      case UnitState::Failed: counts.failed++; break;
++      case UnitState::Untouched: counts.untouched++; break;
++      default: counts.pending++; break;
++      }
 +   }
-+   if (generation > applied)
++   if (!recorded)
++      // Never requested, or forgotten long ago.
++      return generation > applied ? Status::NotApplied : Status::Superseded;
++   if (!known)
 +      return Status::NotApplied;
-+   return IsSuperseded(generation, open, applied) && pending + failed > 0 ? Status::Superseded : Status::Applied;
++   return IsSuperseded(generation, open, applied) ? Status::Superseded : Status::Applied;
 +}
 +
 +std::vector<std::string> OutputGate::GetPending(int64_t generation) const
 +{
 +   std::vector<std::string> names;
 +   std::lock_guard<std::mutex> lock(m_mutex);
-+   auto it = m_history.find(generation);
++   int64_t applied = Applied();
++   bool open = false;
++   bool known = StateOf(generation, open) && generation <= applied;
 +   for (const auto& unit : m_units)
 +   {
 +      if (unit->m_session != m_session)
 +         continue;
-+      if (it == m_history.end() || !IsConfirmed(*unit, generation, it->second))
++      UnitState state = Classify(*unit, generation, open, known);
++      if (state == UnitState::Pending || state == UnitState::Failed)
 +         names.push_back(unit->m_name);
 +   }
 +   return names;
@@ -1074,10 +1126,10 @@ index 0000000..824f940
 +}
 diff --git a/src/cab/out/OutputGate.h b/src/cab/out/OutputGate.h
 new file mode 100644
-index 0000000..672ad8f
+index 0000000..b7480e3
 --- /dev/null
 +++ b/src/cab/out/OutputGate.h
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,188 @@
 +#pragma once
 +
 +#include <atomic>
@@ -1113,9 +1165,22 @@ index 0000000..672ad8f
 +      // The generation was not applied by DOF's main thread yet.
 +      NotApplied,
 +      Applied,
-+      // A later generation set the other state while some unit had not confirmed this one. Only the latest
-+      // generation's state tells what the outputs show; an older one can later count as confirmed by every unit.
++      // A later generation that was published set the other state, or the generation is an opening that a latch
++      // overtook (requested before the latch, applied after it), which never reaches a unit as an opening. This does not
++      // change any more: only the latest generation's state tells what the outputs show.
 +      Superseded,
++   };
++
++   struct Counts
++   {
++      // Units whose hardware got the state (or a later generation of the same state).
++      int confirmed = 0;
++      int pending = 0;
++      // The device is missing, a write failed, or the updater ended on its own. A unit that finished cleanly keeps what
++      // it confirmed or left alone, and fails later generations.
++      int failed = 0;
++      // Units DOF never used, left alone while the gate is open: nothing was written to them.
++      int untouched = 0;
 +   };
 +
 +   class Unit
@@ -1123,13 +1188,16 @@ index 0000000..672ad8f
 +   public:
 +      // Called by the unit's updater before it copies the values it sends.
 +      Snapshot Observe() const;
-+      // Whether the hardware already got the state of `snapshot`; until then the updater transfers every output.
++      // Whether the hardware already got the state of `snapshot`, or the gate is open at a unit DOF leaves alone; until
++      // then the updater transfers every output.
 +      bool IsAcked(const Snapshot& snapshot) const;
 +      // A transfer to the hardware carried the state of `snapshot`.
 +      void Ack(const Snapshot& snapshot);
++      // The gate is open at `snapshot` and DOF never used the unit, so nothing was written to its hardware.
++      void Untouched(const Snapshot& snapshot);
 +      // The unit could not deliver `generation` (no device, failed write).
 +      void Fail(int64_t generation);
-+      // The unit's updater ended without being asked to: it fails every later generation.
++      // The unit's updater ended without being asked to: it fails every generation, also those it confirmed before.
 +      void Die();
 +      // The unit was finished: it delivers nothing any more. What it confirmed stays confirmed.
 +      void Stop();
@@ -1140,14 +1208,17 @@ index 0000000..672ad8f
 +      uint64_t m_session = 0;
 +      std::atomic<int64_t> m_ackedClosed { 0 };
 +      std::atomic<int64_t> m_ackedOpen { 0 };
++      std::atomic<int64_t> m_untouched { 0 };
 +      std::atomic<int64_t> m_failed { 0 };
++      std::atomic<bool> m_dead { false };
 +      std::atomic<bool> m_stopped { false };
 +   };
 +
 +   static OutputGate& Instance();
 +
-+   // The state outputs report. It changes before the generation that set it is published.
-+   bool IsOpen() const { return m_open.load(std::memory_order_acquire); }
++   // The state outputs report. It changes before the generation that set it is published. The latch decides on its own,
++   // so an Apply that raced it cannot report the gate open again.
++   bool IsOpen() const { return !m_latched.load(std::memory_order_acquire) && m_open.load(std::memory_order_acquire); }
 +   // Whether a controller may run its connect test sequence (TestOnConnect): only while the gate is open, and never in a
 +   // session that turned them off, such as a port test, where a controller that connects late or reconnects would light
 +   // its whole strip.
@@ -1156,7 +1227,7 @@ index 0000000..672ad8f
 +   void SetConnectTests(bool allowed) { m_connectTests.store(allowed, std::memory_order_release); }
 +   Snapshot Current() const;
 +
-+   // Starts a new session: opens the gate and forgets the units of the previous one.
++   // Starts a new session: opens the gate and forgets the units and generations of the previous one.
 +   void BeginSession();
 +   // Registers an output controller unit of the current session, before its updater starts. The returned unit lives
 +   // until the process ends.
@@ -1164,56 +1235,86 @@ index 0000000..672ad8f
 +   // Registers a configured unit that cannot deliver anything, such as a device that is not connected.
 +   void RegisterFailed(const std::string& name);
 +
-+   // Reserves the generation of a change to `open`. Once latched, every change is a closing.
++   // Reserves the generation of a change to `open` and records the requested state. Generations from the session's
++   // first latch on are closings.
 +   int64_t Request(bool open);
 +   // On DOF's main thread, in the order of the generations: sets the state outputs report and returns it, closed once
 +   // latched. The caller re-raises the output values, then publishes the generation.
 +   bool Apply(bool open);
 +   // Any thread, at once: closes the gate for the rest of the session and publishes the closing, which every unit's
-+   // updater sends within its polling interval, without DOF's main thread. Openings requested and not applied yet, and
-+   // every later one, apply as closings, and their generations report the closed state. Returns the closing's
-+   // generation. It never allocates: the closing's history entry is a node reserved by the other calls or, once they
-+   // ran out, the oldest entry's.
++   // updater sends within its polling interval, without DOF's main thread. Openings with an earlier generation that
++   // were not applied yet are never published as openings and report as superseded; every later change applies as a
++   // closing and reports the closed state. When latches race, the earliest generation is the session's latch, whatever
++   // order the threads finish in. Returns the closing's generation. It takes no lock and never allocates.
 +   int64_t Latch();
 +   bool IsLatched() const { return m_latched.load(std::memory_order_acquire); }
 +   void Publish(int64_t generation);
 +   int64_t Applied() const { return Current().generation; }
 +
-+   Status GetState(int64_t generation, int& confirmed, int& pending, int& failed) const;
-+   // The units that did not confirm `generation`, failed ones included.
++   Status GetState(int64_t generation, Counts& counts) const;
++   // The units GetState counts as pending or failed for `generation`.
 +   std::vector<std::string> GetPending(int64_t generation) const;
 +
 +private:
-+   OutputGate() { m_spares.reserve(SpareNodes); }
++   friend class OutputGateTestAccess;
++
++   enum class UnitState
++   {
++      Confirmed,
++      Pending,
++      Failed,
++      Untouched,
++   };
++
++   struct Entry
++   {
++      bool open;
++      // Whether the generation became the published one. One that a latch overtook never does.
++      bool published;
++   };
++
++   OutputGate() = default;
 +
 +   static int64_t Pack(int64_t generation, bool open) { return (generation << 1) | (open ? 1 : 0); }
 +
++   // The two halves of Latch: closes at once and reserves the generation with the latch flag, then installs and
++   // publishes it.
++   int64_t BeginLatch();
++   void FinishLatch(int64_t generation);
++   // Takes the next generation; `latched`: a latch took one before.
++   int64_t Reserve(bool& latched);
++
 +   // Called with m_mutex held.
++   bool StateOf(int64_t generation, bool& open) const;
++   // What `unit` reports for `generation`, for both the counts and the names. `known`: the generation was applied and
++   // its state is `open`.
++   UnitState Classify(const Unit& unit, int64_t generation, bool open, bool known) const;
 +   bool IsSuperseded(int64_t generation, bool open, int64_t applied) const;
-+   bool IsConfirmed(const Unit& unit, int64_t generation, bool open) const;
++   // Records the state of a generation and forgets the oldest ones.
++   void Record(int64_t generation, bool open, bool published);
++   // Publishes `generation` unless a later one was published already. Lock-free.
++   bool RaisePublished(int64_t generation, bool open);
 +
 +   std::atomic<bool> m_open { true };
 +   std::atomic<bool> m_connectTests { true };
-+   // Written with m_mutex held.
 +   std::atomic<bool> m_latched { false };
++   // The earliest latch generation of the session, 0 before it: it and every later generation are closings.
++   std::atomic<int64_t> m_latchGeneration { 0 };
 +   // The last published generation and its state: (generation << 1) | open.
 +   std::atomic<int64_t> m_published { Pack(0, true) };
-+   int64_t m_requested = 0;
++   // The last generation taken, and whether a latch took one in this session: (generation << 1) | latched.
++   std::atomic<int64_t> m_requested { 0 };
 +   uint64_t m_session = 0;
 +   mutable std::mutex m_mutex;
 +   // The state each generation set, the latest ones only.
-+   std::map<int64_t, bool> m_history;
-+   // History nodes reserved for Latch, which must not allocate. Refilled, with m_mutex held, by the other calls.
-+   std::vector<std::map<int64_t, bool>::node_type> m_spares;
++   std::map<int64_t, Entry> m_history;
 +   std::vector<std::unique_ptr<Unit>> m_units;
 +   std::vector<std::unique_ptr<Unit>> m_retired;
 +
 +   static constexpr size_t MaxHistory = 4096;
-+   static constexpr size_t SpareNodes = 8;
 +
-+   // Called with m_mutex held. Records the state of a generation and forgets the oldest ones.
-+   void Record(int64_t generation, bool open);
-+   void Reserve();
++   static_assert(std::atomic<int64_t>::is_always_lock_free);
++   static_assert(std::atomic<bool>::is_always_lock_free);
 +};
 +
 +}
@@ -1322,7 +1423,7 @@ index e112579..175fad3 100644
  }
 \ No newline at end of file
 diff --git a/src/cab/out/adressableledstrip/UMXController.cpp b/src/cab/out/adressableledstrip/UMXController.cpp
-index d460fbd..4c70be3 100644
+index d460fbd..a0ef66d 100644
 --- a/src/cab/out/adressableledstrip/UMXController.cpp
 +++ b/src/cab/out/adressableledstrip/UMXController.cpp
 @@ -1,4 +1,5 @@
@@ -1331,48 +1432,228 @@ index d460fbd..4c70be3 100644
  #include "UMXControllerAutoConfigurator.h"
  #include "../../Cabinet.h"
  #include "../OutputControllerList.h"
-@@ -76,14 +77,17 @@ void UMXController::UpdateOutputs(const std::vector<uint8_t>& outputValues)
+@@ -47,7 +48,18 @@ int UMXController::GetNumberOfConfiguredOutputs() { return m_dev ? m_dev->NumOut
  
-    if (!m_lastTimeInit || delay >= m_longestDataLineDelayMs)
+ void UMXController::ConnectToController()
+ {
+-   DisconnectFromController();
++   // A unit that cannot be turned off before the reconnect is still reconnected.
++   try
++   {
++      DisconnectFromController();
++   }
++   catch (const std::exception& e)
++   {
++      Log::Warning(StringExtensions::Build("UMX controller {0} could not turn its outputs off before connecting: {1}", GetName(), e.what()));
++   }
++   // VPE: a device that cannot come back ends the updater instead of failing on every pass.
++   if (m_dev && m_dev->IsLost())
++      throw std::runtime_error(StringExtensions::Build("UMX controller {0} lost its device", GetName()));
+    if (m_dev)
+       m_dev->ResetDataLines();
+ }
+@@ -55,7 +67,11 @@ void UMXController::ConnectToController()
+ void UMXController::DisconnectFromController()
+ {
+    if (m_inUseState == InUseState::Running && m_dev)
++   {
+       m_dev->SendCommand(UMXDevice::UMXCommand::UMX_AllOff);
++      // VPE: SendCommand throws when the command did not get to the device, so the outputs are off now.
++      m_disconnectSentZeros = true;
++   }
+ }
+ 
+ bool UMXController::VerifySettings()
+@@ -74,17 +90,32 @@ void UMXController::UpdateOutputs(const std::vector<uint8_t>& outputValues)
+    auto now = std::chrono::steady_clock::now();
+    int delay = m_lastTimeInit ? static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastTime).count()) : 0;
+ 
+-   if (!m_lastTimeInit || delay >= m_longestDataLineDelayMs)
++   if (m_lastTimeInit && delay < m_longestDataLineDelayMs)
     {
 -      if (m_dev)
 -         m_dev->UpdateOutputs(outputValues);
-+      if (!m_dev)
-+         throw std::runtime_error(StringExtensions::Build("UMX controller {0} has no device", GetName()));
-+      m_dev->UpdateOutputs(outputValues, m_forceFullTransfer);
-       m_lastTime = std::chrono::steady_clock::now();
-       m_lastTimeInit = true;
+-      m_lastTime = std::chrono::steady_clock::now();
+-      m_lastTimeInit = true;
++      std::this_thread::sleep_for(std::chrono::milliseconds(m_longestDataLineDelayMs - delay));
++      // VPE: nothing was sent; the updater sends again after this wait. A full transfer (the final all-off among them)
++      // is sent once the wait is over instead.
++      if (!m_forceFullTransfer)
++      {
++         m_transferSkipped = true;
++         return;
++      }
     }
-    else
+-   else
++
++   if (!m_dev)
++      throw std::runtime_error(StringExtensions::Build("UMX controller {0} has no device", GetName()));
++   // VPE: values copied before a latch that came during the wait, or while the frame was built, are not sent: the
++   // transfer stays unconfirmed, and the updater sends the closing in full next.
++   auto stale = [&outputValues]() {
++      return OutputGate::Instance().IsLatched() && std::any_of(outputValues.begin(), outputValues.end(), [](uint8_t value) { return value != 0; });
++   };
++   if (stale() || !m_dev->UpdateOutputs(outputValues, m_forceFullTransfer, stale))
     {
-+      // VPE: nothing was sent; the updater sends again after this wait.
-       std::this_thread::sleep_for(std::chrono::milliseconds(m_longestDataLineDelayMs - delay));
+-      std::this_thread::sleep_for(std::chrono::milliseconds(m_longestDataLineDelayMs - delay));
 +      m_transferSkipped = true;
++      return;
     }
++   m_lastTime = std::chrono::steady_clock::now();
++   m_lastTimeInit = true;
  }
  
-@@ -212,7 +216,7 @@ void UMXController::UpdateCabinetFromConfig(Cabinet* cabinet)
-       }
+ void UMXController::UpdateCabinetFromConfig(Cabinet* cabinet)
+@@ -106,6 +137,26 @@ void UMXController::UpdateCabinetFromConfig(Cabinet* cabinet)
+       return;
     }
  
--   if (m_dev->m_testOnConnect != UMXDevice::TestMode::None)
++   // VPE: the connect test runs before the controller is added. A device lost by a failed test write is not added (the
++   // auto-configurator lets it go); after another failure the controller is added and its next write opens it again.
 +   if (m_dev->m_testOnConnect != UMXDevice::TestMode::None && OutputGate::Instance().AllowsConnectTests())
++   {
++      std::vector<uint8_t> parameters = {
++         static_cast<uint8_t>(m_dev->m_testOnConnect),
++         m_dev->m_testOnConnectDuration,
++      };
++      try
++      {
++         m_dev->SendCommand(UMXDevice::UMXCommand::UMX_StartTest, parameters);
++      }
++      catch (const std::exception& e)
++      {
++         if (m_dev->IsLost())
++            throw;
++         Log::Warning(StringExtensions::Build("UMX controller {0} could not start its connect test: {1}", GetName(), e.what()));
++      }
++   }
++
+    Log::Write(StringExtensions::Build("Detected and added UMX Controller Nr. {0} with name {1}", std::to_string(m_number), GetName()));
+    cabinet->GetOutputControllers()->push_back(this);
+ 
+@@ -211,15 +262,6 @@ void UMXController::UpdateCabinetFromConfig(Cabinet* cabinet)
+          lwe->GetOutputs().AddOutput(lweo);
+       }
+    }
+-
+-   if (m_dev->m_testOnConnect != UMXDevice::TestMode::None)
+-   {
+-      std::vector<uint8_t> parameters = {
+-         static_cast<uint8_t>(m_dev->m_testOnConnect),
+-         m_dev->m_testOnConnectDuration,
+-      };
+-      m_dev->SendCommand(UMXDevice::UMXCommand::UMX_StartTest, parameters);
+-   }
+ }
+ 
+ tinyxml2::XMLElement* UMXController::ToXml(tinyxml2::XMLDocument& doc) const
+diff --git a/src/cab/out/adressableledstrip/UMXControllerAutoConfigurator.cpp b/src/cab/out/adressableledstrip/UMXControllerAutoConfigurator.cpp
+index 6ae1dfa..6e37c51 100644
+--- a/src/cab/out/adressableledstrip/UMXControllerAutoConfigurator.cpp
++++ b/src/cab/out/adressableledstrip/UMXControllerAutoConfigurator.cpp
+@@ -4,10 +4,41 @@
+ #include "../OutputControllerList.h"
+ #include "../../../Log.h"
+ #include "../../../general/StringExtensions.h"
++#include <algorithm>
+ 
+ namespace DOF
+ {
+ 
++namespace
++{
++
++// VPE: adds a controller for `device`. A device whose configuration cannot be read (an MX handshake that times out, a
++// connect test that lost the device) is skipped, so the other devices and the later auto-configurators still run: its
++// controller is deleted unless the cabinet holds it already, and the device is let go. Returns false then.
++bool AddController(Cabinet* cabinet, UMXDevice* device)
++{
++   UMXController* umxC = new UMXController();
++   try
++   {
++      umxC->SetNumber(device->UnitNo());
++      umxC->UpdateCabinetFromConfig(cabinet);
++   }
++   catch (const std::exception& e)
++   {
++      Log::Exception(StringExtensions::Build("UMX device {0} could not be configured and is skipped: {1}", device->m_name, e.what()));
++      OutputControllerList* controllers = cabinet->GetOutputControllers();
++      if (std::find(controllers->begin(), controllers->end(), umxC) == controllers->end())
++      {
++         delete umxC;
++         device->Release();
++         return false;
++      }
++   }
++   return true;
++}
++
++}
++
+ std::vector<UMXDevice*> UMXControllerAutoConfigurator::s_devices;
+ bool UMXControllerAutoConfigurator::s_inited = false;
+ Cabinet* UMXControllerAutoConfigurator::s_cabinet = nullptr;
+@@ -27,11 +58,8 @@ void UMXControllerAutoConfigurator::AddUMXDevice(UMXDevice* dev)
     {
-       std::vector<uint8_t> parameters = {
-          static_cast<uint8_t>(m_dev->m_testOnConnect),
+       if (s_inited && s_cabinet != nullptr)
+       {
+-         UMXController* umxC = new UMXController();
+-         umxC->SetNumber(dev->UnitNo());
+-         Log::Instrumentation(
+-            "UMX", StringExtensions::Build("Adding new device {0} & controller {1} to cabinet after UMXControllerAutoConfigurator initialization", dev->m_name, umxC->GetName()));
+-         umxC->UpdateCabinetFromConfig(s_cabinet);
++         Log::Instrumentation("UMX", StringExtensions::Build("Adding new device {0} to cabinet after UMXControllerAutoConfigurator initialization", dev->m_name));
++         AddController(s_cabinet, dev);
+       }
+    }
+    catch (const std::exception& e)
+@@ -70,8 +98,9 @@ void UMXControllerAutoConfigurator::AutoConfig(Cabinet* cabinet)
+          preconfigured.push_back(umxC->GetNumber());
+    }
+ 
+-   for (auto* device : s_devices)
++   for (auto deviceIt = s_devices.begin(); deviceIt != s_devices.end();)
+    {
++      UMXDevice* device = *deviceIt;
+       bool found = false;
+       for (int num : preconfigured)
+       {
+@@ -82,12 +111,14 @@ void UMXControllerAutoConfigurator::AutoConfig(Cabinet* cabinet)
+          }
+       }
+ 
+-      if (!found)
++      // VPE: a device that was let go leaves the list, so the next session does not ask its closed handle again.
++      if (!found && !AddController(cabinet, device))
+       {
+-         UMXController* umxC = new UMXController();
+-         umxC->SetNumber(device->UnitNo());
+-         umxC->UpdateCabinetFromConfig(cabinet);
++         deviceIt = s_devices.erase(deviceIt);
++         delete device;
++         continue;
+       }
++      ++deviceIt;
+    }
+ 
+    s_inited = true;
 diff --git a/src/cab/out/adressableledstrip/UMXDevice.cpp b/src/cab/out/adressableledstrip/UMXDevice.cpp
-index dc50fe2..fafcf27 100644
+index dc50fe2..4626a8e 100644
 --- a/src/cab/out/adressableledstrip/UMXDevice.cpp
 +++ b/src/cab/out/adressableledstrip/UMXDevice.cpp
-@@ -83,7 +83,7 @@ void UMXDevice::ResetDataLines()
+@@ -83,10 +83,10 @@ void UMXDevice::ResetDataLines()
        line.m_oldValues.assign(line.m_nbValues, 255);
  }
  
 -void UMXDevice::UpdateOutputs(const std::vector<uint8_t>& outputValues)
-+void UMXDevice::UpdateOutputs(const std::vector<uint8_t>& outputValues, bool full)
++bool UMXDevice::UpdateOutputs(const std::vector<uint8_t>& outputValues, bool full, const std::function<bool()>& cancel)
  {
     if (!m_enabled)
-       return;
+-      return;
++      return true;
+ 
+    for (auto& line : m_dataLines)
+    {
 @@ -115,7 +115,7 @@ void UMXDevice::UpdateOutputs(const std::vector<uint8_t>& outputValues)
        auto& line = m_dataLines[numLine];
        if (line.m_nbLeds > 0)
@@ -1390,8 +1671,14 @@ index dc50fe2..fafcf27 100644
           }
        }
     }
-@@ -153,6 +152,12 @@ void UMXDevice::UpdateOutputs(const std::vector<uint8_t>& outputValues)
-       SendCommand(UMXCommand::UMX_SendStripsData, buffer);
+@@ -150,9 +149,18 @@ void UMXDevice::UpdateOutputs(const std::vector<uint8_t>& outputValues)
+    {
+       std::vector<uint8_t> buffer = { nbChangedLines };
+       buffer.insert(buffer.end(), sendBuffer.begin(), sendBuffer.end());
+-      SendCommand(UMXCommand::UMX_SendStripsData, buffer);
++      // VPE: the device asks `cancel` before each of its writes, so a latch holds back the rest of the frame.
++      if (!SendCommand(UMXCommand::UMX_SendStripsData, buffer, cancel))
++         return false;
        WaitAck(static_cast<uint8_t>(UMXCommand::UMX_SendStripsData));
     }
 +   // VPE: the lines remember what the device got, after it got it (SendCommand throws otherwise).
@@ -1400,25 +1687,51 @@ index dc50fe2..fafcf27 100644
 +      if (line.m_nbLeds > 0)
 +         line.m_oldValues = line.m_values;
 +   }
++   return true;
  }
  
  std::vector<uint8_t> UMXDevice::CompressDataLineValues(const std::vector<uint8_t>& values)
 diff --git a/src/cab/out/adressableledstrip/UMXDevice.h b/src/cab/out/adressableledstrip/UMXDevice.h
-index 81af672..51be088 100644
+index 81af672..47a30ac 100644
 --- a/src/cab/out/adressableledstrip/UMXDevice.h
 +++ b/src/cab/out/adressableledstrip/UMXDevice.h
-@@ -97,7 +97,8 @@ public:
+@@ -3,6 +3,7 @@
+ #include <string>
+ #include <vector>
+ #include <cstdint>
++#include <functional>
+ #include "../../toys/layer/RGBOrderEnum.h"
+ #include "../../toys/layer/StripArrangementEnum.h"
+ #include "../../../general/Curve.h"
+@@ -97,11 +98,25 @@ public:
     void ComputeNumOutputs();
     void CreateDataLines();
     void ResetDataLines();
 -   void UpdateOutputs(const std::vector<uint8_t>& outputValues);
 +   // VPE: `full` sends every data line, whatever was sent before. Throws if the device did not get the data.
-+   void UpdateOutputs(const std::vector<uint8_t>& outputValues, bool full = false);
++   // Returns false if `cancel` said so before the data was all out; the device may then have part of the frame.
++   bool UpdateOutputs(const std::vector<uint8_t>& outputValues, bool full = false, const std::function<bool()>& cancel = nullptr);
  
     virtual void Initialize() = 0;
     virtual void SendCommand(UMXCommand command, const std::vector<uint8_t>& parameters = { }) = 0;
++   // VPE: SendCommand that asks `cancel` before each write to the device and stops when it says so; returns false then.
++   virtual bool SendCommand(UMXCommand command, const std::vector<uint8_t>& parameters, const std::function<bool()>& cancel)
++   {
++      if (cancel && cancel())
++         return false;
++      SendCommand(command, parameters);
++      return true;
++   }
+    virtual void WaitAck(uint8_t command) = 0;
++   // VPE: whether the device failed and cannot be opened again during the session.
++   virtual bool IsLost() const { return false; }
++   // VPE: lets go of a device no controller uses, such as one whose configuration could not be read.
++   virtual void Release() { }
+ 
+    std::vector<LedStripDescriptor> m_ledStrips;
+    std::vector<DataLine> m_dataLines;
 diff --git a/src/cab/out/adressableledstrip/WemosD1StripController.cpp b/src/cab/out/adressableledstrip/WemosD1StripController.cpp
-index 1832b60..417b43c 100644
+index 1832b60..a3d04f4 100644
 --- a/src/cab/out/adressableledstrip/WemosD1StripController.cpp
 +++ b/src/cab/out/adressableledstrip/WemosD1StripController.cpp
 @@ -1,4 +1,5 @@
@@ -1504,7 +1817,7 @@ index d76a7d8..1bebe23 100644
     virtual void DisconnectFromController() override;
  
 diff --git a/src/cab/out/dmx/ArtNet.cpp b/src/cab/out/dmx/ArtNet.cpp
-index ba74e6e..bdfc821 100644
+index 44d0e43..ad4faf3 100644
 --- a/src/cab/out/dmx/ArtNet.cpp
 +++ b/src/cab/out/dmx/ArtNet.cpp
 @@ -28,7 +28,8 @@ void ArtNet::UpdateOutputs(const std::vector<uint8_t>& outputValues)
@@ -1517,48 +1830,51 @@ index ba74e6e..bdfc821 100644
           }
           else
           {
-@@ -61,6 +62,8 @@ void ArtNet::ConnectToController()
-       try
-       {
-          m_engine = Engine::GetInstance();
-+         if (!m_engine->Reopen())
-+            throw std::runtime_error("the Art-Net socket could not be opened");
-          std::vector<uint8_t> zeroData(DMX_CHANNELS, 0);
-          m_engine->SendDMX(m_broadcastAddress, m_universe, zeroData, DMX_CHANNELS);
-       }
-diff --git a/src/cab/out/dmx/artnetengine/Engine.cpp b/src/cab/out/dmx/artnetengine/Engine.cpp
-index c390c73..79733ce 100644
---- a/src/cab/out/dmx/artnetengine/Engine.cpp
-+++ b/src/cab/out/dmx/artnetengine/Engine.cpp
-@@ -63,6 +63,8 @@ Engine::~Engine()
- bool Engine::InitializeSocket()
- {
-    std::lock_guard<std::mutex> lock(m_udpMutex);
-+   if (m_socketInitialized && m_socket >= 0)
-+      return true;
+@@ -79,21 +80,17 @@ void ArtNet::ConnectToController()
  
-    try
+ void ArtNet::DisconnectFromController()
+ {
+-   try
+-   {
+-      if (m_engine != nullptr)
+-      {
+-         std::vector<uint8_t> zeroData(DMX_CHANNELS, 0);
+-         m_engine->SendDMX(m_broadcastAddress, m_universe, zeroData, DMX_CHANNELS);
+-      }
+-   }
+-   catch (...)
+-   {
+-   }
+-
+-   if (m_engine != nullptr)
++   // VPE: a blackout that did not go out is reported. For a controller DOF never used, it is the only one sent at the
++   // end of the session.
++   Engine* engine = m_engine;
++   m_engine = nullptr;
++   if (engine != nullptr)
     {
-@@ -129,16 +131,25 @@ void Engine::CloseSocket()
+-      m_engine = nullptr;
++      std::vector<uint8_t> zeroData(DMX_CHANNELS, 0);
++      if (!engine->SendDMX(m_broadcastAddress, m_universe, zeroData, DMX_CHANNELS))
++         throw std::runtime_error(StringExtensions::Build(
++            "{0} {1} (Universe: {2}, Broadcast Address: {3}) could not send its blackout", { GetXmlElementName(), GetName(), std::to_string(m_universe), m_broadcastAddress }));
++      m_disconnectSentZeros = true;
     }
  }
  
-+bool Engine::Reopen()
-+{
-+   {
-+      std::lock_guard<std::mutex> lock(m_udpMutex);
-+      m_sendExceptionCount = 0;
-+   }
-+   return InitializeSocket();
-+}
-+
- uint8_t Engine::LoByte(int value) const { return static_cast<uint8_t>(value & 0xFF); }
+diff --git a/src/cab/out/dmx/artnetengine/Engine.cpp b/src/cab/out/dmx/artnetengine/Engine.cpp
+index d95af44..302baa3 100644
+--- a/src/cab/out/dmx/artnetengine/Engine.cpp
++++ b/src/cab/out/dmx/artnetengine/Engine.cpp
+@@ -141,14 +141,14 @@ uint8_t Engine::LoByte(int value) const { return static_cast<uint8_t>(value & 0x
  
  uint8_t Engine::HiByte(int value) const { return static_cast<uint8_t>((value >> 8) & 0xFF); }
  
 -void Engine::SendDMX(const std::string& broadcastAddress, short universe, const std::vector<uint8_t>& data, int dataLength)
 +bool Engine::SendDMX(const std::string& broadcastAddress, short universe, const std::vector<uint8_t>& data, int dataLength)
  {
+    std::lock_guard<std::mutex> lock(m_udpMutex);
+ 
     if (!m_socketInitialized || m_socket < 0)
     {
        Log::Exception("ArtNet engine socket not initialized");
@@ -1567,7 +1883,7 @@ index c390c73..79733ce 100644
     }
  
     std::vector<uint8_t> packet(0x12 + dataLength);
-@@ -167,7 +178,7 @@ void Engine::SendDMX(const std::string& broadcastAddress, short universe, const
+@@ -177,7 +177,7 @@ void Engine::SendDMX(const std::string& broadcastAddress, short universe, const
     catch (const std::exception& e)
     {
        Log::Exception(StringExtensions::Build("Exception occurred copying DMX data in ArtNet Engine: {0}", e.what()));
@@ -1575,8 +1891,8 @@ index c390c73..79733ce 100644
 +      return false;
     }
  
-    std::lock_guard<std::mutex> lock(m_udpMutex);
-@@ -190,7 +201,7 @@ void Engine::SendDMX(const std::string& broadcastAddress, short universe, const
+    if (m_socketInitialized && m_socket >= 0)
+@@ -198,7 +198,7 @@ void Engine::SendDMX(const std::string& broadcastAddress, short universe, const
              if (inet_pton(AF_INET, broadcastAddress.c_str(), &addr.sin_addr) <= 0)
              {
                 Log::Exception(StringExtensions::Build("Invalid broadcast address for ArtNet: {0}", broadcastAddress));
@@ -1585,7 +1901,7 @@ index c390c73..79733ce 100644
              }
           }
  
-@@ -212,6 +223,7 @@ void Engine::SendDMX(const std::string& broadcastAddress, short universe, const
+@@ -220,6 +220,7 @@ void Engine::SendDMX(const std::string& broadcastAddress, short universe, const
           }
  
           m_sendExceptionCount = 0;
@@ -1593,7 +1909,7 @@ index c390c73..79733ce 100644
        }
        catch (const std::exception& e)
        {
-@@ -229,6 +241,7 @@ void Engine::SendDMX(const std::string& broadcastAddress, short universe, const
+@@ -237,6 +238,7 @@ void Engine::SendDMX(const std::string& broadcastAddress, short universe, const
           }
        }
     }
@@ -1603,26 +1919,33 @@ index c390c73..79733ce 100644
  }
 \ No newline at end of file
 diff --git a/src/cab/out/dmx/artnetengine/Engine.h b/src/cab/out/dmx/artnetengine/Engine.h
-index 8c01721..a3bae1a 100644
+index 84b1c02..006cb28 100644
 --- a/src/cab/out/dmx/artnetengine/Engine.h
 +++ b/src/cab/out/dmx/artnetengine/Engine.h
-@@ -13,7 +13,10 @@ class Engine
+@@ -13,7 +13,8 @@ class Engine
  public:
     static Engine* GetInstance();
  
 -   void SendDMX(const std::string& broadcastAddress, short universe, const std::vector<uint8_t>& data, int dataLength);
-+   // Returns false if the packet was not sent.
++   // VPE: returns false if the packet was not sent.
 +   bool SendDMX(const std::string& broadcastAddress, short universe, const std::vector<uint8_t>& data, int dataLength);
-+   // VPE: the engine outlives sessions; reopens the socket a previous session closed after repeated failures.
-+   bool Reopen();
+    bool Reopen();
  
  private:
-    Engine();
 diff --git a/src/cab/out/dudescab/DudesCab.cpp b/src/cab/out/dudescab/DudesCab.cpp
-index 77e90f9..579936b 100644
+index 77e90f9..d10030d 100644
 --- a/src/cab/out/dudescab/DudesCab.cpp
 +++ b/src/cab/out/dudescab/DudesCab.cpp
-@@ -88,16 +88,23 @@ void DudesCab::Init(Cabinet* cabinet)
+@@ -25,6 +25,8 @@ namespace DOF
+ {
+ 
+ std::vector<DudesCab::Device*> DudesCab::s_devices;
++std::vector<DudesCab::Device*> DudesCab::s_mxDevices;
++bool DudesCab::s_discovered = false;
+ 
+ const DudesCab::Device::Version DudesCab::Device::s_minimalMxVersion(1, 9, 0);
+ const DudesCab::Device::Version DudesCab::Device::s_newProtocolVersion(1, 9, 0);
+@@ -88,16 +90,23 @@ void DudesCab::Init(Cabinet* cabinet)
  
  void DudesCab::Finish() { OutputControllerFlexCompleteBase::Finish(); }
  
@@ -1649,7 +1972,7 @@ index 77e90f9..579936b 100644
     {
        m_outputBuffer.clear();
        m_outputBuffer.push_back(0);
-@@ -110,7 +117,7 @@ void DudesCab::UpdateOutputs(const std::vector<uint8_t>& newOutputValues)
+@@ -110,7 +119,7 @@ void DudesCab::UpdateOutputs(const std::vector<uint8_t>& newOutputValues)
  
        for (int numDofOutput = 0; numDofOutput < static_cast<int>(newOutputValues.size()); numDofOutput++)
        {
@@ -1658,7 +1981,7 @@ index 77e90f9..579936b 100644
           {
              uint8_t extNum = static_cast<uint8_t>(numDofOutput / m_dev->m_pwmMaxOutputsPerExtension);
              uint8_t outputNum = static_cast<uint8_t>(numDofOutput % m_dev->m_pwmMaxOutputsPerExtension);
-@@ -163,8 +170,15 @@ void DudesCab::UpdateOutputs(const std::vector<uint8_t>& newOutputValues)
+@@ -163,8 +172,15 @@ void DudesCab::UpdateOutputs(const std::vector<uint8_t>& newOutputValues)
        Instrumentation(StringExtensions::Build("{0} Dof Values to send to Dude's cab", std::to_string(nbValuesToSend)));
  
        m_dev->SendCommand(Device::HIDReportType::RT_PWM_OUTPUTS, m_outputBuffer);
@@ -1674,7 +1997,7 @@ index 77e90f9..579936b 100644
     }
  }
  
-@@ -178,7 +192,28 @@ void DudesCab::UpdateDelay()
+@@ -178,21 +194,53 @@ void DudesCab::UpdateDelay()
     m_lastUpdate = std::chrono::steady_clock::now();
  }
  
@@ -1687,32 +2010,154 @@ index 77e90f9..579936b 100644
 +   auto it = std::find_if(devices.begin(), devices.end(), [this](Device* d) { return d->UnitNo() == m_number; });
 +   if (it == devices.end())
 +      return;
-+   if ((*it)->LastWriteFailed() && !(*it)->Reopen())
++   // A blackout that went through on the old handle does not make it usable again: only a reopen does.
++   if ((*it)->NeedsReopen() && !(*it)->Reopen())
 +   {
 +      m_dev = nullptr;
 +      m_cacheInvalid = true;
++      // A board without a serial number is not opened again during the session: the updater gives up on it instead of
++      // trying again on every pass.
++      if (!(*it)->CanReopen())
++         throw std::runtime_error(StringExtensions::Build("Dude's Cab {0} has no serial number and cannot be opened again", GetName()));
 +      return;
 +   }
-+   if (m_dev != *it)
-+   {
-+      m_dev = *it;
++   m_dev = *it;
++   // Setting up the outputs again takes their values from the Output objects, which values set in bulk (SetValues) are
++   // not in: a reconnect keeps the requested values.
++   if (GetNumberOfOutputs() != m_dev->NumOutputs())
 +      SetNumberOfOutputs(m_dev->NumOutputs());
-+   }
 +   m_oldOutputValues.assign(GetNumberOfOutputs(), 0);
 +   m_cacheInvalid = true;
 +}
  
  void DudesCab::DisconnectFromController()
  {
-@@ -186,6 +221,7 @@ void DudesCab::DisconnectFromController()
+    if (m_inUseState == InUseState::Running && m_dev)
     {
-       m_dev->AllOff();
+-      m_dev->AllOff();
++      // VPE: a blackout that got to the board counts as the final update.
++      if (m_dev->AllOff())
++         m_disconnectSentZeros = true;
        m_dev = nullptr;
 +      m_cacheInvalid = true;
     }
  }
  
-@@ -402,6 +438,81 @@ DudesCab::Device::~Device()
+ std::vector<DudesCab::Device*> DudesCab::AllDevices()
+ {
+-   if (s_devices.empty())
++   if (!s_discovered)
++   {
+       s_devices = FindDevices();
++      s_discovered = true;
++   }
+    return s_devices;
+ }
+ 
+@@ -200,13 +248,20 @@ void DudesCab::ClearDevices()
+ {
+    for (Device* device : s_devices)
+       delete device;
++   for (Device* device : s_mxDevices)
++      delete device;
+ 
+    s_devices.clear();
++   s_mxDevices.clear();
++   s_discovered = false;
+ }
+ 
+ std::vector<DudesCab::Device*> DudesCab::FindDevices()
+ {
+    UMXControllerAutoConfigurator::RemoveAllUMXDevices();
++   for (Device* device : s_mxDevices)
++      delete device;
++   s_mxDevices.clear();
+ 
+    std::vector<Device*> dudedevices;
+    std::vector<Device*> devices;
+@@ -286,21 +341,36 @@ std::vector<DudesCab::Device*> DudesCab::FindDevices()
+ 
+             if (!alreadyEnumerated)
+             {
+-               Device* newDevice = new Device(deviceRid, cur_dev->path, productName, serialNumber, cur_dev->vendor_id, cur_dev->product_id, cur_dev->release_number);
+-               dudedevices.push_back(newDevice);
+-
+-               if (deviceRid == Device::RIDType::RIDOutputs)
++               // VPE: a device that does not answer is skipped instead of ending the discovery.
++               Device* newDevice = nullptr;
++               try
++               {
++                  newDevice = new Device(deviceRid, cur_dev->path, productName, serialNumber, cur_dev->vendor_id, cur_dev->product_id, cur_dev->release_number);
++                  if (deviceRid == Device::RIDType::RIDOutputs)
++                     newDevice->ReadPwmOutputsConfig();
++               }
++               catch (const std::exception& e)
+                {
+-                  newDevice->ReadPwmOutputsConfig();
+-                  devices.push_back(newDevice);
++                  Log::Exception(StringExtensions::Build("Dude's Cab {0} did not answer and is skipped: {1}", productName, e.what()));
++                  delete newDevice;
++                  newDevice = nullptr;
+                }
+-               else if (deviceRid == Device::RIDType::RIDOutputsMx)
++
++               if (newDevice)
+                {
+-                  if (newDevice->SupportMx())
++                  dudedevices.push_back(newDevice);
++
++                  if (deviceRid == Device::RIDType::RIDOutputs)
++                     devices.push_back(newDevice);
++                  else if (deviceRid == Device::RIDType::RIDOutputsMx)
+                   {
+-                     UMXDudesCabDevice* dudeUMX = new UMXDudesCabDevice();
+-                     dudeUMX->SetDevice(newDevice);
+-                     UMXControllerAutoConfigurator::AddUMXDevice(dudeUMX);
++                     s_mxDevices.push_back(newDevice);
++                     if (newDevice->SupportMx())
++                     {
++                        UMXDudesCabDevice* dudeUMX = new UMXDudesCabDevice();
++                        dudeUMX->SetDevice(newDevice);
++                        UMXControllerAutoConfigurator::AddUMXDevice(dudeUMX);
++                     }
+                   }
+                }
+             }
+@@ -331,8 +401,24 @@ DudesCab::Device::Device(RIDType rid, const std::string& path, const std::string
+    , m_hidDevice(nullptr)
+ {
+    m_hidDevice = hid_open_path(path.c_str());
++   // VPE: an interface that went away or is not accessible is not a device: discovery skips it.
+    if (!m_hidDevice)
+-      return;
++      throw std::runtime_error(StringExtensions::Build("could not open {0}", path));
++
++   // VPE: a handshake that throws leaves no destructor to close the handle.
++   struct CloseOnThrow
++   {
++      hid_device*& handle;
++      bool armed;
++      ~CloseOnThrow()
++      {
++         if (armed && handle)
++         {
++            hid_close(handle);
++            handle = nullptr;
++         }
++      }
++   } closeOnThrow { m_hidDevice, true };
+ 
+    std::vector<uint8_t> answer;
+ 
+@@ -394,6 +480,7 @@ DudesCab::Device::Device(RIDType rid, const std::string& path, const std::string
+             m_configVersion = info[5];
+       }
+    }
++   closeOnThrow.armed = false;
+ }
+ 
+ DudesCab::Device::~Device()
+@@ -402,6 +489,84 @@ DudesCab::Device::~Device()
        hid_close(m_hidDevice);
  }
  
@@ -1745,15 +2190,17 @@ index 77e90f9..579936b 100644
 +// chose. Until that interface opens, the device stays failed and has no handle.
 +bool DudesCab::Device::Reopen()
 +{
++   m_lastWriteFailed = true;
++   m_needsReopen = true;
++   // Without a serial number nothing tells this board from another one plugged in its place, so it is not reopened
++   // during the session; it stays failed until the next one enumerates the devices again. Its handle is kept, so the
++   // blackout at the end of the session can still try it.
++   if (!CanReopen())
++      return false;
++
 +   if (m_hidDevice)
 +      hid_close(m_hidDevice);
 +   m_hidDevice = nullptr;
-+   m_lastWriteFailed = true;
-+
-+   // Without a serial number nothing tells this board from another one plugged in its place, so it is not reopened
-+   // during the session; it stays failed until the next one enumerates the devices again.
-+   if (m_serial.empty() || m_serial == "<not available>")
-+      return false;
 +   const char* candidate = nullptr;
 +   struct hid_device_info* devs = hid_enumerate(m_vendorID, m_productID);
 +   for (struct hid_device_info* cur = devs; cur; cur = cur->next)
@@ -1788,13 +2235,58 @@ index 77e90f9..579936b 100644
 +   if (!m_hidDevice)
 +      return false;
 +   m_lastWriteFailed = false;
++   m_needsReopen = false;
 +   return true;
 +}
 +
  std::string DudesCab::Device::ToString() const { return StringExtensions::Build("{0} (name: {1} unit:{2})", m_devicename, m_name, std::to_string(m_unitNo)); }
  
  void DudesCab::Device::ReadPwmOutputsConfig()
-@@ -528,8 +639,9 @@ bool DudesCab::Device::WriteUSB(const std::vector<uint8_t>& data)
+@@ -466,7 +631,19 @@ bool DudesCab::Device::HasOutputEnabled(uint8_t extNum, uint8_t outputNum)
+ 
+ bool DudesCab::Device::SupportMx() { return m_firmwareVersion >= s_minimalMxVersion; }
+ 
+-void DudesCab::Device::AllOff() { SendCommand(HIDReportType::RT_PWM_ALLOFF); }
++bool DudesCab::Device::AllOff()
++{
++   SendCommand(HIDReportType::RT_PWM_ALLOFF);
++   return !m_lastWriteFailed;
++}
++
++void DudesCab::Device::Close()
++{
++   if (m_hidDevice)
++      hid_close(m_hidDevice);
++   m_hidDevice = nullptr;
++   m_needsReopen = true;
++}
+ 
+ std::vector<uint8_t> DudesCab::Device::ReadUSB(uint8_t command)
+ {
+@@ -475,7 +652,12 @@ std::vector<uint8_t> DudesCab::Device::ReadUSB(uint8_t command)
+    try
+    {
+       while (answer.size() < 2 || answer[1] != remapCommand)
++      {
+          answer = ReadUSB();
++         // VPE: a read that timed out returns nothing; without this, a device that does not answer is asked forever.
++         if (answer.empty())
++            throw std::runtime_error("timed out");
++      }
+    }
+    catch (const std::exception& ex)
+    {
+@@ -488,6 +670,9 @@ std::vector<uint8_t> DudesCab::Device::ReadUSB(uint8_t command)
+ std::vector<uint8_t> DudesCab::Device::ReadUSB()
+ {
+    std::vector<uint8_t> incomingData;
++   // VPE: a device that is not open has nothing to read.
++   if (!m_hidDevice)
++      return incomingData;
+    uint8_t receivedCommand = 0;
+    auto startRead = std::chrono::steady_clock::now();
+ 
+@@ -528,8 +713,9 @@ bool DudesCab::Device::WriteUSB(const std::vector<uint8_t>& data)
  {
     if (m_hidDevice && !data.empty())
     {
@@ -1805,48 +2297,109 @@ index 77e90f9..579936b 100644
     }
     return false;
  }
-@@ -549,8 +661,10 @@ void DudesCab::Device::SendCommand(HIDReportTypeMx command, const std::vector<ui
+@@ -547,10 +733,22 @@ void DudesCab::Device::SendCommand(HIDReportTypeMx command, const std::vector<ui
+       SendCommand(m_deviceRid, static_cast<uint8_t>(command), parameters);
+ }
  
- void DudesCab::Device::SendCommand(RIDType rid, uint8_t command, const std::vector<uint8_t>& parameters)
+-void DudesCab::Device::SendCommand(RIDType rid, uint8_t command, const std::vector<uint8_t>& parameters)
++bool DudesCab::Device::SendCommand(HIDReportTypeMx command, const std::vector<uint8_t>& parameters, const std::function<bool()>& cancel)
  {
++   if (!SupportMx())
++      return true;
++   return SendCommand(m_deviceRid, static_cast<uint8_t>(command), parameters, cancel);
++}
++
++bool DudesCab::Device::SendCommand(RIDType rid, uint8_t command, const std::vector<uint8_t>& parameters, const std::function<bool()>& cancel)
++{
 +   m_lastWriteFailed = true;
     if (!m_hidDevice)
-       return;
+-      return;
++   {
++      m_needsReopen = true;
++      return true;
++   }
 +   m_lastWriteFailed = false;
  
     if (rid == RIDType::RIDOutputs)
        Log::Instrumentation("DudesCab", StringExtensions::Build("DudesCab SendCommand: {0}", std::to_string(static_cast<int>(command))));
-@@ -581,7 +695,8 @@ void DudesCab::Device::SendCommand(RIDType rid, uint8_t command, const std::vect
+@@ -581,8 +779,16 @@ void DudesCab::Device::SendCommand(RIDType rid, uint8_t command, const std::vect
           sendData.insert(sendData.end(), data.begin() + startPos, data.begin() + startPos + toSend);
        }
  
 -      WriteUSB(sendData);
++      // VPE: a latch that came during the earlier reports holds back the rest of the command.
++      if (cancel && cancel())
++         return false;
 +      if (!WriteUSB(sendData))
++      {
 +         m_lastWriteFailed = true;
++         m_needsReopen = true;
++      }
     }
++   return true;
  }
  
+ DudesCab::Device::HIDCommonReportType DudesCab::Device::RemapCommonCommand(HIDCommonReportType command)
 diff --git a/src/cab/out/dudescab/DudesCab.h b/src/cab/out/dudescab/DudesCab.h
-index b2b1f6c..c76403e 100644
+index b2b1f6c..6514666 100644
 --- a/src/cab/out/dudescab/DudesCab.h
 +++ b/src/cab/out/dudescab/DudesCab.h
-@@ -162,6 +162,15 @@ public:
-       void SendCommand(RIDType rid, uint8_t command, const std::vector<uint8_t>& parameters = { });
+@@ -5,6 +5,7 @@
+ #include <vector>
+ #include <mutex>
+ #include <chrono>
++#include <functional>
+ 
+ #include <hidapi/hidapi.h>
+ 
+@@ -129,7 +130,10 @@ public:
+       int NumOutputs() const { return m_numOutputs; }
+       const std::string& GetSerial() const { return m_serial; }
+ 
+-      void AllOff();
++      // VPE: returns whether the command got to the board.
++      bool AllOff();
++      // VPE: closes the HID handle of a board that is not used.
++      void Close();
+       void ReadPwmOutputsConfig();
+       bool HasOutputEnabled(uint8_t extNum, uint8_t outputNum);
+       bool SupportMx();
+@@ -137,6 +141,8 @@ public:
+       void SendCommand(HIDCommonReportType command, const std::vector<uint8_t>& parameters = { });
+       void SendCommand(HIDReportType command, const std::vector<uint8_t>& parameters = { });
+       void SendCommand(HIDReportTypeMx command, const std::vector<uint8_t>& parameters = { });
++      // VPE: asks `cancel` before each report it writes and stops when it says so; returns false then.
++      bool SendCommand(HIDReportTypeMx command, const std::vector<uint8_t>& parameters, const std::function<bool()>& cancel);
+ 
+       std::vector<uint8_t> ReadUSB(uint8_t command);
+ 
+@@ -159,9 +165,24 @@ public:
+       uint8_t m_configVersion;
+ 
+    private:
+-      void SendCommand(RIDType rid, uint8_t command, const std::vector<uint8_t>& parameters = { });
++      bool SendCommand(RIDType rid, uint8_t command, const std::vector<uint8_t>& parameters = { }, const std::function<bool()>& cancel = nullptr);
        std::vector<uint8_t> ReadUSB();
        bool WriteUSB(const std::vector<uint8_t>& data);
 +      bool m_lastWriteFailed = false;
++      // VPE: a write failed since the device was opened: only Reopen clears it, not a later write that went through.
++      bool m_needsReopen = false;
 +
 +   public:
 +      // VPE: whether a part of the last command could not be written.
 +      bool LastWriteFailed() const { return m_lastWriteFailed; }
++      // VPE: whether a write failed since the device was last opened, so the handle has to be opened again.
++      bool NeedsReopen() const { return m_needsReopen; }
 +      // VPE: opens the device again after a transport failure, such as after it was unplugged and plugged in again.
 +      bool Reopen();
++      // VPE: whether Reopen can find this board again, which takes a serial number.
++      bool CanReopen() const { return !m_serial.empty() && m_serial != "<not available>"; }
 +
 +   private:
  
        HIDCommonReportType RemapCommonCommand(HIDCommonReportType command);
        HIDReportType RemapPwmCommand(HIDReportType command);
-@@ -197,6 +206,8 @@ private:
+@@ -197,6 +218,8 @@ private:
     bool m_minCommandIntervalMsSet;
  
     Device* m_dev;
@@ -1855,22 +2408,99 @@ index b2b1f6c..c76403e 100644
     std::vector<uint8_t> m_oldOutputValues;
     std::vector<uint8_t> m_outputBuffer;
  
+@@ -206,6 +229,11 @@ private:
+ 
+    static std::vector<Device*> FindDevices();
+    static std::vector<Device*> s_devices;
++   // VPE: the MX interfaces, which the UMX devices use, are owned here too, and the devices are listed once until
++   // ClearDevices: a cabinet with an MX interface but no PWM one would otherwise list them again on every lookup and
++   // delete the UMX devices its controllers still use.
++   static std::vector<Device*> s_mxDevices;
++   static bool s_discovered;
+ };
+ 
+ }
+diff --git a/src/cab/out/dudescab/DudesCabAutoConfigurator.cpp b/src/cab/out/dudescab/DudesCabAutoConfigurator.cpp
+index ecf905a..84147f9 100644
+--- a/src/cab/out/dudescab/DudesCabAutoConfigurator.cpp
++++ b/src/cab/out/dudescab/DudesCabAutoConfigurator.cpp
+@@ -18,7 +18,20 @@ void DudesCabAutoConfigurator::AutoConfig(Cabinet* cabinet)
+ 
+    for (DudesCab::Device* device : devices)
+    {
+-      if (device->UnitNo() >= 1 && device->UnitNo() <= 5)
++      // VPE: a controller binds by unit number, so a unit any Dude's Cab controller of the cabinet uses is skipped, as in
++      // C#: two updaters on one board would overwrite each other's frames.
++      bool preconfigured = false;
++      for (IOutputController* controller : *cabinet->GetOutputControllers())
++      {
++         DudesCab* existing = dynamic_cast<DudesCab*>(controller);
++         if (existing && existing->GetNumber() == device->UnitNo())
++         {
++            preconfigured = true;
++            break;
++         }
++      }
++
++      if (!preconfigured && device->UnitNo() >= 1 && device->UnitNo() <= 5)
+       {
+          std::string controllerName = StringExtensions::Build("DudesCab Controller {0:00}", std::to_string(device->UnitNo()));
+ 
 diff --git a/src/cab/out/dudescab/UMXDudesCabDevice.cpp b/src/cab/out/dudescab/UMXDudesCabDevice.cpp
-index 7bd8055..d2ce82b 100644
+index 7bd8055..3dc6c35 100644
 --- a/src/cab/out/dudescab/UMXDudesCabDevice.cpp
 +++ b/src/cab/out/dudescab/UMXDudesCabDevice.cpp
-@@ -113,6 +113,9 @@ void UMXDudesCabDevice::SendCommand(UMXCommand command, const std::vector<uint8_
+@@ -109,14 +109,31 @@ void UMXDudesCabDevice::Initialize()
+    }
+ }
+ 
+-void UMXDudesCabDevice::SendCommand(UMXCommand command, const std::vector<uint8_t>& parameters)
++void UMXDudesCabDevice::SendCommand(UMXCommand command, const std::vector<uint8_t>& parameters) { SendCommand(command, parameters, nullptr); }
++
++bool UMXDudesCabDevice::SendCommand(UMXCommand command, const std::vector<uint8_t>& parameters, const std::function<bool()>& cancel)
  {
++   // VPE: a retry after a failed write goes to the device found again, not to the stale handle.
++   if (m_device->NeedsReopen())
++      m_device->Reopen();
     auto dudeCommand = UMXToDudeCommand(command);
-    m_device->SendCommand(dudeCommand, parameters);
+-   m_device->SendCommand(dudeCommand, parameters);
++   bool sent = m_device->SendCommand(dudeCommand, parameters, cancel);
 +   // VPE: a command that did not get to the device is an error.
 +   if (m_device->LastWriteFailed())
 +      throw std::runtime_error(StringExtensions::Build("Sending UMX command {0} failed", std::to_string(static_cast<int>(command))));
++   return sent;
  }
  
  void UMXDudesCabDevice::WaitAck(uint8_t command) { }
+ 
++bool UMXDudesCabDevice::IsLost() const { return m_device && m_device->NeedsReopen() && !m_device->CanReopen(); }
++
++void UMXDudesCabDevice::Release()
++{
++   if (m_device)
++      m_device->Close();
++}
++
+ DudesCab::Device::HIDReportTypeMx UMXDudesCabDevice::UMXToDudeCommand(UMXCommand command)
+ {
+    switch (command)
+diff --git a/src/cab/out/dudescab/UMXDudesCabDevice.h b/src/cab/out/dudescab/UMXDudesCabDevice.h
+index f981906..6f13772 100644
+--- a/src/cab/out/dudescab/UMXDudesCabDevice.h
++++ b/src/cab/out/dudescab/UMXDudesCabDevice.h
+@@ -16,7 +16,10 @@ public:
+ 
+    void Initialize() override;
+    void SendCommand(UMXCommand command, const std::vector<uint8_t>& parameters = { }) override;
++   bool SendCommand(UMXCommand command, const std::vector<uint8_t>& parameters, const std::function<bool()>& cancel) override;
+    void WaitAck(uint8_t command) override;
++   bool IsLost() const override;
++   void Release() override;
+ 
+    DudesCab::Device* GetDevice() const { return m_device; }
+    void SetDevice(DudesCab::Device* device) { m_device = device; }
 diff --git a/src/cab/out/ftdichip/FT245RBitbangController.cpp b/src/cab/out/ftdichip/FT245RBitbangController.cpp
-index 29f2e7e..b8ab01a 100644
+index d698a04..2215df1 100644
 --- a/src/cab/out/ftdichip/FT245RBitbangController.cpp
 +++ b/src/cab/out/ftdichip/FT245RBitbangController.cpp
 @@ -7,6 +7,7 @@
@@ -1912,7 +2542,7 @@ index 29f2e7e..b8ab01a 100644
  }
  
  void FT245RBitbangController::Update()
-@@ -177,10 +189,12 @@ void FT245RBitbangController::UpdaterThreadSignal()
+@@ -185,10 +197,12 @@ void FT245RBitbangController::UpdaterThreadSignal()
  
  void FT245RBitbangController::UpdaterThreadDoIt()
  {
@@ -1925,10 +2555,15 @@ index 29f2e7e..b8ab01a 100644
        m_updaterThreadFinished = true;
        return;
     }
-@@ -193,17 +207,23 @@ void FT245RBitbangController::UpdaterThreadDoIt()
+@@ -200,18 +214,27 @@ void FT245RBitbangController::UpdaterThreadDoIt()
+    catch (const std::exception&)
     {
        Log::Exception(StringExtensions::Build("Could not send initial update to FTDI chip {0}. Updater thread will terminate.", m_serialNumber));
-       Disconnect();
+-      Disconnect();
++      // VPE: Disconnect tries to turn the outputs off once more; when that fails too, Finish reports it.
++      std::string error;
++      if (!Disconnect(&error))
++         m_finishError = StringExtensions::Build("FT245RBitbangController {0} could not turn its outputs off: {1}", GetName(), error);
 +      gateUnit->Die();
        m_updaterThreadFinished = true;
        return;
@@ -1950,7 +2585,7 @@ index 29f2e7e..b8ab01a 100644
        }
        catch (const std::exception& e)
        {
-@@ -225,6 +245,7 @@ void FT245RBitbangController::UpdaterThreadDoIt()
+@@ -233,6 +256,7 @@ void FT245RBitbangController::UpdaterThreadDoIt()
           catch (const std::exception& ec)
           {
              Log::Exception(StringExtensions::Build("Could not send update to FTDI chip {0}. Tried to reconnect to device but failed. Updater thread will terminate.", m_serialNumber));
@@ -1958,7 +2593,7 @@ index 29f2e7e..b8ab01a 100644
              break;
           }
  
-@@ -232,18 +253,24 @@ void FT245RBitbangController::UpdaterThreadDoIt()
+@@ -240,18 +264,24 @@ void FT245RBitbangController::UpdaterThreadDoIt()
           {
              try
              {
@@ -1984,21 +2619,45 @@ index 29f2e7e..b8ab01a 100644
              break;
           }
        }
-@@ -262,8 +289,13 @@ void FT245RBitbangController::UpdaterThreadDoIt()
+@@ -263,15 +293,36 @@ void FT245RBitbangController::UpdaterThreadDoIt()
+       }
+    }
+ 
++   // VPE: the outputs are off when either the final update or the one Disconnect sends got there. Taken before the
++   // final update, so the zeros confirm the closing that was published when the updater ended.
++   OutputGate::Snapshot finalGate = gateUnit->Observe();
++   bool off = false;
++   std::string error;
+    try
+    {
+       SendUpdate(0);
++      off = true;
+    }
     catch (const std::exception& e)
     {
        Log::Exception(StringExtensions::Build("Final update to turn off all output for FTDI chip {0} failed.", m_serialNumber));
-+      m_finishError = StringExtensions::Build("FT245RBitbangController {0} could not turn its outputs off: {1}", GetName(), e.what());
-    }
-    Disconnect();
++      error = e.what();
++   }
++   std::string disconnectError;
++   if (Disconnect(&disconnectError))
++      off = true;
++   else if (error.empty())
++      error = disconnectError;
++   if (!off)
++      m_finishError = StringExtensions::Build("FT245RBitbangController {0} could not turn its outputs off: {1}", GetName(), error);
 +   if (died)
 +      gateUnit->Die();
 +   else
++   {
++      if (off && !finalGate.open)
++         gateUnit->Ack(finalGate);
 +      gateUnit->Stop();
+    }
+-   Disconnect();
     m_updaterThreadFinished = true;
  }
  
-@@ -341,6 +373,9 @@ void FT245RBitbangController::SendUpdate(uint8_t outputData)
+@@ -349,20 +400,27 @@ void FT245RBitbangController::SendUpdate(uint8_t outputData)
              "Wrong number of written bytes (expected 1, received {0}) was returned when sending data to the FTDI chip {1}", std::to_string(numBytes), m_serialNumber));
        }
     }
@@ -2007,9 +2666,39 @@ index 29f2e7e..b8ab01a 100644
 +      throw std::runtime_error(StringExtensions::Build("FTDI chip {0} is not connected", m_serialNumber));
  }
  
- void FT245RBitbangController::Disconnect()
+-void FT245RBitbangController::Disconnect()
++bool FT245RBitbangController::Disconnect(std::string* error)
+ {
+    std::lock_guard<std::recursive_mutex> lock(m_ftdiLocker);
+ 
++   bool off = false;
+    if (m_ftdi)
+    {
+       try
+       {
+          SendUpdate(0);
++         off = true;
+       }
+-      catch (...)
++      catch (const std::exception& e)
+       {
++         if (error)
++            *error = e.what();
+       }
+ 
+       if (m_ftdi->IsOpen())
+@@ -380,6 +438,9 @@ void FT245RBitbangController::Disconnect()
+       m_ftdi = nullptr;
+       Log::Write(StringExtensions::Build("Connection to FTDI chip {0} closed.", m_serialNumber));
+    }
++   else if (error)
++      *error = StringExtensions::Build("FTDI chip {0} is not connected", m_serialNumber);
++   return off;
+ }
+ 
+ tinyxml2::XMLElement* FT245RBitbangController::ToXml(tinyxml2::XMLDocument& doc) const
 diff --git a/src/cab/out/ftdichip/FT245RBitbangController.h b/src/cab/out/ftdichip/FT245RBitbangController.h
-index de1b98d..e0b2567 100644
+index de1b98d..bbe3c05 100644
 --- a/src/cab/out/ftdichip/FT245RBitbangController.h
 +++ b/src/cab/out/ftdichip/FT245RBitbangController.h
 @@ -2,6 +2,7 @@
@@ -2029,69 +2718,19 @@ index de1b98d..e0b2567 100644
     int m_firstTryFailCnt;
  
     std::recursive_mutex m_ftdiLocker;
-diff --git a/src/cab/out/ftdichip/FT245RBitbangControllerAutoConfigurator.cpp b/src/cab/out/ftdichip/FT245RBitbangControllerAutoConfigurator.cpp
-index 3b4a24c..60d53f4 100644
---- a/src/cab/out/ftdichip/FT245RBitbangControllerAutoConfigurator.cpp
-+++ b/src/cab/out/ftdichip/FT245RBitbangControllerAutoConfigurator.cpp
-@@ -30,17 +30,17 @@ void FT245RBitbangControllerAutoConfigurator::AutoConfig(Cabinet* cabinet)
-       return;
-    }
+@@ -70,7 +73,8 @@ private:
  
--   for (uint32_t i = 0; i < amountDevices; i++)
-+   // VPE: list the boards once, into storage for all of them. Upstream listed them once per board into room for one
-+   // entry, so a second board overflowed the buffer, and every pass took the first board again.
-    {
-       FTDI* connectFTDI = new FTDI();
--
--      FTDI::FT_DEVICE_INFO_NODE devInfo;
--      uint32_t numDevs = 1;
--      status = connectFTDI->GetDeviceInfoList(&devInfo, numDevs);
--
--      if (status == FTDI::FT_OK && numDevs > 0)
-+      std::vector<FTDI::FT_DEVICE_INFO_NODE> devInfo(amountDevices);
-+      uint32_t numDevs = amountDevices;
-+      status = connectFTDI->GetDeviceInfoList(devInfo.data(), numDevs);
-+      if (status == FTDI::FT_OK)
-       {
--         deviceList.emplace_back(devInfo.SerialNumber, devInfo.Description);
-+         for (uint32_t i = 0; i < numDevs; i++)
-+            deviceList.emplace_back(devInfo[i].SerialNumber, devInfo[i].Description);
-       }
-       delete connectFTDI;
-    }
-diff --git a/src/cab/out/ftdichip/FTDI.cpp b/src/cab/out/ftdichip/FTDI.cpp
-index 97d6458..10aa4e5 100644
---- a/src/cab/out/ftdichip/FTDI.cpp
-+++ b/src/cab/out/ftdichip/FTDI.cpp
-@@ -1,6 +1,7 @@
- #include "FTDI.h"
- #include "../../../Log.h"
- #include "../../../general/StringExtensions.h"
-+#include <algorithm>
- #include <cstring>
+    void Connect();
+    void SendUpdate(uint8_t outputData);
+-   void Disconnect();
++   // Returns whether it turned the outputs off before closing; when not, the reason is in `error`.
++   bool Disconnect(std::string* error = nullptr);
+ };
  
- namespace DOF
-@@ -71,6 +72,9 @@ FTDI::FT_STATUS FTDI::GetDeviceInfoList(FT_DEVICE_INFO_NODE* devinfo, uint32_t&
-    if (!m_ftdiContext || !devinfo)
-       return FT_INVALID_PARAMETER;
- 
-+   // VPE: numdevs is the capacity of devinfo on input and the number of entries written on output. Upstream wrote one
-+   // entry per connected board whatever the caller had room for.
-+   const uint32_t capacity = numdevs;
-    struct ftdi_device_list* devlist = nullptr;
-    int result = ftdi_usb_find_all(m_ftdiContext, &devlist, 0x0403, 0x6001);
- 
-@@ -80,7 +84,7 @@ FTDI::FT_STATUS FTDI::GetDeviceInfoList(FT_DEVICE_INFO_NODE* devinfo, uint32_t&
-       return ConvertLibftdiError(result);
-    }
- 
--   numdevs = static_cast<uint32_t>(result);
-+   numdevs = (std::min)(static_cast<uint32_t>(result), capacity);
- 
-    struct ftdi_device_list* curdev = devlist;
-    for (uint32_t i = 0; i < numdevs && curdev; ++i, curdev = curdev->next)
+ }
+\ No newline at end of file
 diff --git a/src/cab/out/lw/LedWiz.cpp b/src/cab/out/lw/LedWiz.cpp
-index 96aa2a0..10c8b4d 100644
+index c136d75..a597cd8 100644
 --- a/src/cab/out/lw/LedWiz.cpp
 +++ b/src/cab/out/lw/LedWiz.cpp
 @@ -1,5 +1,6 @@
@@ -2112,49 +2751,56 @@ index 96aa2a0..10c8b4d 100644
  }
  
  void LedWiz::AddOutputs()
-@@ -161,11 +163,13 @@ void LedWiz::OnOutputValueChanged(IOutput* output)
- 
-    LedWizUnit* s = s_ledWizUnits.at(m_number);
- 
-+   // The scheduled value goes to the unit only: writing it back into the output would make the output gate lose the
-+   // value it holds back while closed.
-    IOutput* recalculatedOutput = ScheduledSettings::GetInstance().GetNewRecalculatedOutput(output, 1, m_number - 1);
--   lwo->SetOutput(recalculatedOutput->GetOutput());
-+   uint8_t value = recalculatedOutput->GetOutput();
-    if (recalculatedOutput != output)
-       delete recalculatedOutput;
--   s->UpdateValue(lwo);
-+   s->UpdateValue(lwo, value);
- }
- 
- void LedWiz::StartupLedWiz()
-@@ -483,18 +487,23 @@ LedWiz::LedWizUnit::~LedWizUnit()
+@@ -484,13 +486,48 @@ LedWiz::LedWizUnit::~LedWizUnit()
  void LedWiz::LedWizUnit::Init(Cabinet* cabinet, int minCommandIntervalMs)
  {
     m_minCommandIntervalMs = minCommandIntervalMs;
 +   // VPE: the gate unit exists before the updater starts, so a gate change made right after init counts it.
 +   if (!IsUpdaterThreadAlive())
++   {
++      ResetState();
 +      m_gateUnit = OutputGate::Instance().Register(StringExtensions::Build("LedWiz {0:00}", std::to_string(m_number)));
++   }
     StartLedWizUpdaterThread();
  }
  
++void LedWiz::LedWizUnit::ResetState()
++{
++   std::lock_guard<std::recursive_mutex> lock(m_valueChangeLocker);
++   m_newOutputValues.fill(49);
++   m_currentOutputValues.fill(0);
++   m_newAfterValueSwitches.fill(0);
++   m_newBeforeValueSwitches.fill(0);
++   m_currentAfterValueSwitches.fill(0);
++   m_currentBeforeValueSwitches.fill(0);
++   m_newValueUpdateRequired = true;
++   m_newSwitchUpdateBeforeValueUpdateRequired = true;
++   m_newSwitchUpdateAfterValueUpdateRequired = true;
++   m_currentValueUpdateRequired = true;
++   m_currentSwitchUpdateBeforeValueUpdateRequired = true;
++   m_currentSwitchUpdateAfterValueUpdateRequired = true;
++   m_updateRequired = true;
++   m_inUseState = InUseStates::Startup;
++   m_pbaTime = std::chrono::steady_clock::time_point();
++}
++
  void LedWiz::LedWizUnit::Finish()
  {
     TerminateLedWizUpdaterThread();
++   // Taken before the zeros, so they confirm the closing that was published when the updater ended.
++   OutputGate::Snapshot finalGate {};
++   if (m_gateUnit)
++      finalGate = m_gateUnit->Observe();
 +   m_writeFailed = false;
     ShutdownLighting();
-+   m_shutdownFailed = m_writeFailed && m_fp != nullptr;
++   // A unit that was found but whose handle never opened could not turn its outputs off either.
++   m_shutdownFailed = m_writeFailed && (m_fp != nullptr || IsPresent());
++   if (m_gateUnit && !m_writeFailed && !finalGate.open)
++      m_gateUnit->Ack(finalGate);
  }
  
--void LedWiz::LedWizUnit::UpdateValue(LedWizOutput* ledWizOutput)
-+void LedWiz::LedWizUnit::UpdateValue(LedWizOutput* ledWizOutput, uint8_t value)
- {
--   uint8_t v = s_byteToLedWizValue[ledWizOutput->GetOutput()];
-+   uint8_t v = s_byteToLedWizValue[value];
-    bool s = (v != 0);
-    int zeroBasedOutputNumber = ledWizOutput->GetLedWizOutputNumber() - 1;
-    int byteNr = zeroBasedOutputNumber >> 3;
-@@ -612,9 +621,15 @@ void LedWiz::LedWizUnit::LedWizUpdaterDoIt()
+ void LedWiz::LedWizUnit::UpdateValue(LedWizOutput* ledWizOutput)
+@@ -613,9 +650,15 @@ void LedWiz::LedWizUnit::LedWizUpdaterDoIt()
  {
     Log::Write(StringExtensions::Build("Updater thread for LedWiz {0:00} started.", std::to_string(m_number)));
  
@@ -2170,26 +2816,31 @@ index 96aa2a0..10c8b4d 100644
        try
        {
           if (IsPresent())
-@@ -629,14 +644,31 @@ void LedWiz::LedWizUnit::LedWizUpdaterDoIt()
+@@ -630,14 +673,36 @@ void LedWiz::LedWizUnit::LedWizUpdaterDoIt()
                 m_inUseState = InUseStates::Running;
              }
  
 -            if (m_inUseState == InUseStates::Running)
 +            // The observed state governs what is sent. Closed: all off, whatever the values (a gate that opens restores
 +            // them before it publishes); they go out in full once the opened generation is observed.
++            bool wrote = true;
 +            if (!gate.open)
 +               ShutdownLighting();
 +            else if (m_inUseState == InUseStates::Running)
                 SendLedWizUpdate();
-+            // Open and never used: DOF leaves the hardware alone, there is nothing to send.
++            else
++               // Open and never used: DOF leaves the hardware alone, there is nothing to send and nothing to confirm.
++               wrote = false;
 +            if (m_writeFailed)
 +            {
 +               // The values that did not get there are sent again.
 +               ForceFullUpdate();
 +               gateUnit->Fail(gate.generation);
 +            }
-+            else
++            else if (wrote)
 +               gateUnit->Ack(gate);
++            else
++               gateUnit->Untouched(gate);
           }
 +         else
 +            gateUnit->Fail(gate.generation);
@@ -2203,7 +2854,7 @@ index 96aa2a0..10c8b4d 100644
           failCnt++;
           if (failCnt > MAX_UPDATE_FAIL_COUNT)
           {
-@@ -648,17 +680,38 @@ void LedWiz::LedWizUnit::LedWizUpdaterDoIt()
+@@ -649,17 +714,38 @@ void LedWiz::LedWizUnit::LedWizUpdaterDoIt()
  
        if (m_keepLedWizUpdaterAlive)
        {
@@ -2243,7 +2894,7 @@ index 96aa2a0..10c8b4d 100644
  void LedWiz::LedWizUnit::UpdateDelay()
  {
     int ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - m_lastUpdate).count());
-@@ -726,9 +779,13 @@ void LedWiz::LedWizUnit::WriteUSB(const uint8_t* buf, size_t length)
+@@ -727,9 +813,13 @@ void LedWiz::LedWizUnit::WriteUSB(const uint8_t* buf, size_t length)
           std::this_thread::sleep_for(std::chrono::milliseconds(s_retryWait[tries]));
        }
        Log::Error(StringExtensions::Build("LedWiz {0} WriteUSB failed after {1} retries", std::to_string(m_number), std::to_string(std::size(s_retryWait))));
@@ -2258,7 +2909,7 @@ index 96aa2a0..10c8b4d 100644
  
  bool LedWiz::LedWizUnit::IsPresent() const
 diff --git a/src/cab/out/lw/LedWiz.h b/src/cab/out/lw/LedWiz.h
-index 9f42dc1..7fcf360 100644
+index 9f42dc1..7c3c3a0 100644
 --- a/src/cab/out/lw/LedWiz.h
 +++ b/src/cab/out/lw/LedWiz.h
 @@ -1,6 +1,7 @@
@@ -2269,16 +2920,7 @@ index 9f42dc1..7fcf360 100644
  #include <hidapi/hidapi.h>
  #include <array>
  #include <atomic>
-@@ -96,7 +97,7 @@ private:
-       int GetNumber() const { return m_number; }
-       void Init(Cabinet* cabinet, int minCommandIntervalMs);
-       void Finish();
--      void UpdateValue(LedWizOutput* ledWizOutput);
-+      void UpdateValue(LedWizOutput* ledWizOutput, uint8_t value);
-       void CopyNewToCurrent();
-       bool IsUpdaterThreadAlive() const;
-       void StartLedWizUpdaterThread();
-@@ -157,6 +158,16 @@ private:
+@@ -157,6 +158,19 @@ private:
        std::chrono::steady_clock::time_point m_lastUpdate;
        int m_minCommandIntervalMs;
        std::chrono::steady_clock::time_point m_pbaTime;
@@ -2292,11 +2934,14 @@ index 9f42dc1..7fcf360 100644
 +
 +   private:
 +      void ForceFullUpdate();
++      // VPE: the units outlive sessions. A new session starts from all off and unused, so it never sends what the
++      // previous one had requested (a latch sent zeros but kept the values).
++      void ResetState();
     };
  };
  
 diff --git a/src/cab/out/pac/PacDrive.cpp b/src/cab/out/pac/PacDrive.cpp
-index 5c8b6e7..79f5387 100644
+index 1a2be63..ef76acd 100644
 --- a/src/cab/out/pac/PacDrive.cpp
 +++ b/src/cab/out/pac/PacDrive.cpp
 @@ -1,5 +1,6 @@
@@ -2323,27 +2968,17 @@ index 5c8b6e7..79f5387 100644
  }
  
  void PacDrive::Update()
-@@ -70,7 +74,8 @@ void PacDrive::AddOutputs()
-          Output* newOutput = new Output();
-          newOutput->SetName(StringExtensions::Build("{0}.{1:00}", GetName(), std::to_string(i)));
-          newOutput->SetNumber(i);
--         outputs->push_back(newOutput);
-+         // VPE: Add, not push_back: only Add connects the output's change event (and the output gate).
-+         outputs->Add(newOutput);
-       }
-    }
- }
-@@ -129,17 +134,25 @@ PacDrive::PacDriveUnit::~PacDriveUnit() { TerminatePacDriveUpdaterThread(); }
+@@ -129,23 +133,25 @@ PacDrive::PacDriveUnit::~PacDriveUnit() { TerminatePacDriveUpdaterThread(); }
  void PacDrive::PacDriveUnit::Init(Cabinet* cabinet)
  {
     m_index = PacDriveSingleton::GetInstance().PacDriveGetIndex();
 +   // VPE: the unit outlives a session; the next one starts from all off, not from the last game's outputs.
-+   {
-+      std::lock_guard<std::mutex> lock(m_valueChangeLocker);
-+      m_newValue = 0;
-+      m_currentValue = 0;
-+      m_updateRequired = true;
-+   }
+    {
+       std::lock_guard<std::mutex> lock(m_valueChangeLocker);
+       m_newValue = 0;
+       m_currentValue = 0;
+       m_updateRequired = true;
+    }
 +   // VPE: the gate unit exists before the updater starts; a PacDrive that is not connected counts as failed.
     if (m_index >= 0)
     {
@@ -2364,7 +2999,7 @@ index 5c8b6e7..79f5387 100644
  
  void PacDrive::PacDriveUnit::UpdateValue(IOutput* output)
  {
-@@ -171,13 +184,15 @@ void PacDrive::PacDriveUnit::TriggerPacDriveUpdaterThread()
+@@ -177,13 +183,21 @@ void PacDrive::PacDriveUnit::TriggerPacDriveUpdaterThread()
     m_updateCondition.notify_one();
  }
  
@@ -2375,14 +3010,20 @@ index 5c8b6e7..79f5387 100644
     if (m_index >= 0)
     {
 -      PacDriveSetLEDStates(0);
++      // Taken before the zeros, so they confirm the closing that was published when the updater ended.
++      OutputGate::Snapshot finalGate {};
++      if (m_gateUnit)
++         finalGate = m_gateUnit->Observe();
 +      ok = PacDriveSetLEDStates(0);
++      if (ok && m_gateUnit && !finalGate.open)
++         m_gateUnit->Ack(finalGate);
        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 +   return ok;
  }
  
  void PacDrive::PacDriveUnit::StartPacDriveUpdaterThread()
-@@ -214,19 +229,31 @@ void PacDrive::PacDriveUnit::TerminatePacDriveUpdaterThread()
+@@ -220,19 +234,34 @@ void PacDrive::PacDriveUnit::TerminatePacDriveUpdaterThread()
  
  void PacDrive::PacDriveUnit::PacDriveUpdaterDoIt()
  {
@@ -2402,8 +3043,11 @@ index 5c8b6e7..79f5387 100644
           if (m_index >= 0)
           {
 -            SendPacDriveUpdate();
-+            SendPacDriveUpdate(gate.open);
-+            gateUnit->Ack(gate);
++            // VPE: a failed write is reported and retried on the next pass, without ending the updater.
++            if (SendPacDriveUpdate(gate.open))
++               gateUnit->Ack(gate);
++            else
++               gateUnit->Fail(gate.generation);
           }
 +         else
 +            gateUnit->Fail(gate.generation);
@@ -2415,7 +3059,7 @@ index 5c8b6e7..79f5387 100644
           Log::Exception(StringExtensions::Build("Error occurred when updating PacDrive: {0}", e.what()));
           failCount++;
  
-@@ -244,24 +271,39 @@ void PacDrive::PacDriveUnit::PacDriveUpdaterDoIt()
+@@ -250,27 +279,39 @@ void PacDrive::PacDriveUnit::PacDriveUpdaterDoIt()
        }
        m_triggerUpdate = false;
     }
@@ -2427,45 +3071,41 @@ index 5c8b6e7..79f5387 100644
  }
  
 -void PacDrive::PacDriveUnit::SendPacDriveUpdate()
-+void PacDrive::PacDriveUnit::SendPacDriveUpdate(bool open)
++bool PacDrive::PacDriveUnit::SendPacDriveUpdate(bool open)
  {
     if (m_index < 0)
-       return;
+-      return;
++      return false;
  
     std::lock_guard<std::mutex> updateLock(m_pacDriveUpdateLocker);
--   std::lock_guard<std::mutex> valueLock(m_valueChangeLocker);
--
--   if (!m_updateRequired)
--      return;
--
--   CopyNewToCurrent();
--   m_updateRequired = false;
-+   uint16_t data;
-+   {
+    uint16_t data;
+    {
 +      // VPE: the values are copied under the lock and written without it, so a slow device never holds up the
 +      // main thread's value changes (and with them a gate change for the other controllers).
-+      std::lock_guard<std::mutex> valueLock(m_valueChangeLocker);
-+      if (!m_updateRequired)
-+         return;
-+      CopyNewToCurrent();
-+      m_updateRequired = false;
-+      data = m_currentValue;
-+   }
+       std::lock_guard<std::mutex> valueLock(m_valueChangeLocker);
+       if (!m_updateRequired)
+-         return;
+-
++         return true;
+       CopyNewToCurrent();
+       m_updateRequired = false;
+       data = m_currentValue;
+    }
  
--   PacDriveSetLEDStates(m_currentValue);
+-   PacDriveSetLEDStates(data);
 +   // VPE: the observed gate state governs what is sent; an opening gate restores the values before it publishes.
-+   if (!PacDriveSetLEDStates(open ? data : 0))
-+   {
-+      // VPE: sent again on the next pass.
-+      std::lock_guard<std::mutex> valueLock(m_valueChangeLocker);
-+      m_updateRequired = true;
-+      throw std::runtime_error("PacDrive: write failed");
-+   }
++   if (PacDriveSetLEDStates(open ? data : 0))
++      return true;
++
++   // VPE: sent again on the next pass.
++   std::lock_guard<std::mutex> valueLock(m_valueChangeLocker);
++   m_updateRequired = true;
++   return false;
  }
  
  void PacDrive::PacDriveUnit::CopyNewToCurrent() { m_currentValue = m_newValue; }
 diff --git a/src/cab/out/pac/PacDrive.h b/src/cab/out/pac/PacDrive.h
-index e9e1876..7e9af8b 100644
+index e9e1876..55fd93c 100644
 --- a/src/cab/out/pac/PacDrive.h
 +++ b/src/cab/out/pac/PacDrive.h
 @@ -1,6 +1,7 @@
@@ -2494,20 +3134,21 @@ index e9e1876..7e9af8b 100644
  
        std::mutex m_pacDriveUpdateLocker;
        std::mutex m_valueChangeLocker;
-@@ -70,7 +73,7 @@ private:
+@@ -70,7 +73,8 @@ private:
        void StartPacDriveUpdaterThread();
        void TerminatePacDriveUpdaterThread();
        void PacDriveUpdaterDoIt();
 -      void SendPacDriveUpdate();
-+      void SendPacDriveUpdate(bool open);
++      // Returns false if the write failed; the update is then sent again on the next pass.
++      bool SendPacDriveUpdate(bool open);
        void CopyNewToCurrent();
        bool IsUpdaterThreadAlive() const;
        bool PacDriveSetLEDStates(uint16_t data);
 diff --git a/src/cab/out/pac/PacDriveSingleton.cpp b/src/cab/out/pac/PacDriveSingleton.cpp
-index c093209..4ffa650 100644
+index b5b88a6..c53d5b3 100644
 --- a/src/cab/out/pac/PacDriveSingleton.cpp
 +++ b/src/cab/out/pac/PacDriveSingleton.cpp
-@@ -367,8 +367,10 @@ std::vector<int> PacDriveSingleton::PacUIOGetIdList()
+@@ -374,8 +374,10 @@ std::vector<int> PacDriveSingleton::PacUIOGetIdList()
     return idList;
  }
  
@@ -2519,17 +3160,36 @@ index c093209..4ffa650 100644
     if (index < 0 || index >= static_cast<int>(m_devices.size()))
        return false;
  
-@@ -385,12 +387,19 @@ bool PacDriveSingleton::PacLed64SetLEDIntensities(int index, const uint8_t* data
+@@ -389,26 +391,30 @@ bool PacDriveSingleton::PacLed64SetLEDIntensities(int index, const uint8_t* data
  
-    for (int i = 0; i < maxLeds; i++)
+    bool success = true;
+    int maxLeds = (device.type == DeviceType::PacLED64) ? 64 : 96;
++   int interfaceNumber = (device.type == DeviceType::IPACIO) ? GetUsbInterface(index) : 0;
+ 
+-   if (device.type == DeviceType::IPACIO)
++   for (int i = 0; i < maxLeds; i++)
     {
-+      // VPE: one transfer per port, so a full update takes a while; the caller can end it between two ports.
+-      int interfaceNumber = GetUsbInterface(index);
+-      for (int i = 0; i < maxLeds; i++)
++      // VPE: one transfer per port, so a full update takes a while; the caller can end it between two ports, also on
++      // an Ultimate I/O.
 +      if (cancel && cancel())
 +      {
 +         if (cancelled)
 +            *cancelled = true;
 +         return success;
 +      }
++      if (device.type == DeviceType::IPACIO)
+       {
+          if (!SendUltimateIOCommand(usbDevice, interfaceNumber, static_cast<uint8_t>(i), data[i]))
+             success = false;
++         continue;
+       }
+-      return success;
+-   }
+-
+-   for (int i = 0; i < maxLeds; i++)
+-   {
        uint8_t ledData[2];
        ledData[0] = static_cast<uint8_t>(i);
        ledData[1] = data[i];
@@ -2540,7 +3200,7 @@ index c093209..4ffa650 100644
        {
           success = false;
        }
-@@ -422,7 +431,7 @@ bool PacDriveSingleton::PacLed64SetLEDIntensity(int index, int port, uint8_t int
+@@ -443,7 +449,7 @@ bool PacDriveSingleton::PacLed64SetLEDIntensity(int index, int port, uint8_t int
  
     int result = libusb_control_transfer(usbDevice, 0x21, 9, 0x0200, 0, data, 2, 2000);
  
@@ -2549,7 +3209,7 @@ index c093209..4ffa650 100644
  }
  
  bool PacDriveSingleton::PacLed64SetLEDStates(int index, int group, uint8_t data)
-@@ -451,7 +460,7 @@ bool PacDriveSingleton::PacLed64SetLEDStates(int index, int group, uint8_t data)
+@@ -486,7 +492,7 @@ bool PacDriveSingleton::PacLed64SetLEDStates(int index, int group, uint8_t data)
           ledData[1] = 0; // intensity = 0
  
           int result = libusb_control_transfer(usbDevice, 0x21, 9, 0x0200, 0, ledData, 2, 2000);
@@ -2558,7 +3218,7 @@ index c093209..4ffa650 100644
           {
              success = false;
           }
-@@ -472,7 +481,7 @@ bool PacDriveSingleton::PacLed64SetLEDStates(int index, int group, uint8_t data)
+@@ -507,7 +513,7 @@ bool PacDriveSingleton::PacLed64SetLEDStates(int index, int group, uint8_t data)
              ledData[1] = intensity;
  
              int result = libusb_control_transfer(usbDevice, 0x21, 9, 0x0200, 0, ledData, 2, 2000);
@@ -2567,7 +3227,7 @@ index c093209..4ffa650 100644
              {
                 success = false;
              }
-@@ -502,7 +511,7 @@ bool PacDriveSingleton::PacLed64SetLEDFadeTime(int index, uint8_t fadeTime)
+@@ -540,7 +546,7 @@ bool PacDriveSingleton::PacLed64SetLEDFadeTime(int index, uint8_t fadeTime)
  
     int result = libusb_control_transfer(usbDevice, 0x21, 9, 0x0300, 0, data, 2, 2000);
  
@@ -2577,7 +3237,7 @@ index c093209..4ffa650 100644
  
  hid_device* PacDriveSingleton::GetHidDevice(int index)
 diff --git a/src/cab/out/pac/PacDriveSingleton.h b/src/cab/out/pac/PacDriveSingleton.h
-index b246346..6c5bac1 100644
+index c71dc9d..2fbebff 100644
 --- a/src/cab/out/pac/PacDriveSingleton.h
 +++ b/src/cab/out/pac/PacDriveSingleton.h
 @@ -38,7 +38,9 @@ public:
@@ -2592,7 +3252,7 @@ index b246346..6c5bac1 100644
     bool PacLed64SetLEDStates(int index, int group, uint8_t data);
     bool PacLed64SetLEDFadeTime(int index, uint8_t fadeTime);
 diff --git a/src/cab/out/pac/PacLed64.cpp b/src/cab/out/pac/PacLed64.cpp
-index b7a8f8a..43d0067 100644
+index 3a4215f..74f62da 100644
 --- a/src/cab/out/pac/PacLed64.cpp
 +++ b/src/cab/out/pac/PacLed64.cpp
 @@ -1,4 +1,5 @@
@@ -2656,17 +3316,23 @@ index b7a8f8a..43d0067 100644
  
     m_index = -1;
  }
-@@ -274,7 +292,8 @@ void PacLed64::PacLed64Unit::ShutdownLighting()
+@@ -274,7 +292,14 @@ void PacLed64::PacLed64Unit::ShutdownLighting()
     if (IsPresent())
     {
        EnforceMinUpdateInterval();
--      PacDriveSingleton::GetInstance().PacLed64SetLEDStates(0, 0, 0);
+-      PacDriveSingleton::GetInstance().PacLed64SetLEDStates(m_index, 0, 0);
++      // Taken before the zeros, so they confirm the closing that was published when the updater ended.
++      OutputGate::Snapshot finalGate {};
++      if (m_gateUnit)
++         finalGate = m_gateUnit->Observe();
 +      if (!PacDriveSingleton::GetInstance().PacLed64SetLEDStates(m_index, 0, 0))
 +         throw std::runtime_error("PacLed64: turning the outputs off failed");
++      if (m_gateUnit && !finalGate.open)
++         m_gateUnit->Ack(finalGate);
        std::this_thread::sleep_for(std::chrono::milliseconds(100));
        std::fill(m_lastStateSent.begin(), m_lastStateSent.end(), false);
     }
-@@ -314,6 +333,7 @@ void PacLed64::PacLed64Unit::TerminatePacLed64UpdaterThread()
+@@ -314,6 +339,7 @@ void PacLed64::PacLed64Unit::TerminatePacLed64UpdaterThread()
  
  void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
  {
@@ -2674,7 +3340,7 @@ index b7a8f8a..43d0067 100644
     try
     {
        ResetFadeTime();
-@@ -321,6 +341,7 @@ void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
+@@ -321,6 +347,7 @@ void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
     catch (const std::exception& e)
     {
        Log::Exception(StringExtensions::Build("Exception occurred while setting fade time for PacLed64 {0} to 0: {1}", std::to_string(m_index), e.what()));
@@ -2682,7 +3348,7 @@ index b7a8f8a..43d0067 100644
        m_updaterThreadFinished = true;
        return;
     }
-@@ -328,16 +349,30 @@ void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
+@@ -328,16 +355,34 @@ void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
     int failCount = 0;
     while (m_keepPacLed64UpdaterAlive)
     {
@@ -2698,8 +3364,12 @@ index b7a8f8a..43d0067 100644
           if (IsPresent())
           {
 -            SendPacLed64Update();
-+            if (SendPacLed64Update(gate.open))
++            // VPE: a failed write is reported and retried on the next pass, without ending the updater.
++            bool failed = false;
++            if (SendPacLed64Update(gate.open, failed))
 +               gateUnit->Ack(gate);
++            else if (failed)
++               gateUnit->Fail(gate.generation);
           }
 +         else
 +            gateUnit->Fail(gate.generation);
@@ -2714,7 +3384,7 @@ index b7a8f8a..43d0067 100644
           Log::Exception(StringExtensions::Build("Error occurred when updating PacLed64 {0}: {1}", std::to_string(m_id), e.what()));
           failCount++;
  
-@@ -356,112 +391,92 @@ void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
+@@ -356,72 +401,109 @@ void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
        }
        m_triggerUpdate = false;
     }
@@ -2726,173 +3396,144 @@ index b7a8f8a..43d0067 100644
  }
  
 -void PacLed64::PacLed64Unit::SendPacLed64Update()
-+bool PacLed64::PacLed64Unit::SendPacLed64Update(bool open)
++bool PacLed64::PacLed64Unit::SendPacLed64Update(bool open, bool& failed)
  {
++   failed = false;
     if (!IsPresent())
 -      return;
 +      return true;
  
     std::lock_guard<std::mutex> updateLock(m_pacLed64UpdateLocker);
--   std::lock_guard<std::mutex> valueLock(m_valueChangeLocker);
--
--   if (!m_updateRequired && !m_forceFullUpdate)
--      return;
--
--   CopyNewToCurrent();
--   m_updateRequired = false;
--
--   uint8_t intensityUpdatesRequired = 0;
--   uint8_t stateUpdatesRequired = 0;
 +   std::array<uint8_t, 64> target {};
 +   bool full;
-+   {
+    {
 +      // VPE: the values are copied under the lock and written without it, so a slow device never holds up the main
 +      // thread's value changes (and with them a gate change for the other controllers).
-+      std::lock_guard<std::mutex> valueLock(m_valueChangeLocker);
-+      if (!m_updateRequired && !m_forceFullUpdate)
+       std::lock_guard<std::mutex> valueLock(m_valueChangeLocker);
+       if (!m_updateRequired && !m_forceFullUpdate)
+-         return;
+-
 +         return true;
-+      CopyNewToCurrent();
-+      m_updateRequired = false;
+       CopyNewToCurrent();
+       m_updateRequired = false;
 +      full = m_forceFullUpdate;
 +      // VPE: the observed gate state governs what is sent; an opening gate restores the values before it publishes.
 +      if (open)
 +         std::copy_n(m_currentValue.begin(), 64, target.begin());
-+   }
+    }
  
+-   int updatesRequired = 0;
 -   if (!m_forceFullUpdate)
 +   int changed = 0;
 +   for (int o = 0; o < 64; o++)
     {
--      for (int g = 0; g < 8; g++)
+-      for (int o = 0; o < 64; o++)
 -      {
--         bool stateUpdateRequired = false;
--         for (int p = 0; p < 8; p++)
--         {
--            int o = (g << 3) | p;
--            if (m_currentValue[o] > 0)
--            {
--               if (m_currentValue[o] != m_lastValueSent[o])
--               {
--                  intensityUpdatesRequired++;
--               }
--               else if (!m_lastStateSent[o])
--               {
--                  stateUpdateRequired = true;
--               }
--            }
--            else if (m_lastStateSent[o])
--            {
--               stateUpdateRequired = true;
--            }
--         }
--         if (stateUpdateRequired)
--            stateUpdatesRequired++;
+-         if (m_currentValue[o] != m_lastValueSent[o] || (m_currentValue[o] > 0) != m_lastStateSent[o])
+-            updatesRequired++;
 -      }
 +      if (target[o] != m_lastValueSent[o] || (target[o] > 0) != m_lastStateSent[o])
 +         changed++;
     }
  
--   if (m_forceFullUpdate || (intensityUpdatesRequired + stateUpdatesRequired) > m_fullUpdateThreshold)
+-   if (m_forceFullUpdate || updatesRequired > m_fullUpdateThreshold)
 +   if (full || changed > m_fullUpdateThreshold)
     {
        EnforceMinUpdateInterval();
--      PacDriveSingleton::GetInstance().PacLed64SetLEDIntensities(m_index, m_currentValue.data());
+-      bool written = PacDriveSingleton::GetInstance().PacLed64SetLEDIntensities(m_index, m_currentValue.data());
 +      // VPE: a latch before or during the transfer makes this opening's update obsolete (see below); the ports it
 +      // reached are not known to the next pass, which sends all of them.
 +      bool cancelled = false;
 +      bool written = PacDriveSingleton::GetInstance().PacLed64SetLEDIntensities(m_index, target.data(), open ? GateLatched : nullptr, &cancelled);
        m_lastCommand = std::chrono::steady_clock::now();
 -
--      m_lastValueSent = m_currentValue;
--      for (int i = 0; i < 64; i++)
+-      if (written)
 +      if (cancelled)
        {
--         m_lastStateSent[i] = (m_lastValueSent[i] > 0);
+-         m_lastValueSent = m_currentValue;
+-         for (int i = 0; i < 64; i++)
+-         {
+-            m_lastStateSent[i] = (m_lastValueSent[i] > 0);
+-         }
+-         m_forceFullUpdate = false;
 +         std::lock_guard<std::mutex> valueLock(m_valueChangeLocker);
 +         m_forceFullUpdate = true;
 +         m_updateRequired = true;
 +         return false;
        }
+-      else
 +      if (!written)
-+         throw std::runtime_error("PacLed64: write failed");
-+      for (int o = 0; o < 64; o++)
 +      {
++         std::lock_guard<std::mutex> valueLock(m_valueChangeLocker);
+          m_forceFullUpdate = true;
+-   }
+-   else
+-   {
++         m_updateRequired = true;
++         failed = true;
++         return false;
++      }
+       for (int o = 0; o < 64; o++)
+       {
+-         if (m_currentValue[o] == m_lastValueSent[o] && (m_currentValue[o] > 0) == m_lastStateSent[o])
+-            continue;
+-
+-         EnforceMinUpdateInterval();
+-         bool written = PacDriveSingleton::GetInstance().PacLed64SetLEDIntensity(m_index, o, m_currentValue[o]);
+-         m_lastCommand = std::chrono::steady_clock::now();
+-         if (!written)
+-         {
+-            m_forceFullUpdate = true;
+-            continue;
+-         }
 +         m_lastValueSent[o] = target[o];
 +         m_lastStateSent[o] = target[o] > 0;
 +      }
 +      std::lock_guard<std::mutex> valueLock(m_valueChangeLocker);
-       m_forceFullUpdate = false;
++      m_forceFullUpdate = false;
 +      return true;
-    }
--   else
-+
-+   // VPE: each changed port gets its intensity, zero included. libdof's state call writes 255 or 0 to every port of
-+   // a group, which would turn dimmed and unchanged neighbours to full or off.
++   }
+ 
+-         m_lastValueSent[o] = m_currentValue[o];
+-         m_lastStateSent[o] = (m_currentValue[o] > 0);
 +   for (int o = 0; o < 64; o++)
-    {
--      for (int g = 0; g < 8; g++)
++   {
 +      if (target[o] == m_lastValueSent[o] && (target[o] > 0) == m_lastStateSent[o])
 +         continue;
 +      EnforceMinUpdateInterval();
 +      // VPE: each write waits for the minimum interval, so an update of many ports takes a while. Once the gate is
 +      // latched, the rest of an opening's update is obsolete: the next pass sends the closing in full instead.
 +      if (open && OutputGate::Instance().IsLatched())
-       {
--         int mask = 0;
--         bool stateUpdateRequired = false;
--
--         for (int p = 0; p < 8; p++)
--         {
--            int o = (g << 3) | p;
--            if (m_currentValue[o] > 0)
--            {
--               if (m_currentValue[o] != m_lastValueSent[o])
--               {
--                  EnforceMinUpdateInterval();
--                  PacDriveSingleton::GetInstance().PacLed64SetLEDIntensity(m_index, o, m_currentValue[o]);
--                  m_lastCommand = std::chrono::steady_clock::now();
--
--                  m_lastStateSent[o] = true;
--                  m_lastValueSent[o] = m_currentValue[o];
--               }
--               else if (!m_lastStateSent[o])
--               {
--                  mask |= (1 << p);
--                  stateUpdateRequired = true;
--                  m_lastStateSent[o] = true;
--               }
--            }
--            else if (m_lastStateSent[o])
--            {
--               stateUpdateRequired = true;
--               m_lastStateSent[o] = false;
--               m_lastValueSent[o] = 0;
--            }
--         }
--
--         if (stateUpdateRequired)
--         {
--            EnforceMinUpdateInterval();
--            PacDriveSingleton::GetInstance().PacLed64SetLEDStates(m_index, g + 1, static_cast<uint8_t>(mask));
--            m_lastCommand = std::chrono::steady_clock::now();
--         }
++      {
 +         std::lock_guard<std::mutex> valueLock(m_valueChangeLocker);
 +         m_forceFullUpdate = true;
 +         m_updateRequired = true;
 +         return false;
-       }
-+      if (!PacDriveSingleton::GetInstance().PacLed64SetLEDIntensity(m_index, o, target[o]))
-+         throw std::runtime_error("PacLed64: write failed");
++      }
++      bool written = PacDriveSingleton::GetInstance().PacLed64SetLEDIntensity(m_index, o, target[o]);
 +      m_lastCommand = std::chrono::steady_clock::now();
++      if (!written)
++      {
++         failed = true;
++         continue;
+       }
 +      m_lastValueSent[o] = target[o];
 +      m_lastStateSent[o] = target[o] > 0;
     }
++   if (failed)
++   {
++      // VPE: what a failed port has is not known: the next pass sends everything.
++      std::lock_guard<std::mutex> valueLock(m_valueChangeLocker);
++      m_forceFullUpdate = true;
++      m_updateRequired = true;
++      return false;
++   }
 +   return true;
  }
  
  void PacLed64::PacLed64Unit::CopyNewToCurrent() { m_currentValue = m_newValue; }
 diff --git a/src/cab/out/pac/PacLed64.h b/src/cab/out/pac/PacLed64.h
-index 640daa8..88ea8c3 100644
+index 640daa8..173532d 100644
 --- a/src/cab/out/pac/PacLed64.h
 +++ b/src/cab/out/pac/PacLed64.h
 @@ -1,6 +1,7 @@
@@ -2911,18 +3552,19 @@ index 640daa8..88ea8c3 100644
  
        std::vector<uint8_t> m_newValue;
        std::vector<uint8_t> m_currentValue;
-@@ -105,7 +107,8 @@ private:
+@@ -105,7 +107,9 @@ private:
        void StartPacLed64UpdaterThread();
        void TerminatePacLed64UpdaterThread();
        void PacLed64UpdaterDoIt();
 -      void SendPacLed64Update();
 +      // Returns false if a latch of the gate ended an opening's update early; the next pass sends everything.
-+      bool SendPacLed64Update(bool open);
++      // Returns true once the update is sent. `failed` is set when a write failed; the next pass sends everything.
++      bool SendPacLed64Update(bool open, bool& failed);
        void CopyNewToCurrent();
        void ResetFadeTime();
        void EnforceMinUpdateInterval();
 diff --git a/src/cab/out/pac/PacUIO.cpp b/src/cab/out/pac/PacUIO.cpp
-index 314ea83..fb7ab81 100644
+index 894e0ed..74c3cf3 100644
 --- a/src/cab/out/pac/PacUIO.cpp
 +++ b/src/cab/out/pac/PacUIO.cpp
 @@ -1,5 +1,6 @@
@@ -2950,25 +3592,23 @@ index 314ea83..fb7ab81 100644
     Log::Write(StringExtensions::Build("PacUIO Id:{0} finished and updater thread stopped.", std::to_string(m_id)));
  }
  
-@@ -153,17 +156,46 @@ PacUIO::PacUIOUnit::PacUIOUnit(int id)
-    std::fill_n(m_currentValue, 96, 0);
-    std::fill_n(m_lastValueSent, 96, 0);
-    std::fill_n(m_lastStateSent, 96, false);
--
--   InitUnit();
-+   // VPE: constructing a unit writes nothing; a board is touched only once a configured controller starts its unit.
- }
+@@ -159,17 +162,30 @@ PacUIO::PacUIOUnit::~PacUIOUnit() { TerminatePacUIOUpdaterThread(); }
  
- PacUIO::PacUIOUnit::~PacUIOUnit() { TerminatePacUIOUpdaterThread(); }
- 
--void PacUIO::PacUIOUnit::Init(Cabinet* cabinet) { StartPacUIOUpdaterThread(); }
-+void PacUIO::PacUIOUnit::Init(Cabinet* cabinet)
-+{
+ void PacUIO::PacUIOUnit::Init(Cabinet* cabinet)
+ {
 +   // VPE: the units live as long as the process. Each session finds the device again and starts from nothing, so
 +   // values and the enumeration index of an earlier session are never sent.
-+   if (!IsUpdaterThreadAlive())
-+   {
-+      m_index = PacDriveSingleton::GetInstance().PacUIOGetIndexForDeviceId(m_id);
+    if (!IsUpdaterThreadAlive())
+    {
+       m_pdSingleton = &PacDriveSingleton::GetInstance();
+       m_index = m_pdSingleton->PacUIOGetIndexForDeviceId(m_id);
+-      std::lock_guard<std::mutex> lock(m_valueChangeLocker);
+-      std::fill_n(m_newValue, 96, 0);
+-      std::fill_n(m_currentValue, 96, 0);
+-      std::fill_n(m_lastValueSent, 96, 0);
+-      std::fill_n(m_lastStateSent, 96, false);
+-      m_updateRequired = true;
+-      m_forceFullUpdate = true;
 +      {
 +         std::lock_guard<std::mutex> lock(m_valueChangeLocker);
 +         std::fill_n(m_newValue, 96, 0);
@@ -2987,10 +3627,10 @@ index 314ea83..fb7ab81 100644
 +      }
 +      m_gateUnit = OutputGate::Instance().Register(unitName);
 +      m_started = true;
-+   }
-+   StartPacUIOUpdaterThread();
-+}
- 
+    }
+    StartPacUIOUpdaterThread();
+ }
+@@ -177,6 +193,9 @@ void PacUIO::PacUIOUnit::Init(Cabinet* cabinet)
  void PacUIO::PacUIOUnit::Finish()
  {
     TerminatePacUIOUpdaterThread();
@@ -3000,21 +3640,7 @@ index 314ea83..fb7ab81 100644
     ShutdownLighting();
  }
  
-@@ -183,11 +215,8 @@ void PacUIO::PacUIOUnit::UpdateValue(IOutput* output)
-    }
- }
- 
--void PacUIO::PacUIOUnit::CopyNewToCurrent()
--{
--   std::lock_guard<std::mutex> lock(m_valueChangeLocker);
--   std::copy(m_newValue, m_newValue + 96, m_currentValue);
--}
-+// Called with m_valueChangeLocker held.
-+void PacUIO::PacUIOUnit::CopyNewToCurrent() { std::copy(m_newValue, m_newValue + 96, m_currentValue); }
- 
- bool PacUIO::PacUIOUnit::IsUpdaterThreadAlive() { return m_pacUIOUpdater.joinable(); }
- 
-@@ -229,6 +258,7 @@ void PacUIO::PacUIOUnit::TriggerPacUIOUpdaterThread()
+@@ -238,6 +257,7 @@ void PacUIO::PacUIOUnit::TriggerPacUIOUpdaterThread()
  
  void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
  {
@@ -3022,7 +3648,7 @@ index 314ea83..fb7ab81 100644
     try
     {
        ResetFadeTime();
-@@ -236,6 +266,7 @@ void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
+@@ -245,6 +265,7 @@ void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
     catch (const std::exception& e)
     {
        Log::Exception(StringExtensions::Build("A exception occurred while setting the fadetime for PacUIO {0} to 0.", std::to_string(m_index)));
@@ -3030,7 +3656,7 @@ index 314ea83..fb7ab81 100644
        m_updaterThreadFinished = true;
        return;
     }
-@@ -243,16 +274,34 @@ void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
+@@ -252,16 +273,38 @@ void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
     int failCnt = 0;
     while (m_keepPacUIOUpdaterAlive.load())
     {
@@ -3047,8 +3673,12 @@ index 314ea83..fb7ab81 100644
           if (IsPresent())
           {
 -            SendPacUIOUpdate();
-+            if (SendPacUIOUpdate(gate.open))
++            // VPE: a failed write is reported and retried on the next pass, without ending the updater.
++            bool failed = false;
++            if (SendPacUIOUpdate(gate.open, failed))
 +               gateUnit->Ack(gate);
++            else if (failed)
++               gateUnit->Fail(gate.generation);
           }
 +         else
 +            gateUnit->Fail(gate.generation);
@@ -3066,7 +3696,7 @@ index 314ea83..fb7ab81 100644
           Log::Exception(StringExtensions::Build("A error occurred when updating PacUIO {0}", std::to_string(m_id)));
           failCnt++;
  
-@@ -271,112 +320,94 @@ void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
+@@ -280,68 +323,101 @@ void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
        }
        m_triggerUpdate.store(false);
     }
@@ -3078,8 +3708,9 @@ index 314ea83..fb7ab81 100644
  }
  
 -void PacUIO::PacUIOUnit::SendPacUIOUpdate()
-+bool PacUIO::PacUIOUnit::SendPacUIOUpdate(bool open)
++bool PacUIO::PacUIOUnit::SendPacUIOUpdate(bool open, bool& failed)
  {
++   failed = false;
     if (!IsPresent())
     {
        m_forceFullUpdate = true;
@@ -3103,62 +3734,50 @@ index 314ea83..fb7ab81 100644
 +         std::copy(m_currentValue, m_currentValue + 96, target);
     }
  
--   uint8_t intensityUpdatesRequired = 0;
--   uint8_t stateUpdatesRequired = 0;
--
+-   int updatesRequired = 0;
 -   if (!m_forceFullUpdate)
 +   int changed = 0;
 +   for (int o = 0; o < 96; o++)
     {
--      for (int g = 0; g < 12; g++)
+-      for (int o = 0; o < 96; o++)
 -      {
--         bool stateUpdateRequired = false;
--         for (int p = 0; p < 8; p++)
--         {
--            int o = g << 3 | p;
--            if (m_currentValue[o] > 0)
--            {
--               if (m_currentValue[o] != m_lastValueSent[o])
--               {
--                  intensityUpdatesRequired++;
--               }
--               else if (!m_lastStateSent[o])
--               {
--                  stateUpdateRequired = true;
--               }
--            }
--            else if (m_lastStateSent[o])
--            {
--               stateUpdateRequired = true;
--            }
--         }
--         if (stateUpdateRequired)
--            stateUpdatesRequired++;
+-         if (m_currentValue[o] != m_lastValueSent[o] || (m_currentValue[o] > 0) != m_lastStateSent[o])
+-            updatesRequired++;
 -      }
 +      if (target[o] != m_lastValueSent[o] || (target[o] > 0) != m_lastStateSent[o])
 +         changed++;
     }
  
--   if (m_forceFullUpdate || (intensityUpdatesRequired + stateUpdatesRequired) > 50)
+-   if (m_forceFullUpdate || updatesRequired > 50)
 +   if (m_forceFullUpdate || changed > 50)
     {
--      m_pdSingleton->PacLed64SetLEDIntensities(m_index, m_currentValue);
--      std::copy(m_currentValue, m_currentValue + 96, m_lastValueSent);
--      for (int i = 0; i < 96; i++)
+-      if (m_pdSingleton->PacLed64SetLEDIntensities(m_index, m_currentValue))
 +      // VPE: a latch before or during the transfer makes this opening's update obsolete; the ports it reached are not
 +      // known to the next pass, which sends all of them.
 +      bool cancelled = false;
 +      bool written = m_pdSingleton->PacLed64SetLEDIntensities(m_index, target, open ? GateLatched : nullptr, &cancelled);
 +      if (cancelled)
        {
--         m_lastStateSent[i] = (m_lastValueSent[i] > 0);
+-         std::copy(m_currentValue, m_currentValue + 96, m_lastValueSent);
+-         for (int i = 0; i < 96; i++)
+-         {
+-            m_lastStateSent[i] = (m_lastValueSent[i] > 0);
+-         }
+-         m_forceFullUpdate = false;
 +         std::lock_guard<std::mutex> valueLock(m_valueChangeLocker);
 +         m_forceFullUpdate = true;
 +         m_updateRequired = true;
 +         return false;
        }
+-      else
 +      if (!written)
-+         throw std::runtime_error("PacUIO: write failed");
++      {
++         std::lock_guard<std::mutex> valueLock(m_valueChangeLocker);
+          m_forceFullUpdate = true;
++         m_updateRequired = true;
++         failed = true;
++         return false;
++      }
 +      std::copy(target, target + 96, m_lastValueSent);
 +      for (int i = 0; i < 96; i++)
 +         m_lastStateSent[i] = (m_lastValueSent[i] > 0);
@@ -3168,72 +3787,66 @@ index 314ea83..fb7ab81 100644
     }
 -   else
 +
-+   // VPE: each changed port gets its intensity, zero included. libdof's state call writes 255 or 0 to every port of
-+   // a group, which would turn dimmed and unchanged neighbours to full or off.
 +   for (int o = 0; o < 96; o++)
     {
--      for (int g = 0; g < 12; g++)
+-      for (int o = 0; o < 96; o++)
 +      if (target[o] == m_lastValueSent[o] && (target[o] > 0) == m_lastStateSent[o])
 +         continue;
 +      // VPE: once the gate is latched, the rest of an opening's update is obsolete: the next pass sends the closing.
 +      if (open && OutputGate::Instance().IsLatched())
        {
--         int mask = 0;
--         bool stateUpdateRequired = false;
--         for (int p = 0; p < 8; p++)
+-         if (m_currentValue[o] == m_lastValueSent[o] && (m_currentValue[o] > 0) == m_lastStateSent[o])
+-            continue;
+-
+-         if (!m_pdSingleton->PacLed64SetLEDIntensity(m_index, o, m_currentValue[o]))
 -         {
--            int o = g << 3 | p;
--            if (m_currentValue[o] > 0)
--            {
--               if (m_currentValue[o] != m_lastValueSent[o])
--               {
--                  m_pdSingleton->PacLed64SetLEDIntensity(m_index, o, m_currentValue[o]);
--                  m_lastStateSent[o] = true;
--                  m_lastValueSent[o] = m_currentValue[o];
--               }
--               else if (!m_lastStateSent[o])
--               {
--                  mask |= (1 << p);
--                  stateUpdateRequired = true;
--                  m_lastStateSent[o] = true;
--               }
--            }
--            else if (m_lastStateSent[o])
--            {
--               stateUpdateRequired = true;
--               m_lastStateSent[o] = false;
--               m_lastValueSent[o] = 0;
--            }
+-            m_forceFullUpdate = true;
+-            continue;
 -         }
--         if (stateUpdateRequired)
--         {
--            m_pdSingleton->PacLed64SetLEDStates(m_index, g + 1, static_cast<uint8_t>(mask));
--         }
+-         m_lastValueSent[o] = m_currentValue[o];
+-         m_lastStateSent[o] = (m_currentValue[o] > 0);
 +         std::lock_guard<std::mutex> valueLock(m_valueChangeLocker);
 +         m_forceFullUpdate = true;
 +         m_updateRequired = true;
 +         return false;
-       }
++      }
 +      if (!m_pdSingleton->PacLed64SetLEDIntensity(m_index, o, target[o]))
-+         throw std::runtime_error("PacUIO: write failed");
++      {
++         failed = true;
++         continue;
+       }
 +      m_lastValueSent[o] = target[o];
 +      m_lastStateSent[o] = target[o] > 0;
     }
++   if (failed)
++   {
++      // VPE: what a failed port has is not known: the next pass sends everything.
++      std::lock_guard<std::mutex> valueLock(m_valueChangeLocker);
++      m_forceFullUpdate = true;
++      m_updateRequired = true;
++      return false;
++   }
 +   return true;
  }
  
  void PacUIO::PacUIOUnit::ShutdownLighting()
- {
+@@ -349,7 +425,14 @@ void PacUIO::PacUIOUnit::ShutdownLighting()
     Log::Write("PacUIO.ShutdownLighting");
--   m_pdSingleton->PacLed64SetLEDStates(0, 0, 0);
-+   if (!IsPresent())
-+      return;
+    if (!IsPresent())
+       return;
+-   m_pdSingleton->PacLed64SetLEDStates(m_index, 0, 0);
++   // Taken before the zeros, so they confirm the closing that was published when the updater ended.
++   OutputGate::Snapshot finalGate {};
++   if (m_gateUnit)
++      finalGate = m_gateUnit->Observe();
 +   if (!m_pdSingleton->PacLed64SetLEDStates(m_index, 0, 0))
 +      throw std::runtime_error("PacUIO: turning the outputs off failed");
++   if (m_gateUnit && !finalGate.open)
++      m_gateUnit->Ack(finalGate);
     std::fill_n(m_lastStateSent, 96, false);
  }
  
-@@ -393,24 +424,19 @@ bool PacUIO::PacUIOUnit::IsPresent()
+@@ -366,24 +449,19 @@ bool PacUIO::PacUIOUnit::IsPresent()
     return m_index >= 0;
  }
  
@@ -3269,7 +3882,7 @@ index 314ea83..fb7ab81 100644
  }
 \ No newline at end of file
 diff --git a/src/cab/out/pac/PacUIO.h b/src/cab/out/pac/PacUIO.h
-index 0da2310..cb2591d 100644
+index 0da2310..60f089b 100644
 --- a/src/cab/out/pac/PacUIO.h
 +++ b/src/cab/out/pac/PacUIO.h
 @@ -1,6 +1,7 @@
@@ -3297,37 +3910,35 @@ index 0da2310..cb2591d 100644
  
        std::mutex m_pacUIOUpdateLocker;
        std::mutex m_valueChangeLocker;
-@@ -82,9 +86,9 @@ private:
+@@ -82,9 +86,10 @@ private:
     private:
        void CopyNewToCurrent();
        void PacUIOUpdaterDoIt();
 -      void SendPacUIOUpdate();
 +      // VPE: false if a latch ended an opening's update early (the gate's opening was then not sent).
-+      bool SendPacUIOUpdate(bool open);
++      // Returns true once the update is sent. `failed` is set when a write failed; the next pass sends everything.
++      bool SendPacUIOUpdate(bool open, bool& failed);
        void ResetFadeTime();
 -      void InitUnit();
  
        bool IsPresent();
        void OnPacAttached(int index);
 diff --git a/src/cab/out/pinone/PinOne.cpp b/src/cab/out/pinone/PinOne.cpp
-index b898d3f..926ed3d 100644
+index 0cce88a..cc59c9d 100644
 --- a/src/cab/out/pinone/PinOne.cpp
 +++ b/src/cab/out/pinone/PinOne.cpp
-@@ -171,21 +171,27 @@ void PinOne::UpdateOutputs(const std::vector<uint8_t>& newOutputValues)
-       int lim = std::min(i + 7, GetNumberOfOutputs());
+@@ -172,7 +172,7 @@ void PinOne::UpdateOutputs(const std::vector<uint8_t>& newOutputValues)
+       int lim = std::min(i + 7, count);
        for (int j = i; j < lim; ++j)
        {
 -         if (newOutputValues[j] != m_oldOutputValues[j])
-+         if (j < static_cast<int>(newOutputValues.size()) && j < static_cast<int>(m_oldOutputValues.size())
-+            && (m_forceFullTransfer || newOutputValues[j] != m_oldOutputValues[j]))
++         if (m_forceFullTransfer || newOutputValues[j] != m_oldOutputValues[j])
           {
              UpdateDelay();
              std::vector<uint8_t> buf(9);
-             buf[0] = 0;
+@@ -180,13 +180,16 @@ void PinOne::UpdateOutputs(const std::vector<uint8_t>& newOutputValues)
              buf[1] = pfx;
--            std::copy(newOutputValues.begin() + i, newOutputValues.begin() + lim, buf.begin() + 2);
-+            int end = std::min(lim, static_cast<int>(newOutputValues.size()));
-+            std::copy(newOutputValues.begin() + i, newOutputValues.begin() + end, buf.begin() + 2);
+             std::copy(newOutputValues.begin() + i, newOutputValues.begin() + lim, buf.begin() + 2);
  
 +            // VPE: the cache only learns what the device got.
              if (m_comPort == HidSentinel)
@@ -3341,11 +3952,10 @@ index b898d3f..926ed3d 100644
                 m_pinOneCommunication->Write(buf);
 +            else
 +               throw std::runtime_error(StringExtensions::Build("{0} {1} is not connected", "PinOne", GetName()));
-+            lim = end;
  
              std::copy(newOutputValues.begin() + i, newOutputValues.begin() + lim, m_oldOutputValues.begin() + i);
              break;
-@@ -238,15 +244,9 @@ void PinOne::ConnectToController()
+@@ -239,15 +242,9 @@ void PinOne::ConnectToController()
        m_pinOneCommunication = new PinOneCommunication(m_comPort);
        if (!m_pinOneCommunication->ConnectToServer())
        {
@@ -3797,7 +4407,7 @@ index 0536494..4fa07c7 100644
 \ No newline at end of file
 +}
 diff --git a/src/cab/out/ps/Pinscape.cpp b/src/cab/out/ps/Pinscape.cpp
-index 698dccc..9da61b7 100644
+index 698dccc..4cf24b0 100644
 --- a/src/cab/out/ps/Pinscape.cpp
 +++ b/src/cab/out/ps/Pinscape.cpp
 @@ -75,7 +75,16 @@ void Pinscape::SetNumber(int value)
@@ -3818,13 +4428,33 @@ index 698dccc..9da61b7 100644
  
  void Pinscape::SetMinCommandIntervalMs(int value)
  {
-@@ -113,7 +122,10 @@ void Pinscape::ConnectToController() { }
+@@ -101,19 +110,22 @@ void Pinscape::Init(Cabinet* cabinet)
+    OutputControllerFlexCompleteBase::Init(cabinet);
+ }
+ 
+-void Pinscape::Finish()
+-{
+-   if (m_dev)
+-      m_dev->AllOff();
+-   OutputControllerFlexCompleteBase::Finish();
+-}
++// VPE: the all-off goes out on the updater's way out (DisconnectFromController), after its last transfer and checked;
++// a failure reaches the caller through the base class once the updater has ended.
++void Pinscape::Finish() { OutputControllerFlexCompleteBase::Finish(); }
+ 
+ void Pinscape::ConnectToController() { }
+ 
  void Pinscape::DisconnectFromController()
  {
-    if (m_dev && m_inUseState == InUseState::Running)
+-   if (m_dev && m_inUseState == InUseState::Running)
+-      m_dev->AllOff();
++   // VPE: also for a controller DOF never used, whose blackout is the only update it gets at the end of the session.
++   if (m_dev)
 +   {
-       m_dev->AllOff();
 +      m_cacheInvalid = true;
++      if (!m_dev->AllOff())
++         throw std::runtime_error(StringExtensions::Build("{0} could not turn its outputs off", GetName()));
++      m_disconnectSentZeros = true;
 +   }
  }
  
@@ -3874,10 +4504,28 @@ index 698dccc..9da61b7 100644
  }
  
  void Pinscape::UpdateDelay()
+@@ -349,7 +372,7 @@ bool Pinscape::Device::ReadUSB(uint8_t* pBuf)
+    return true;
+ }
+ 
+-void Pinscape::Device::AllOff() { SpecialRequest(0x05); }
++bool Pinscape::Device::AllOff() { return SpecialRequest(0x05); }
+ 
+ bool Pinscape::Device::SpecialRequest(uint8_t id)
+ {
 diff --git a/src/cab/out/ps/Pinscape.h b/src/cab/out/ps/Pinscape.h
-index ee1ca84..fa6fbb8 100644
+index ee1ca84..8b7a11e 100644
 --- a/src/cab/out/ps/Pinscape.h
 +++ b/src/cab/out/ps/Pinscape.h
+@@ -56,7 +56,7 @@ private:
+       int GetNumOutputs() const { return m_numOutputs; }
+       bool IsLedWizEmulator(int unitNum);
+       bool ReadUSB(uint8_t* buf);
+-      void AllOff();
++      bool AllOff();
+       bool SpecialRequest(uint8_t id);
+       bool WriteUSB(uint8_t* buf);
+       void UpdateOutputs(uint8_t* NewOutputValues);
 @@ -79,6 +79,8 @@ private:
     int m_minCommandIntervalMs;
     bool m_minCommandIntervalMsSet;
@@ -3888,36 +4536,18 @@ index ee1ca84..fa6fbb8 100644
     static std::vector<Device*> s_devices;
     Device* m_dev;
 diff --git a/src/cab/out/pspico/PinscapePico.cpp b/src/cab/out/pspico/PinscapePico.cpp
-index 4b5ddd4..aa0f37c 100644
+index 6cdcc74..8b85dc7 100644
 --- a/src/cab/out/pspico/PinscapePico.cpp
 +++ b/src/cab/out/pspico/PinscapePico.cpp
-@@ -81,19 +81,15 @@ void PinscapePico::Init(Cabinet* cabinet)
-       m_minCommandIntervalMs = 0;
-    }
- 
--   OutputControllerFlexCompleteBase::Init(cabinet);
-+   // VPE: the device is bound before the outputs and the cache are made from its output count, and before the
-+   // updater starts, which then owns the cache.
-    ConnectToController();
-+   OutputControllerFlexCompleteBase::Init(cabinet);
- }
- 
--void PinscapePico::Finish()
--{
--   if (m_dev)
--   {
--      AllOff();
--   }
--   DisconnectFromController();
--   OutputControllerFlexCompleteBase::Finish();
--}
-+// VPE: the updater turns the outputs off and disconnects when it stops; doing it here as well raced with its last
-+// transfers.
-+void PinscapePico::Finish() { OutputControllerFlexCompleteBase::Finish(); }
- 
- bool PinscapePico::VerifySettings()
- {
-@@ -103,13 +99,16 @@ bool PinscapePico::VerifySettings()
+@@ -7,6 +7,7 @@
+ #include <ctime>
+ #include <iomanip>
+ #include <sstream>
++#include <stdexcept>
+ #include <string>
+ #include <thread>
+ #include <regex>
+@@ -95,13 +96,16 @@ bool PinscapePico::VerifySettings()
        return false;
     }
  
@@ -3935,15 +4565,20 @@ index 4b5ddd4..aa0f37c 100644
  
     for (auto device : s_devices)
     {
-@@ -133,6 +132,7 @@ void PinscapePico::DisconnectFromController()
+@@ -124,7 +128,11 @@ void PinscapePico::DisconnectFromController()
+ {
     if (m_dev)
     {
-       m_dev->AllOff();
+-      m_dev->AllOff();
 +      m_cacheInvalid = true;
++      // VPE: the blackout is the last word for a unit DOF never used: one that did not get there is an error.
++      if (!m_dev->AllOff())
++         throw std::runtime_error(StringExtensions::Build("Pinscape Pico {0} could not turn its outputs off", GetName()));
++      m_disconnectSentZeros = true;
     }
  }
  
-@@ -196,7 +196,9 @@ public:
+@@ -188,7 +196,9 @@ public:
     {
        for (const auto& l : list)
        {
@@ -3954,7 +4589,7 @@ index 4b5ddd4..aa0f37c 100644
           buf[0] = psp->m_dev->GetOutputReportId();
           buf[1] = 0x22;
           buf[2] = static_cast<uint8_t>(l.outputs.size());
-@@ -207,7 +209,8 @@ public:
+@@ -199,7 +209,8 @@ public:
              buf[idx++] = static_cast<uint8_t>(output.second);
           }
  
@@ -3964,7 +4599,7 @@ index 4b5ddd4..aa0f37c 100644
        }
     }
  
-@@ -285,7 +288,8 @@ public:
+@@ -277,7 +288,8 @@ public:
     {
        for (const auto& l : list)
        {
@@ -3974,7 +4609,7 @@ index 4b5ddd4..aa0f37c 100644
           buf[0] = psp->m_dev->GetOutputReportId();
           buf[1] = 0x21;
           buf[2] = static_cast<uint8_t>(l.numToSend);
-@@ -294,7 +298,8 @@ public:
+@@ -286,7 +298,8 @@ public:
           for (const auto& output : l.outputs)
              buf[idx++] = static_cast<uint8_t>(output);
  
@@ -3984,7 +4619,7 @@ index 4b5ddd4..aa0f37c 100644
        }
     }
  
-@@ -309,17 +314,21 @@ private:
+@@ -301,7 +314,7 @@ private:
  void PinscapePico::UpdateOutputs(const std::vector<uint8_t>& newOutputValues)
  {
     if (!m_dev)
@@ -3993,15 +4628,8 @@ index 4b5ddd4..aa0f37c 100644
  
     ContiguousOutputListGroup contiguousGroup;
     RandomAccessOutputListGroup randomGroup;
-    int firstChangedIndex = -1;
-    int lastChangedIndex = -1;
- 
--   for (int i = 0; i < GetNumberOfOutputs(); ++i)
-+   // VPE: the outputs were created before the device reported its port count; only the ports both know are sent.
-+   if (static_cast<int>(m_oldOutputValues.size()) < GetNumberOfOutputs())
-+      m_oldOutputValues.resize(GetNumberOfOutputs(), 255);
-+   int count = std::min(GetNumberOfOutputs(), static_cast<int>(newOutputValues.size()));
-+   for (int i = 0; i < count; ++i)
+@@ -314,7 +327,7 @@ void PinscapePico::UpdateOutputs(const std::vector<uint8_t>& newOutputValues)
+    for (int i = 0; i < count; ++i)
     {
        int val = newOutputValues[i];
 -      bool changed = (newOutputValues[i] != m_oldOutputValues[i]);
@@ -4009,7 +4637,7 @@ index 4b5ddd4..aa0f37c 100644
  
        contiguousGroup.Add(i, val, changed);
        randomGroup.Add(i, val, changed);
-@@ -332,10 +341,12 @@ void PinscapePico::UpdateOutputs(const std::vector<uint8_t>& newOutputValues)
+@@ -327,10 +340,12 @@ void PinscapePico::UpdateOutputs(const std::vector<uint8_t>& newOutputValues)
        }
     }
  
@@ -4022,23 +4650,28 @@ index 4b5ddd4..aa0f37c 100644
  
     if (firstChangedIndex >= 0)
     {
-@@ -349,6 +360,12 @@ int PinscapePico::GetNumberOfOutputs() const
- {
-    if (m_dev)
-       return m_dev->NumOutputs();
-+   // VPE: before binding, the enumerated device of this unit knows its port count; auto-configuration maps that many.
-+   for (auto device : s_devices)
-+   {
-+      if (device->UnitNo() == m_number)
-+         return device->NumOutputs();
-+   }
-    return 128;
+@@ -700,7 +715,7 @@ void PinscapePico::Device::Close()
+    }
  }
  
+-void PinscapePico::Device::AllOff() { DeviceRequest("ALL PORTS OFF", 0x20); }
++bool PinscapePico::Device::AllOff() { return DeviceRequest("ALL PORTS OFF", 0x20); }
+ 
+ bool PinscapePico::Device::DeviceRequest(const std::string& desc, uint8_t commandId)
+ {
 diff --git a/src/cab/out/pspico/PinscapePico.h b/src/cab/out/pspico/PinscapePico.h
-index e78cf9c..f12a7cf 100644
+index e78cf9c..f529cc1 100644
 --- a/src/cab/out/pspico/PinscapePico.h
 +++ b/src/cab/out/pspico/PinscapePico.h
+@@ -68,7 +68,7 @@ public:
+       bool Open();
+       uint8_t* ReadUSB(uint32_t timeoutMs);
+       void Close();
+-      void AllOff();
++      bool AllOff();
+       bool WriteUSB(const std::string& desc, uint8_t* buf, uint32_t timeoutMs);
+       bool DeviceRequest(const std::string& desc, uint8_t commandId);
+ 
 @@ -108,6 +108,8 @@ private:
     std::chrono::steady_clock::time_point m_lastUpdate;
     static std::vector<Device*> s_devices;
@@ -4049,308 +4682,6 @@ index e78cf9c..f12a7cf 100644
  
  }
 \ No newline at end of file
-diff --git a/src/cab/schedules/ScheduledSettings.cpp b/src/cab/schedules/ScheduledSettings.cpp
-index a6d0b0d..0da2207 100644
---- a/src/cab/schedules/ScheduledSettings.cpp
-+++ b/src/cab/schedules/ScheduledSettings.cpp
-@@ -89,18 +89,8 @@ ScheduledSettingDevice* ScheduledSettings::GetActiveSchedule(IOutput* currentOut
-    std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
-    int deviceID = startingDeviceIndex + currentDeviceIndex;
- 
--   static std::vector<int> cacheList;
--
--   static int callCount = 0;
--   if (++callCount > 1000)
--   {
--      cacheList.clear();
--      callCount = 0;
--   }
--
--   if (std::find(cacheList.begin(), cacheList.end(), deviceID) != cacheList.end())
--      return nullptr;
--
-+   // VPE: no cache of devices. It skipped every lookup after the first match of a device, so later outputs of that
-+   // device (and values sent again after the output gate opened) went out at full strength.
-    for (ScheduledSetting* scheduledSetting : *this)
-    {
-       if (!scheduledSetting || !scheduledSetting->IsEnabled())
-@@ -143,8 +133,6 @@ ScheduledSettingDevice* ScheduledSettings::GetActiveSchedule(IOutput* currentOut
-             }
-          }
- 
--         cacheList.push_back(deviceID);
--
-          return device;
-       }
-    }
-diff --git a/src/cab/schedules/ScheduledSettings.h b/src/cab/schedules/ScheduledSettings.h
-index c98d622..7d636ff 100644
---- a/src/cab/schedules/ScheduledSettings.h
-+++ b/src/cab/schedules/ScheduledSettings.h
-@@ -31,13 +31,12 @@ public:
-    virtual tinyxml2::XMLElement* ToXml(tinyxml2::XMLDocument& doc) const override;
-    virtual bool FromXml(const tinyxml2::XMLElement* element) override;
-    virtual std::string GetXmlElementName() const override { return "ScheduledSettings"; }
-+   void Clear();
- 
- private:
-    ScheduledSettings() = default;
-    ScheduledSettings(const ScheduledSettings&) = delete;
-    ScheduledSettings& operator=(const ScheduledSettings&) = delete;
--
--   void Clear();
- };
- 
- }
-\ No newline at end of file
-diff --git a/src/cab/sequencer/SequentialOutputSettings.h b/src/cab/sequencer/SequentialOutputSettings.h
-index 031af6b..a4a3dcb 100644
---- a/src/cab/sequencer/SequentialOutputSettings.h
-+++ b/src/cab/sequencer/SequentialOutputSettings.h
-@@ -21,13 +21,12 @@ public:
-    virtual tinyxml2::XMLElement* ToXml(tinyxml2::XMLDocument& doc) const override;
-    virtual bool FromXml(const tinyxml2::XMLElement* element) override;
-    virtual std::string GetXmlElementName() const override { return "SequentialOutputSettings"; }
-+   void Clear();
- 
- private:
-    SequentialOutputSettings() = default;
-    SequentialOutputSettings(const SequentialOutputSettings&) = delete;
-    SequentialOutputSettings& operator=(const SequentialOutputSettings&) = delete;
--
--   void Clear();
- };
- 
- }
-\ No newline at end of file
-diff --git a/src/cab/toys/layer/AlphaMappingTable.cpp b/src/cab/toys/layer/AlphaMappingTable.cpp
-index 84fd974..8bfca11 100644
---- a/src/cab/toys/layer/AlphaMappingTable.cpp
-+++ b/src/cab/toys/layer/AlphaMappingTable.cpp
-@@ -14,7 +14,7 @@ void AlphaMappingTable::Initialize()
-    for (int alpha = 0; alpha < 256; alpha++)
-    {
-       for (int value = 0; value < 256; value++)
--         AlphaMapping[alpha][value] = static_cast<float>(value) / 255.0f * static_cast<float>(alpha);
-+         AlphaMapping[alpha][value] = static_cast<float>(static_cast<double>(value) / 255 * static_cast<double>(alpha));
-    }
- 
-    s_initialized = true;
-diff --git a/src/cab/toys/layer/RGBAToy.cpp b/src/cab/toys/layer/RGBAToy.cpp
-index d797b7b..daa4f5b 100644
---- a/src/cab/toys/layer/RGBAToy.cpp
-+++ b/src/cab/toys/layer/RGBAToy.cpp
-@@ -4,6 +4,7 @@
- #include "../../out/IOutput.h"
- #include "../../../Log.h"
- #include "../../../general/StringExtensions.h"
-+#include "AlphaMappingTable.h"
- 
- #include <algorithm>
- 
-@@ -37,10 +38,47 @@ void RGBAToy::Init(Cabinet* cabinet)
-    Reset();
- }
- 
-+RGBColor RGBAToy::GetResultingData()
-+{
-+   if (m_layers.GetLayerNumbers().size() > 0)
-+   {
-+      float red = 0;
-+      float green = 0;
-+      float blue = 0;
-+      std::vector<int> layerNumbers = m_layers.GetLayerNumbers();
-+      for (int layerNumber : layerNumbers)
-+      {
-+         RGBAColor* layer = m_layers.GetLayer(layerNumber, 1);
-+         if (layer == nullptr)
-+            continue;
-+         const RGBAColor& layerColor = layer[0];
-+         int alpha = layerColor.GetAlpha();
-+         if (alpha != 0)
-+         {
-+            int negAlpha = 255 - alpha;
-+            red = AlphaMappingTable::AlphaMapping[negAlpha][(int)red] + AlphaMappingTable::AlphaMapping[alpha][layerColor.GetRed()];
-+            green = AlphaMappingTable::AlphaMapping[negAlpha][(int)green] + AlphaMappingTable::AlphaMapping[alpha][layerColor.GetGreen()];
-+            blue = AlphaMappingTable::AlphaMapping[negAlpha][(int)blue] + AlphaMappingTable::AlphaMapping[alpha][layerColor.GetBlue()];
-+         }
-+      }
-+
-+      return RGBColor((int)red, (int)green, (int)blue);
-+   }
-+   else
-+   {
-+      return RGBColor(0, 0, 0);
-+   }
-+}
-+
- void RGBAToy::Reset()
- {
--   m_currentColor = RGBAColor(0, 0, 0, 255);
--   UpdateOutputs();
-+   m_layers.Clear();
-+   if (m_redOutput != nullptr)
-+      m_redOutput->SetOutput(0);
-+   if (m_greenOutput != nullptr)
-+      m_greenOutput->SetOutput(0);
-+   if (m_blueOutput != nullptr)
-+      m_blueOutput->SetOutput(0);
- }
- 
- void RGBAToy::Finish()
-@@ -49,52 +87,21 @@ void RGBAToy::Finish()
-    Reset();
- }
- 
--void RGBAToy::UpdateToy()
--{
--   MergeLayers();
--
--   UpdateOutputs();
--}
-+void RGBAToy::UpdateToy() { UpdateOutputs(); }
- 
- void RGBAToy::UpdateOutputs()
- {
-+   RGBColor rgb = GetResultingData();
-+
-    if (m_redOutput != nullptr)
--      m_redOutput->SetOutput(static_cast<uint8_t>(m_currentColor.GetRed()));
-+      m_redOutput->SetOutput(static_cast<uint8_t>(rgb.GetRed()));
- 
-    if (m_greenOutput != nullptr)
--      m_greenOutput->SetOutput(static_cast<uint8_t>(m_currentColor.GetGreen()));
-+      m_greenOutput->SetOutput(static_cast<uint8_t>(rgb.GetGreen()));
- 
-    if (m_blueOutput != nullptr)
--      m_blueOutput->SetOutput(static_cast<uint8_t>(m_currentColor.GetBlue()));
-+      m_blueOutput->SetOutput(static_cast<uint8_t>(rgb.GetBlue()));
- }
- 
--void RGBAToy::MergeLayers()
--{
--   m_currentColor = RGBAColor(0, 0, 0, 255);
--
--   std::vector<int> layerNumbers = m_layers.GetLayerNumbers();
--   std::sort(layerNumbers.begin(), layerNumbers.end());
--
--   for (int layerNumber : layerNumbers)
--   {
--      RGBAColor* layer = m_layers.GetLayer(layerNumber, 1);
--      if (layer != nullptr)
--      {
--         const RGBAColor& layerColor = layer[0];
--
--         if (layerColor.GetAlpha() > 0)
--         {
--            float alpha = layerColor.GetAlpha() / 255.0f;
--            float invAlpha = 1.0f - alpha;
--
--            int red = static_cast<int>(m_currentColor.GetRed() * invAlpha + layerColor.GetRed() * alpha);
--            int green = static_cast<int>(m_currentColor.GetGreen() * invAlpha + layerColor.GetGreen() * alpha);
--            int blue = static_cast<int>(m_currentColor.GetBlue() * invAlpha + layerColor.GetBlue() * alpha);
--
--            m_currentColor.SetRGBA(red, green, blue, 255);
--         }
--      }
--   }
--}
- 
- }
-\ No newline at end of file
-diff --git a/src/cab/toys/layer/RGBAToy.h b/src/cab/toys/layer/RGBAToy.h
-index 429a6de..665726e 100644
---- a/src/cab/toys/layer/RGBAToy.h
-+++ b/src/cab/toys/layer/RGBAToy.h
-@@ -5,6 +5,7 @@
- #include "../IRGBOutputToy.h"
- #include "ILayerToy.h"
- #include "../../../general/color/RGBAColor.h"
-+#include "../../../general/color/RGBColor.h"
- #include <vector>
- 
- namespace DOF
-@@ -34,7 +35,7 @@ public:
-    IOutput* GetGreenOutput() const { return m_greenOutput; }
-    IOutput* GetBlueOutput() const { return m_blueOutput; }
- 
--   RGBAColor GetCurrentColor() const { return m_currentColor; }
-+   RGBColor GetResultingData();
- 
-    virtual const std::string& GetOutputNameBlue() const override { return m_outputNameBlue; }
-    virtual void SetOutputNameBlue(const std::string& name) override { m_outputNameBlue = name; }
-@@ -43,12 +44,8 @@ public:
-    virtual const std::string& GetOutputNameRed() const override { return m_outputNameRed; }
-    virtual void SetOutputNameRed(const std::string& name) override { m_outputNameRed = name; }
- 
--protected:
--   void MergeLayers();
--
- private:
-    LayerDictionary<RGBAColor> m_layers;
--   RGBAColor m_currentColor;
- 
-    std::string m_outputNameRed;
-    std::string m_outputNameGreen;
-diff --git a/src/fx/EffectEffectBase.cpp b/src/fx/EffectEffectBase.cpp
-index 973be2b..0b3ca68 100644
---- a/src/fx/EffectEffectBase.cpp
-+++ b/src/fx/EffectEffectBase.cpp
-@@ -31,7 +31,9 @@ void EffectEffectBase::TriggerTargetEffect(TableElementData* triggerData)
-    {
-       try
-       {
--         m_targetEffect->Trigger(triggerData);
-+         // VPE: C# DOF passes the data by value; a copy keeps the target's changes (ValueInvertEffect) out of the caller.
-+         TableElementData data = *triggerData;
-+         m_targetEffect->Trigger(&data);
-       }
-       catch (const std::exception& e)
-       {
-diff --git a/src/fx/conditionfx/TableElementConditionEffect.cpp b/src/fx/conditionfx/TableElementConditionEffect.cpp
-index e28b0ab..b4e5045 100644
---- a/src/fx/conditionfx/TableElementConditionEffect.cpp
-+++ b/src/fx/conditionfx/TableElementConditionEffect.cpp
-@@ -133,7 +133,8 @@ void TableElementConditionEffect::UpdateVariableValues()
- 
-       if (StringExtensions::StartsWith(varName, "NamedElement_"))
-       {
--         std::string elementName = varName.substr(13);
-+         // VPE: element names are stored upper case.
-+         std::string elementName = StringExtensions::ToUpper(varName.substr(13));
- 
-          for (TableElement* element : *tableElements)
-          {
-diff --git a/src/fx/matrixfx/RGBAMatrixColorScaleShapeEffect.cpp b/src/fx/matrixfx/RGBAMatrixColorScaleShapeEffect.cpp
-index 1da6c1a..82cb7ce 100644
---- a/src/fx/matrixfx/RGBAMatrixColorScaleShapeEffect.cpp
-+++ b/src/fx/matrixfx/RGBAMatrixColorScaleShapeEffect.cpp
-@@ -109,7 +109,9 @@ void RGBAMatrixColorScaleShapeEffect::Trigger(TableElementData* tableElementData
- {
-    if (m_targetEffect != nullptr)
-    {
--      m_targetEffect->Trigger(tableElementData);
-+      // VPE: pass a copy, as C# DOF passes the data by value.
-+      TableElementData data = *tableElementData;
-+      m_targetEffect->Trigger(&data);
-    }
- }
- 
-diff --git a/src/fx/matrixfx/RGBAMatrixShapeEffect.cpp b/src/fx/matrixfx/RGBAMatrixShapeEffect.cpp
-index d30e7f2..8716f8a 100644
---- a/src/fx/matrixfx/RGBAMatrixShapeEffect.cpp
-+++ b/src/fx/matrixfx/RGBAMatrixShapeEffect.cpp
-@@ -104,7 +104,9 @@ void RGBAMatrixShapeEffect::Trigger(TableElementData* tableElementData)
- {
-    if (m_targetEffect != nullptr)
-    {
--      m_targetEffect->Trigger(tableElementData);
-+      // VPE: pass a copy, as C# DOF passes the data by value.
-+      TableElementData data = *tableElementData;
-+      m_targetEffect->Trigger(&data);
-    }
- }
- 
 diff --git a/src/fx/matrixfx/bitmapshapes/ShapeDefinitions.cpp b/src/fx/matrixfx/bitmapshapes/ShapeDefinitions.cpp
 index 303936f..afd013f 100644
 --- a/src/fx/matrixfx/bitmapshapes/ShapeDefinitions.cpp
@@ -4499,10 +4830,10 @@ index b6baeda..6b7ca12 100644
  
 diff --git a/src/general/PathConfinement.cpp b/src/general/PathConfinement.cpp
 new file mode 100644
-index 0000000..4c48ae9
+index 0000000..be98f3c
 --- /dev/null
 +++ b/src/general/PathConfinement.cpp
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,155 @@
 +#include "PathConfinement.h"
 +
 +#include <filesystem>
@@ -4522,9 +4853,11 @@ index 0000000..4c48ae9
 +{
 +   // A root was given. Without one every path is allowed (upstream behavior).
 +   bool set = false;
-+   // The root resolved; if it did not, nothing is allowed.
++   // The root resolved; until it does, nothing is allowed.
 +   bool valid = false;
 +   fs::path path;
++   // As given, so that a root that did not resolve (a folder not created yet) is looked up again on the next access.
++   std::string given;
 +};
 +
 +std::mutex s_mutex;
@@ -4538,6 +4871,7 @@ index 0000000..4c48ae9
 +   if (root.empty())
 +      return r;
 +   r.set = true;
++   r.given = root;
 +   std::error_code ec;
 +   fs::path canonical = fs::canonical(fs::path(root), ec);
 +   if (!ec && !canonical.empty())
@@ -4551,8 +4885,14 @@ index 0000000..4c48ae9
 +Root CurrentRoot()
 +{
 +   if (t_hasRoot)
++   {
++      if (t_root.set && !t_root.valid)
++         t_root = MakeRoot(t_root.given);
 +      return t_root;
++   }
 +   std::lock_guard<std::mutex> lock(s_mutex);
++   if (s_root.set && !s_root.valid)
++      s_root = MakeRoot(s_root.given);
 +   return s_root;
 +}
 +
@@ -4651,7 +4991,7 @@ index 0000000..4c48ae9
 +}
 diff --git a/src/general/PathConfinement.h b/src/general/PathConfinement.h
 new file mode 100644
-index 0000000..9319509
+index 0000000..00a6e77
 --- /dev/null
 +++ b/src/general/PathConfinement.h
 @@ -0,0 +1,34 @@
@@ -4668,7 +5008,7 @@ index 0000000..9319509
 +{
 +public:
 +   // Folder that reads are limited to. Empty allows every path (upstream behavior); writes and deletions are always
-+   // refused while a root is set. A root that does not resolve allows nothing.
++   // refused while a root is set. A root that does not resolve allows nothing, and is looked up again on every access.
 +   static void SetRoot(const std::string& root);
 +   static bool HasRoot();
 +   // Whether the path, with its symbolic links and dot components resolved, lies inside the root. Any error denies.
@@ -4708,19 +5048,6 @@ index 6c25106..51d74de 100644
     std::ofstream ofs;
     ofs.exceptions(std::ios::failbit | std::ios::badbit);
     ofs.open(filename, append ? (std::ios::out | std::ios::app) : std::ios::out);
-diff --git a/src/general/analog/AnalogAlpha.cpp b/src/general/analog/AnalogAlpha.cpp
-index 83f83be..5ce32e2 100644
---- a/src/general/analog/AnalogAlpha.cpp
-+++ b/src/general/analog/AnalogAlpha.cpp
-@@ -5,7 +5,7 @@ namespace DOF
- 
- AnalogAlpha::AnalogAlpha()
-    : m_value(0)
--   , m_alpha(255)
-+   , m_alpha(0)
- {
- }
- 
 diff --git a/src/general/bitmap/Image.cpp b/src/general/bitmap/Image.cpp
 index 023ce64..c2f72fd 100644
 --- a/src/general/bitmap/Image.cpp
@@ -4741,7 +5068,7 @@ index 023ce64..c2f72fd 100644
     if (!file)
     {
 diff --git a/src/globalconfiguration/GlobalConfig.cpp b/src/globalconfiguration/GlobalConfig.cpp
-index 96ea59f..e17eab8 100644
+index 96ea59f..f55b488 100644
 --- a/src/globalconfiguration/GlobalConfig.cpp
 +++ b/src/globalconfiguration/GlobalConfig.cpp
 @@ -6,9 +6,11 @@
@@ -4787,167 +5114,17 @@ index 96ea59f..e17eab8 100644
  
     return nullptr;
  }
-diff --git a/src/ledcontrol/setup/Configurator.cpp b/src/ledcontrol/setup/Configurator.cpp
-index 778587c..9ffb994 100644
---- a/src/ledcontrol/setup/Configurator.cpp
-+++ b/src/ledcontrol/setup/Configurator.cpp
-@@ -36,6 +36,7 @@
- #include "../../fx/timmedfx/DelayEffect.h"
- #include "../../fx/timmedfx/FadeEffect.h"
- #include "../../fx/valuefx/ValueInvertEffect.h"
-+#include "../../fx/conditionfx/TableElementConditionEffect.h"
- #include "../../fx/valuefx/ValueMapFullRangeEffect.h"
- #include "../../fx/matrixfx/RGBAMatrixColorEffect.h"
- #include "../../fx/matrixfx/RGBAMatrixFlickerEffect.h"
-@@ -859,6 +860,8 @@ void Configurator::SetupTable(
-                         "Ledwiz {0:00} Column {1:00} Setting {2:00} AnalogToyValueEffect", std::to_string(ledWizNr), std::to_string(tcc->GetNumber()), std::to_string(settingNumber));
-                      analogEffect->SetName(effectName);
-                      analogEffect->SetToyName(toy->GetName());
-+                     int layer = tcs->HasLayer() ? tcs->GetLayer() : settingNumber;
-+                     analogEffect->SetLayerNr(layer);
+@@ -388,6 +395,10 @@ void GlobalConfig::SaveGlobalConfig(const std::string& globalConfigFilename)
+    if (StringExtensions::IsNullOrWhiteSpace(gcFileName))
+       throw std::runtime_error("No filename for GlobalConfig file has been supplied. Looking up the filename from the property GlobalConfigFilename failed as well");
  
-                      AnalogAlpha activeValue(MathExtensions::Limit(tcs->GetIntensity(), 0, 255), 255);
-                      AnalogAlpha inactiveValue = activeValue;
-@@ -1060,9 +1063,16 @@ void Configurator::SetupTable(
-                         break;
-                      case OutputControlEnum::Condition:
-                      {
--                        std::vector<std::string> tableElementDescriptors;
--                        tableElementDescriptors.push_back(StringExtensions::Build("{0}.{1}.{2}", std::to_string(ledWizNr), std::to_string(tcc->GetNumber()), std::to_string(settingNumber)));
--                        AssignEffectToTableElements(table, tableElementDescriptors, finalEffect);
-+                        // VPE: as C# DOF, the condition becomes an effect in front of the chain, triggered by every table
-+                        // element the condition reads.
-+                        TableElementConditionEffect* conditionEffect = new TableElementConditionEffect();
-+                        conditionEffect->SetName(StringExtensions::Build("Ledwiz {0:00} Column {1:00} Setting {2:00} TableElementConditionEffect",
-+                           std::to_string(ledWizNr), std::to_string(tcc->GetNumber()), std::to_string(settingNumber)));
-+                        conditionEffect->SetTargetEffectName(finalEffect->GetName());
-+                        conditionEffect->SetCondition(tcs->GetCondition());
-+                        MakeEffectNameUnique(conditionEffect, table);
-+                        table->GetEffects()->insert(std::make_pair(conditionEffect->GetName(), conditionEffect));
-+                        AssignEffectToTableElements(table, conditionEffect->GetVariables(), conditionEffect);
-                      }
-                      break;
-                      case OutputControlEnum::FixedOff:
-@@ -1123,12 +1133,14 @@ void Configurator::AssignEffectToTableElements(Table* table, const std::vector<s
-       {
-          std::string elementName = descriptor.substr(1);
- 
--         TableElementData elementData(elementName, 0);
-+         // VPE: parsed with its dollar sign, so a name like S1 stays a named element instead of becoming solenoid 1.
-+         TableElementData elementData(descriptor, 0);
-          tableElements->UpdateState(&elementData);
- 
-          for (TableElement* te : *tableElements)
-          {
--            if (te->GetName() == elementName)
-+            // VPE: element names are stored upper case.
-+            if (te->GetName() == StringExtensions::ToUpper(elementName))
-             {
-                tableElement = te;
-                break;
-diff --git a/src/pinballsupport/AlarmHandler.cpp b/src/pinballsupport/AlarmHandler.cpp
-index a9afb5a..5b6d3c8 100644
---- a/src/pinballsupport/AlarmHandler.cpp
-+++ b/src/pinballsupport/AlarmHandler.cpp
-@@ -113,7 +113,7 @@ void AlarmHandler::RegisterIntervalAlarm(int intervalMs, AlarmCallback intervalA
-    std::lock_guard<std::recursive_mutex> lock(m_intervalAlarmMutex);
- 
-    UnregisterIntervalAlarm(intervalAlarmHandler);
--   m_intervalAlarmList.emplace_back(intervalMs, intervalAlarmHandler);
-+   m_intervalAlarmList.emplace_back(intervalMs, intervalAlarmHandler, m_nextIntervalAlarmId++);
- }
- 
- void AlarmHandler::UnregisterIntervalAlarm(AlarmCallback intervalAlarmHandler)
-@@ -152,17 +152,17 @@ AlarmHandler::TimePoint AlarmHandler::GetNextIntervalAlarm()
- bool AlarmHandler::ProcessIntervalAlarms(TimePoint alarmTime)
- {
-    std::vector<AlarmCallback> toExecute;
--   std::vector<size_t> toUpdateIndices;
-+   std::vector<uint64_t> toUpdate;
- 
-    {
-       std::lock_guard<std::recursive_mutex> lock(m_intervalAlarmMutex);
- 
--      for (size_t i = 0; i < m_intervalAlarmList.size(); ++i)
-+      for (const IntervalAlarmSetting& intervalAlarm : m_intervalAlarmList)
-       {
--         if (m_intervalAlarmList[i].nextAlarm <= alarmTime)
-+         if (intervalAlarm.nextAlarm <= alarmTime)
-          {
--            toExecute.push_back(m_intervalAlarmList[i].intervalAlarmHandler);
--            toUpdateIndices.push_back(i);
-+            toExecute.push_back(intervalAlarm.intervalAlarmHandler);
-+            toUpdate.push_back(intervalAlarm.id);
-          }
-       }
-    }
-@@ -183,20 +183,16 @@ bool AlarmHandler::ProcessIntervalAlarms(TimePoint alarmTime)
-    {
-       std::lock_guard<std::recursive_mutex> lock(m_intervalAlarmMutex);
- 
--      for (size_t i : toUpdateIndices)
-+      // As C# DOF: advance the registrations that fired. A handler that unregistered or re-registered itself during
-+      // its call has a new registration (or none), which keeps the schedule it was given.
-+      for (IntervalAlarmSetting& intervalAlarm : m_intervalAlarmList)
-       {
--         if (i < m_intervalAlarmList.size())
--         {
--            auto& intervalAlarm = m_intervalAlarmList[i];
--            if (intervalAlarm.nextAlarm + std::chrono::milliseconds(intervalAlarm.intervalMs) <= alarmTime)
--            {
--               intervalAlarm.nextAlarm = alarmTime + std::chrono::milliseconds(1);
--            }
--            else
--            {
--               intervalAlarm.nextAlarm = intervalAlarm.nextAlarm + std::chrono::milliseconds(intervalAlarm.intervalMs);
--            }
--         }
-+         if (std::find(toUpdate.begin(), toUpdate.end(), intervalAlarm.id) == toUpdate.end())
-+            continue;
-+         if (intervalAlarm.nextAlarm + std::chrono::milliseconds(intervalAlarm.intervalMs) <= alarmTime)
-+            intervalAlarm.nextAlarm = alarmTime + std::chrono::milliseconds(1);
-+         else
-+            intervalAlarm.nextAlarm = intervalAlarm.nextAlarm + std::chrono::milliseconds(intervalAlarm.intervalMs);
-       }
-    }
- 
-diff --git a/src/pinballsupport/AlarmHandler.h b/src/pinballsupport/AlarmHandler.h
-index a21e29e..6cf343b 100644
---- a/src/pinballsupport/AlarmHandler.h
-+++ b/src/pinballsupport/AlarmHandler.h
-@@ -1,5 +1,7 @@
- #pragma once
- 
-+#include <cstdint>
++   // VPE: the backup below is a write too.
++   if (!PathConfinement::IsWriteAllowed(gcFileName))
++      return;
 +
- #include "DOF/DOF.h"
- #include "Action.h"
- #include <functional>
-@@ -73,11 +75,14 @@ private:
-       int intervalMs;
-       TimePoint nextAlarm;
-       AlarmCallback intervalAlarmHandler;
-+      // VPE: identifies the registration, so a handler that re-registers itself is not advanced twice.
-+      uint64_t id;
- 
--      IntervalAlarmSetting(int interval, AlarmCallback handler)
-+      IntervalAlarmSetting(int interval, AlarmCallback handler, uint64_t registration)
-          : intervalMs(interval)
--         , intervalAlarmHandler(handler)
-          , nextAlarm(std::chrono::steady_clock::now() + std::chrono::milliseconds(interval))
-+         , intervalAlarmHandler(handler)
-+         , id(registration)
-       {
-       }
-    };
-@@ -86,6 +91,7 @@ private:
-    std::recursive_mutex m_intervalAlarmMutex;
-    std::vector<AlarmSetting> m_alarmList;
-    std::vector<IntervalAlarmSetting> m_intervalAlarmList;
-+   uint64_t m_nextIntervalAlarmId = 1;
- 
-    TimePoint GetNextAlarm();
-    TimePoint GetNextIntervalAlarm();
+    if (FileInfo(gcFileName).Exists())
+    {
+       auto now = std::chrono::system_clock::now();
 diff --git a/src/table/Table.cpp b/src/table/Table.cpp
 index d6d677d..989bffa 100644
 --- a/src/table/Table.cpp
@@ -4967,40 +5144,3 @@ index d6d677d..989bffa 100644
        std::string xml = ToXml();
        std::ofstream file(filename);
        if (file.is_open())
-diff --git a/src/table/TableElementList.cpp b/src/table/TableElementList.cpp
-index 425eb08..449f6a3 100644
---- a/src/table/TableElementList.cpp
-+++ b/src/table/TableElementList.cpp
-@@ -39,9 +39,11 @@ void TableElementList::UpdateState(TableElementData* data)
- 
-    if (!data->m_name.empty())
-    {
-+      // VPE: element names are stored upper case.
-+      std::string name = StringExtensions::ToUpper(data->m_name);
-       for (TableElement* element : *this)
-       {
--         if (element && element->GetName() == data->m_name)
-+         if (element && element->GetName() == name)
-          {
-             targetElement = element;
-             break;
-@@ -49,7 +51,9 @@ void TableElementList::UpdateState(TableElementData* data)
-       }
-    }
- 
--   if (!targetElement)
-+   // VPE: a named element is found by its name only, and created with it. Upstream fell back to the type and number
-+   // lookup and created a nameless element, so $name conditions and effects never found their element.
-+   if (!targetElement && data->m_name.empty())
-    {
-       for (TableElement* element : *this)
-       {
-@@ -63,6 +67,8 @@ void TableElementList::UpdateState(TableElementData* data)
- 
-    if (targetElement)
-       targetElement->SetValue(data->m_value);
-+   else if (!data->m_name.empty())
-+      push_back(new TableElement(data->m_name, data->m_value));
-    else
-    {
-       TableElement* newElement = new TableElement(data->m_tableElementType, data->m_number, data->m_value);

@@ -34,4 +34,9 @@ if ! "$BUILD/vpe_dof_smoke" "$NATIVE/tests/fixtures/artnet" "$NATIVE/tests/fixtu
 	echo "The native smoke test failed."
 	exit 1
 fi
+if ! "$BUILD/vpe_dof_internal" > "$BUILD/internal.log" 2>&1; then
+	cat "$BUILD/internal.log"
+	echo "The native internal tests failed."
+	exit 1
+fi
 echo "VpeDof $CONFIG built and copied to $OUT"

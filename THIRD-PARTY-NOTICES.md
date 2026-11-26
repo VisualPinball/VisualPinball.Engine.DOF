@@ -6,7 +6,7 @@ The complete corresponding source of every release is attached to the release as
 
 | Component | Version | Licence | Licence text |
 | --- | --- | --- | --- |
-| [libdof](https://github.com/vpinball/libdof), C++ port of the [DirectOutput Framework](https://github.com/DirectOutput/DirectOutput), with VPE's patches (`native/patches`) | 0.5.4 (d92f8fc) | GPL-3.0-or-later | `third-party/libdof/LICENSE` |
+| [libdof](https://github.com/vpinball/libdof), C++ port of the [DirectOutput Framework](https://github.com/DirectOutput/DirectOutput), with VPE's patches (`native/patches`) | 0.5.4 (5e90261) | GPL-3.0-or-later | `third-party/libdof/LICENSE` |
 | [hidapi](https://github.com/libusb/hidapi) | 0.15.0 (d6b2a97) | BSD-3-Clause (one of its three licence options, chosen here) | `third-party/hidapi/LICENSE-bsd.txt`, below |
 | [libusb](https://github.com/libusb/libusb) | 1.0.29 (15a7ebb) | LGPL-2.1-or-later | `third-party/libusb/COPYING` |
 | [libserialport](https://github.com/sigrokproject/libserialport) | 21b3dfe | LGPL-3.0-or-later | `third-party/libserialport/COPYING` |

@@ -61,7 +61,6 @@ namespace VisualPinball.Engine.DOF.Player
 		private string _revision;
 		private string _rom;
 		private string _romProblem;
-		private string _tableConfig;
 		private string _feed = "none";
 		private int _boundTriggers;
 
@@ -99,7 +98,7 @@ namespace VisualPinball.Engine.DOF.Player
 			_triggers = null;
 			_cabinet = null;
 			_ending = false;
-			_revision = _rom = _romProblem = _tableConfig = null;
+			_revision = _rom = _romProblem = null;
 			_leaseKeys.Clear();
 			_feed = "none";
 			_boundTriggers = 0;
@@ -125,12 +124,8 @@ namespace VisualPinball.Engine.DOF.Player
 				var components = scene?.Table != null ? scene.Table.GetComponentsInChildren<DofTriggerComponent>(true) : Array.Empty<DofTriggerComponent>();
 				var lamps = LampsOf(scene);
 				var gameName = components.Select(c => c.GameName).FirstOrDefault(n => !string.IsNullOrWhiteSpace(n));
-				var names = DofGameSetup.TableNames(game.PackagePath, game.Title).ToArray();
-				_tableConfig = DofGameSetup.ResolveTableConfig(game.Settings.String("TableConfig", DofGameSetup.Auto), catalog.TableConfigs, names);
-				var tableFile = revision.TableFileFor(_tableConfig, game.Title);
-				// After the table config, whose effects respond without rows.
-				(_rom, _romProblem) = DofGameSetup.ResolveRom(game.Settings.String("Rom", DofGameSetup.Auto), game.Identity, RunningRom(scene, game.Identity), gameName, catalog,
-					_tableConfig);
+				// The ini rows drive the outputs: the session loads no table XML config (DofSession).
+				(_rom, _romProblem) = DofGameSetup.ResolveRom(game.Settings.String("Rom", DofGameSetup.Auto), game.Identity, RunningRom(scene, game.Identity), gameName, catalog);
 
 				// One DOF instance per process: a previous game's may still be finishing.
 				var ownership = DofOwnership.TryAcquire();
@@ -158,7 +153,6 @@ namespace VisualPinball.Engine.DOF.Player
 				var feed = FeedOf(outputs);
 				session = new DofGameSession(new DofSessionOptions {
 					BasePath = revision.BasePath,
-					TableFile = tableFile,
 					RomName = _rom,
 					GameSession = unchecked((int)game.Session),
 					// Without a feed only the triggers drive DOF; there is no initial state to wait for.
@@ -203,7 +197,7 @@ namespace VisualPinball.Engine.DOF.Player
 				Quiescence = ReleaseWhenFinished(session, hold);
 				game.Lifetime.Own(new Subscription(EmergencyStop));
 				_status = "Ready";
-				_application.Logger.Info($"DOF for {_rom ?? "no ROM"}{(_tableConfig != null ? ", table config " + _tableConfig : "")}, revision {_revision}"
+				_application.Logger.Info($"DOF for {_rom ?? "no ROM"}, revision {_revision}"
 					+ (_leaseKeys.Count > 0 ? ", reserved " + string.Join(", ", _leaseKeys) : "") + ".");
 				if (_romProblem != null) {
 					_application.Logger.Warn(_romProblem);
@@ -457,9 +451,6 @@ namespace VisualPinball.Engine.DOF.Player
 			if (_romProblem != null) {
 				writer.Add("Rows", _romProblem);
 			}
-			if (_tableConfig != null) {
-				writer.Add("Table config", _tableConfig);
-			}
 			var cabinet = _cabinet;
 			if (cabinet != null) {
 				writer.Add("Cabinet", cabinet);
@@ -510,7 +501,6 @@ namespace VisualPinball.Engine.DOF.Player
 			if (_romProblem != null) {
 				writer.Add("rom.problem", _romProblem);
 			}
-			writer.Add("table config", _tableConfig ?? "none");
 			writer.Add("feed", _feed);
 			writer.Add("triggers", _boundTriggers.ToString());
 			writer.Add("leases", _leaseKeys.Count > 0 ? string.Join(", ", _leaseKeys) : "none");

@@ -26,7 +26,6 @@ namespace VisualPinball.Engine.DOF.Test
 			var fake = native;
 			var options = new DofSessionOptions {
 				BasePath = "unused",
-				TableFile = "unused.vpx",
 				RomName = "vpetest",
 				GameSession = Game,
 				WaitForSnapshot = false,
@@ -516,6 +515,15 @@ namespace VisualPinball.Engine.DOF.Test
 			WaitUntil(() => session.State == DofSessionState.Faulted, "the fault");
 			Assert.That(session.Diagnostics.Fault, Does.Contain("cannot keep up"));
 			native.Pending = 0;
+			Wait(session.StopAsync());
+		}
+
+		[Test]
+		public void InitPassesNoTableFile()
+		{
+			var (session, native) = Create();
+			Assert.That(Wait(session.StartAsync()).Started, Is.True);
+			Assert.That(native.InitTableFiles, Is.EqualTo(new string[] { null }), "libdof looks up no table XML config");
 			Wait(session.StopAsync());
 		}
 

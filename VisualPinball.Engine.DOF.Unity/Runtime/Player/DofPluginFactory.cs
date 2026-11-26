@@ -204,11 +204,9 @@ namespace VisualPinball.Engine.DOF.Player
 				new PluginField("PulsePort", "Test output", SettingKind.Action) { Provider = "pulse-port" },
 				new PluginField("AllOff", "All off", SettingKind.Action) { Provider = "all-off",
 					Description = "Turns every output of the cabinet off, such as one a game that crashed left on." }),
-			new PluginSettingsGroup("This game", "Which configuration rows and table config the game uses.",
+			new PluginSettingsGroup("This game", "Which configuration rows the game uses.",
 				new PluginField("Rom", "Game name", SettingKind.Choice) { Default = DofGameSetup.Auto, Scope = ConfigurationScope.GameOnly, Provider = "roms", FullWidth = true,
-					Description = "Automatic uses the ROM the game plays, or the name the table sets for DOF. A table mapping for the table's name is offered here." },
-				new PluginField("TableConfig", "Table config", SettingKind.Choice) { Default = DofGameSetup.Auto, Scope = ConfigurationScope.GameOnly, Provider = "table-configs",
-					Description = "A table XML config of the configuration, for tables that bring their own toys. Automatic uses the one named after the table file." }));
+					Description = "Automatic uses the ROM the game plays, or the name the table sets for DOF. A table mapping for the table's name is offered here." }));
 
 		#endregion
 
@@ -264,16 +262,6 @@ namespace VisualPinball.Engine.DOF.Player
 						EmptyMessage = "Import a DOF configuration first.",
 						MissingSelectionMessage = "The configuration has no rows for this name any more.",
 					};
-				}
-				case "table-configs": {
-					choices.Add(new PluginChoice(DofGameSetup.Auto, "Automatic", "The table config named after the table file, if there is one."));
-					choices.Add(new PluginChoice(DofGameSetup.None, "None"));
-					if (catalog != null) {
-						foreach (var config in catalog.TableConfigs) {
-							choices.Add(new PluginChoice(config, config));
-						}
-					}
-					return new PluginChoiceCatalog(id, choices) { MissingSelectionMessage = "The configuration has no table config of this name any more." };
 				}
 				case "test-ports": {
 					if (catalog != null) {
@@ -387,7 +375,7 @@ namespace VisualPinball.Engine.DOF.Player
 			text.Append(catalog.Devices.Count == 1 ? "1 ini device" : $"{catalog.Devices.Count} ini devices");
 			text.Append($", {catalog.Rows.Select(r => r.Rom).Distinct(StringComparer.OrdinalIgnoreCase).Count()} games");
 			text.Append(catalog.Controllers.Count == 0 ? ", no cabinet file (DOF configures connected boards itself)" : ", controllers " + string.Join(", ", catalog.Controllers.Select(c => c.SerialPort != null ? $"{c.Name} ({c.Type}, {c.SerialPort})" : $"{c.Name} ({c.Type})")));
-			text.Append(catalog.TableConfigs.Count == 0 ? "." : $", {catalog.TableConfigs.Count} table configs.");
+			text.Append(catalog.TableConfigs.Count == 0 ? "." : $", {catalog.TableConfigs.Count} table configs (stored only, not loaded).");
 			var report = revision.ReadReport();
 			if (!string.IsNullOrWhiteSpace(report)) {
 				text.Append("\n").Append(report.Trim());

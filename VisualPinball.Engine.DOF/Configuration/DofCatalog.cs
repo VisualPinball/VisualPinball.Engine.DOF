@@ -69,7 +69,10 @@ namespace VisualPinball.Engine.DOF.Configuration
 		public bool RowsFromLibdof { get; }
 		/// <summary><c>tablemappings.xml</c>: table name to ROM name.</summary>
 		public IReadOnlyList<KeyValuePair<string, string>> TableMappings { get; }
-		/// <summary>Table XML configs that a game can bind (see <see cref="DofRevision.TableFileFor"/>).</summary>
+		/// <summary>
+		/// The table XML configs the configuration contains, by name. An inventory only: the player loads none of them
+		/// (see <see cref="DofGlobalConfig"/>).
+		/// </summary>
 		public IReadOnlyList<string> TableConfigs { get; }
 		public IReadOnlyList<DofCatalogController> Controllers { get; }
 

@@ -54,11 +54,8 @@ namespace VisualPinball.Engine.DOF.Unity.Tests
 				Assert.That(DofGameSetup.ResolveRom("missing", Rom, null, null, catalog).Problem, Does.Contain("no rows for missing"),
 					"a chosen name without rows is reported too");
 				Assert.That(problem, Is.EqualTo("The configuration has no rows for other, so nothing in the cabinet responds to this game."));
-				Assert.That(DofGameSetup.ResolveRom("auto", new GameIdentity("vpe", "other"), null, "nothing", catalog, "mytable").Problem,
-					Is.EqualTo("The configuration has no rows for other, so only what the table config mytable defines responds to this game."),
-					"a table config's effects respond without rows");
-				Assert.That(DofGameSetup.ResolveRom("auto", default(GameIdentity), null, null, catalog, "mytable").Problem,
-					Does.Contain("only what the table config mytable defines responds").And.Not.Contain("nothing"));
+				Assert.That(DofGameSetup.ResolveRom("auto", default(GameIdentity), null, null, catalog),
+					Is.EqualTo(((string)null, "The game has no ROM and the table declares no DOF game name; choose one in the game's DOF settings.")));
 
 				// A table mapping goes by the title, which another table can share: it is only offered.
 				Assert.That(DofGameSetup.ResolveRom("auto", new GameIdentity("vpe", "other"), null, null, catalog).Rom, Is.EqualTo("other"));
@@ -84,16 +81,9 @@ namespace VisualPinball.Engine.DOF.Unity.Tests
 		}
 
 		[Test]
-		public void BindsTableConfigsByNameOrSetting()
+		public void NamesTheTableByItsFileThenItsTitle()
 		{
-			var configs = new[] { "Castle Siege", "Robot Wars" };
-			var names = DofGameSetup.TableNames(@"C:\Tables\robot wars.vpe", "RW").ToArray();
-			Assert.That(names, Is.EqualTo(new[] { "robot wars", "RW" }));
-			Assert.That(DofGameSetup.ResolveTableConfig("auto", configs, names), Is.EqualTo("Robot Wars"));
-			Assert.That(DofGameSetup.ResolveTableConfig("none", configs, names), Is.Null);
-			Assert.That(DofGameSetup.ResolveTableConfig("castle siege", configs, names), Is.EqualTo("Castle Siege"));
-			Assert.That(DofGameSetup.ResolveTableConfig("gone", configs, names), Is.Null);
-			Assert.That(DofGameSetup.ResolveTableConfig("auto", configs, new[] { "other" }), Is.Null);
+			Assert.That(DofGameSetup.TableNames(@"C:\Tables\my table.vpe", "MT").ToArray(), Is.EqualTo(new[] { "my table", "MT" }));
 		}
 
 		[Test]

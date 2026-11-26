@@ -15,38 +15,56 @@ namespace VisualPinball.Engine.DOF
 		/// <summary>DOF's main thread has applied the change.</summary>
 		public bool Applied { get; }
 		/// <summary>
-		/// A later change set the other state while some unit had not confirmed this one. The later change is the one to
-		/// wait for.
+		/// A later change that reached the controllers set the other state, or this is an opening that a latch overtook
+		/// (requested before the latch, applied after it), which never reaches them as an opening. The latest change is
+		/// the one to wait for. A superseded change stays superseded.
 		/// </summary>
 		/// <remarks>
 		/// Only the latest change's counts tell what the outputs show. For an older change they are what each unit wrote
-		/// last in that state, at different times, and a superseded change can later count as written by every unit.
+		/// last in that state, at different times. A change old enough to be forgotten reports superseded.
 		/// </remarks>
 		public bool Superseded { get; }
 		/// <summary>
-		/// Controller units that confirmed the state: a transfer to their device carried it, or, for a unit DOF never
-		/// used, the gate is open and DOF leaves its device alone.
+		/// Controller units that confirmed the state: a transfer to their device carried it, or a later change to the same
+		/// state did.
 		/// </summary>
-		/// <remarks>Written is not a physical acknowledgement: an Art-Net unit, for one, has only sent a packet.</remarks>
+		/// <remarks>
+		/// Written is not a physical acknowledgement: it means the transport took the data (an Art-Net unit, for one, has
+		/// only sent a packet).
+		/// </remarks>
 		public int Written { get; }
 		/// <summary>Units that have not written it yet.</summary>
 		public int Pending { get; }
-		/// <summary>Units whose write failed, whose device is missing, or whose updater stopped or finished.</summary>
+		/// <summary>
+		/// Units whose write failed, whose device is missing, or whose updater ended on its own, even after it wrote the
+		/// state. A unit that finished cleanly keeps what it wrote or left alone, and fails later changes.
+		/// </summary>
 		public int Failed { get; }
+		/// <summary>
+		/// Units DOF never used, which it leaves alone while the gate is open: nothing was written to them. A closing has
+		/// none, since it is written to every unit.
+		/// </summary>
+		public int Untouched { get; }
 
-		/// <summary>Applied, and every unit has either written it or failed.</summary>
+		/// <summary>Applied, and every unit has written it, failed, or is left alone.</summary>
 		public bool Settled => Applied && Pending == 0;
 
 		public DofGateState(bool applied, int written, int pending, int failed, bool superseded = false)
+			: this(applied, written, pending, failed, superseded, 0)
+		{
+		}
+
+		public DofGateState(bool applied, int written, int pending, int failed, bool superseded, int untouched)
 		{
 			Applied = applied || superseded;
 			Superseded = superseded;
 			Written = written;
 			Pending = pending;
 			Failed = failed;
+			Untouched = untouched;
 		}
 
-		public override string ToString() => $"applied={Applied} superseded={Superseded} written={Written} pending={Pending} failed={Failed}";
+		public override string ToString() => $"applied={Applied} superseded={Superseded} written={Written} pending={Pending} failed={Failed} untouched={Untouched}";
 	}
 
 	public readonly struct DofController
@@ -218,12 +236,14 @@ namespace VisualPinball.Engine.DOF
 
 		/// <summary>
 		/// Any thread, in any state until disposed: closes the output gate at once and latches it closed for the rest of
-		/// the instance. Openings that DOF's main thread has not applied yet, and every later one, apply as closings,
-		/// and their generations report the closed state. The closing reaches the controllers without waiting for DOF's
-		/// main thread: an idle updater checks the gate every 50 ms, its polling interval, which bounds how long it takes
-		/// to notice; a busy one sends it after the write in progress (a PacLed64 or PacUIO drops the rest of an
-		/// opening's update). Never blocks beyond a short internal lock and never allocates, so the simulation thread may
-		/// call it.
+		/// the instance. An opening requested before the latch that DOF's main thread has not applied yet never reaches
+		/// the controllers as an opening and reports <see cref="DofGateState.Superseded"/>; every change requested after
+		/// it applies as a closing and reports the closed state. When latches race, the first to start decides, and a
+		/// state once reported does not change when a later latch returns. The closing reaches the controllers without
+		/// waiting for DOF's main thread: an idle updater checks the gate every 50 ms, its polling interval, which bounds
+		/// how long it takes to notice; a busy one sends it after the write in progress (a PacLed64 or PacUIO drops the
+		/// rest of an opening's update, a UMX one the rest of the frame it is sending). Takes no lock and never allocates, so the simulation thread or a fault handler may call it.
+		/// Once it returned, the gate reports closed, also to an opening DOF's main thread is applying at that moment.
 		/// </summary>
 		/// <returns>The closing's generation, or -1 after <see cref="Dispose"/>.</returns>
 		public long LatchOutputGate()
@@ -234,8 +254,8 @@ namespace VisualPinball.Engine.DOF
 
 		public DofGateState GetGateState(long generation)
 		{
-			var status = DofNative.GateState(Handle, generation, out var written, out var pending, out var failed);
-			return new DofGateState(status == 1, written, pending, failed, status == 2);
+			var status = DofNative.GateState(Handle, generation, out var written, out var pending, out var failed, out var untouched);
+			return new DofGateState(status == 1, written, pending, failed, status == 2, untouched);
 		}
 
 		/// <summary>The names of the controller units that have not written <paramref name="generation"/> yet, or failed.</summary>

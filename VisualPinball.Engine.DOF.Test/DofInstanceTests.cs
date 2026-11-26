@@ -98,7 +98,7 @@ namespace VisualPinball.Engine.DOF.Test
 		[Test]
 		public void ReportsAbiAndLibdofVersion()
 		{
-			Assert.That(DofLibrary.NativeAbiVersion, Is.EqualTo(3));
+			Assert.That(DofLibrary.NativeAbiVersion, Is.EqualTo(4));
 			Assert.That(DofLibrary.LibdofVersion, Does.Match(@"^\d+\.\d+\.\d+"));
 		}
 
@@ -632,6 +632,164 @@ namespace VisualPinball.Engine.DOF.Test
 			dof.DataNamed("left", 0);
 			Expect(unit.Universe, f => f[0] == 0 && f[2] == 128, "condition false again");
 			dof.Finish();
+		}
+
+		[Test]
+		public void ConditionNamesTheWholeElement()
+		{
+			// As in C# DOF, "S1X" is not a table element: the condition is dropped instead of following S1.
+			var unit = Unit("ArtNetA");
+			using var config = new TestConfig().GlobalConfig().Cabinet(8, unit).Ini(1, "vpetest,(S1X=1),S1");
+			using var dof = Start(config);
+			dof.Data('S', 1, 1);
+			Expect(unit.Universe, f => f[1] == 255, "S1 on");
+			Thread.Sleep(200);
+			Assert.That(_capture.Frames(unit.Universe).All(f => f[0] == 0), Is.True, "(S1X=1) does not follow S1");
+			dof.Finish();
+		}
+
+		[Test]
+		public void SignedDirectTriggerDrivesItsPort()
+		{
+			// The number of a direct trigger has to parse whole, and a sign is part of it, as in C# DOF.
+			var unit = Unit("ArtNetA");
+			using var config = new TestConfig().GlobalConfig().Cabinet(8, unit).Ini(1, "vpetest,E-1,S1X,S2");
+			using var dof = Start(config);
+			dof.Data('E', -1, 1);
+			Expect(unit.Universe, f => f[0] == 255, "E-1 on");
+			dof.Data('S', 1, 1);
+			dof.Data('S', 2, 1);
+			Expect(unit.Universe, f => f[2] == 255, "S2 on");
+			Thread.Sleep(200);
+			Assert.That(_capture.Frames(unit.Universe).All(f => f[1] == 0), Is.True, "S1X does not follow S1");
+			dof.Finish();
+		}
+
+		[Test]
+		public void OffQueuedBeforeAnOpeningIsNotSentAsOn()
+		{
+			var unit = Unit("ArtNetA");
+			using var config = new TestConfig().GlobalConfig().Cabinet(8, unit).Ini(1, "vpetest,S1");
+			using var dof = Start(config);
+			// Used while open, so the opening below has to send its frame.
+			dof.Data('S', 1, 1);
+			Expect(unit.Universe, f => f[0] == 255, "S1 on");
+			// Past the minimum effect duration (60 ms), which would hold S1 on for a moment after it goes off.
+			Thread.Sleep(100);
+			var start = _capture.Count(unit.Universe);
+			Assert.That(WaitSettled(dof, dof.SetOutputGate(false)).Settled, Is.True);
+			// The closing's frame was sent; frames sent before it may still be on their way.
+			Expect(unit.Universe, f => f[0] == 0, "closed", start);
+			var mark = _capture.Count(unit.Universe);
+
+			// The opening comes behind a backlog of input that ends with S1 going off: it applies after that input.
+			Backlog(dof);
+			dof.Data('S', 1, 0);
+			var open = dof.SetOutputGate(true);
+			Assert.That(WaitSettled(dof, open).Settled, Is.True);
+			Thread.Sleep(200);
+			var after = _capture.Frames(unit.Universe).Skip(mark).ToList();
+			Assert.That(after, Is.Not.Empty);
+			Assert.That(after.All(f => f[0] == 0), Is.True, "S1 was off before the gate opened: " + string.Join(",", after.Select(f => f[0])));
+			dof.Finish();
+		}
+
+		[Test]
+		public void FinishDoesNotSendAnOffQueuedBeforeAnOpeningAsOn()
+		{
+			var unit = Unit("ArtNetA");
+			using var config = new TestConfig().GlobalConfig().Cabinet(8, unit).Ini(1, "vpetest,S1");
+			using var dof = Start(config);
+			// Used while open, so finish has to send its final frame.
+			dof.Data('S', 1, 1);
+			Expect(unit.Universe, f => f[0] == 255, "S1 on");
+			// Past the minimum effect duration (60 ms), which would hold S1 on for a moment after it goes off.
+			Thread.Sleep(100);
+			var start = _capture.Count(unit.Universe);
+			Assert.That(WaitSettled(dof, dof.SetOutputGate(false)).Settled, Is.True);
+			// The closing's frame was sent; frames sent before it may still be on their way.
+			Expect(unit.Universe, f => f[0] == 0, "closed", start);
+			var mark = _capture.Count(unit.Universe);
+
+			// Finish right after the opening: the input queued before it still goes first.
+			Backlog(dof);
+			dof.Data('S', 1, 0);
+			dof.SetOutputGate(true);
+			dof.Finish();
+			Thread.Sleep(100);
+			var after = _capture.Frames(unit.Universe).Skip(mark).ToList();
+			Assert.That(after, Is.Not.Empty, "finish sends a final frame");
+			Assert.That(after.All(f => f[0] == 0), Is.True, "S1 was off before the gate opened: " + string.Join(",", after.Select(f => f[0])));
+		}
+
+		[Test]
+		public void OnQueuedAfterAClosingIsNotSent()
+		{
+			var unit = Unit("ArtNetA");
+			using var config = new TestConfig().GlobalConfig().Cabinet(8, unit).Ini(1, "vpetest,S1");
+			using var dof = Start(config);
+			dof.Data('S', 1, 1);
+			Expect(unit.Universe, f => f[0] == 255, "S1 on");
+			// Rounds with and without input still queued when the closing comes, so the main thread is busy or idle.
+			for (var round = 0; round < 6; round++) {
+				var start = _capture.Count(unit.Universe);
+				dof.Data('S', 1, 0);
+				Expect(unit.Universe, f => f[0] == 0, "S1 off", start);
+				var mark = _capture.Count(unit.Universe);
+				if (round % 2 == 1) {
+					Backlog(dof);
+				}
+				var closed = dof.SetOutputGate(false);
+				dof.Data('S', 1, 1);
+				Assert.That(WaitSettled(dof, closed).Settled, Is.True, "round " + round);
+				WaitForInput(dof);
+				var after = _capture.Frames(unit.Universe).Skip(mark).ToList();
+				Assert.That(after, Is.Not.Empty, "round " + round);
+				Assert.That(after.All(f => f[0] == 0), Is.True, $"round {round}: S1 came on after the closing");
+
+				var open = dof.SetOutputGate(true);
+				Assert.That(WaitSettled(dof, open).Settled, Is.True, "round " + round);
+				Expect(unit.Universe, f => f[0] == 255, "S1 shows once the gate opens", mark);
+			}
+			dof.Finish();
+		}
+
+		[Test]
+		public void UnusedUnitIsUntouchedWhileOpen()
+		{
+			// Unit B has no port the ini row uses, so DOF leaves it alone while the gate is open. A closing still goes to it.
+			var a = Unit("ArtNetA");
+			var b = Unit("ArtNetB");
+			using var config = new TestConfig().GlobalConfig().Cabinet(4, a, b).Ini(1, "vpetest,S1");
+			using var dof = Start(config);
+			dof.Data('S', 1, 1);
+			Expect(a.Universe, f => f[0] == 255, "frame");
+
+			var closed = dof.SetOutputGate(false);
+			var closing = WaitSettled(dof, closed);
+			Assert.That((closing.Written, closing.Pending, closing.Failed, closing.Untouched), Is.EqualTo((2, 0, 0, 0)), closing.ToString());
+
+			var open = dof.SetOutputGate(true);
+			var opening = WaitSettled(dof, open);
+			Assert.That((opening.Settled, opening.Written, opening.Pending, opening.Failed, opening.Untouched), Is.EqualTo((true, 1, 0, 0, 1)), opening.ToString());
+			Assert.That(dof.GetGatePending(open), Is.Empty);
+			dof.Finish();
+		}
+
+		private static void Backlog(DofInstance dof)
+		{
+			for (var i = 0; i < 3000; i++) {
+				dof.Data('L', 1 + i % 64, i & 1);
+			}
+		}
+
+		private static void WaitForInput(DofInstance dof)
+		{
+			var watch = Stopwatch.StartNew();
+			while (dof.PendingInput > 0 && watch.ElapsedMilliseconds < 2000) {
+				Thread.Sleep(5);
+			}
+			Thread.Sleep(100);
 		}
 
 		[Test]

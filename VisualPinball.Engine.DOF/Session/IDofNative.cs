@@ -18,7 +18,7 @@ namespace VisualPinball.Engine.DOF.Session
 		int PendingInput { get; }
 		void Finish();
 		long SetOutputGate(bool open);
-		/// <summary>Closes the gate at once and for good: queued and later openings apply as closings. See <see cref="DofInstance.LatchOutputGate"/>.</summary>
+		/// <summary>Closes the gate at once and for good: queued openings are superseded, later changes apply as closings. See <see cref="DofInstance.LatchOutputGate"/>.</summary>
 		long LatchOutputGate();
 		DofGateState GetGateState(long generation);
 		IReadOnlyList<string> GetGatePending(long generation);

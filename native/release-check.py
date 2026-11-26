@@ -11,6 +11,8 @@
   another package's copies. On macOS each architecture is checked.
 - It imports only libraries of the operating system: no C/C++ runtime DLLs on Windows (static CRT), no libstdc++ or
   libgcc_s on Linux (linked statically), only libSystem, libc++, libobjc and system frameworks on macOS.
+- Its vpe_dof_abi_version returns the VPE_DOF_ABI_VERSION of the header, so a library built from older sources with the
+  same exports does not pass. The library is loaded for that: run the check on the platform it is built for.
 - Linux: the newest glibc symbol version it needs (--max-glibc fails above that). macOS: the architectures it
   contains (--archs) and the minimum macOS version of each (--min-macos fails above that).
 - --unity-meta: the library has its Unity import settings next to it, and its folder too, as native/unity has them
@@ -23,6 +25,7 @@ lipo on macOS. Exits with 1 when a check fails.
 """
 
 import argparse
+import ctypes
 import fnmatch
 import os
 import re
@@ -59,6 +62,32 @@ def declared_functions(header):
 	with open(header, encoding="utf-8") as file:
 		text = file.read()
 	return set(re.findall(r"^VPE_DOF_API\b[^;(]*?\b(vpe_dof_\w+)\s*\(", text, re.MULTILINE))
+
+
+def header_abi_version(header):
+	with open(header, encoding="utf-8") as file:
+		match = re.search(r"^#define\s+VPE_DOF_ABI_VERSION\s+(\d+)", file.read(), re.MULTILINE)
+	return int(match.group(1)) if match else None
+
+
+# The platform that can load a library of each kind.
+LOADERS = {"PE": "win32", "ELF": "linux", "Mach-O": "darwin"}
+
+
+def check_abi_version(library, kind, header):
+	expected = header_abi_version(header)
+	if expected is None:
+		return [("{} defines no VPE_DOF_ABI_VERSION".format(header), False)]
+	if not sys.platform.startswith(LOADERS[kind]):
+		return [("cannot load a {} library on {} to check its ABI version".format(kind, sys.platform), False)]
+	try:
+		function = ctypes.CDLL(os.path.abspath(library)).vpe_dof_abi_version
+	except (OSError, AttributeError) as error:
+		return [("cannot call vpe_dof_abi_version: {}".format(error), False)]
+	function.restype = ctypes.c_int32
+	function.argtypes = []
+	version = function()
+	return [("ABI version {} (the header's is {})".format(version, expected), version == expected)]
 
 
 def nm_symbol(line):
@@ -217,6 +246,7 @@ def main():
 		return 1
 
 	exports, imports, bad_imports, notes = check(args.library, args)
+	notes += check_abi_version(args.library, kind, args.header)
 	if args.unity_meta:
 		notes += check_unity_meta(args.library)
 	declared = declared_functions(args.header)

@@ -15,11 +15,10 @@ using VisualPinball.Plugins;
 
 namespace VisualPinball.Engine.DOF.Player
 {
-	/// <summary>What a game runs DOF with: the ROM name, the table XML config and the devices to reserve.</summary>
+	/// <summary>What a game runs DOF with: the ROM name and the devices to reserve.</summary>
 	internal static class DofGameSetup
 	{
 		internal const string Auto = "auto";
-		internal const string None = "none";
 
 		/// <summary>The lease key of the FTDI chip family, which DOF's FT245R boards share with PinDMD 1 (the DMD plugin's key).</summary>
 		internal const string FtdiFamily = "usb:pindmd1:auto";
@@ -40,16 +39,11 @@ namespace VisualPinball.Engine.DOF.Player
 		/// <param name="runningRom">The ROM the gamelogic engine plays (PinMAME can play a compatible one), or null.</param>
 		/// <param name="gameName">The DOF game name the table sets on its <c>DofTriggerComponent</c>, or null.</param>
 		/// <param name="catalog">The configuration, or null.</param>
-		/// <param name="tableConfig">
-		/// The table config the game runs with (<see cref="ResolveTableConfig"/>), or null. Its effects go by the table's
-		/// elements, not by rows, so without rows the game is not left without effects.
-		/// </param>
-		internal static (string Rom, string Problem) ResolveRom(string setting, GameIdentity identity, string runningRom, string gameName, DofCatalog catalog,
-			string tableConfig = null)
+		internal static (string Rom, string Problem) ResolveRom(string setting, GameIdentity identity, string runningRom, string gameName, DofCatalog catalog)
 		{
 			if (!string.IsNullOrWhiteSpace(setting) && !string.Equals(setting, Auto, StringComparison.Ordinal)) {
 				var chosen = setting.Trim();
-				return (chosen, catalog != null && catalog.Match(chosen).Count == 0 ? NoRows(chosen, tableConfig) : null);
+				return (chosen, catalog != null && catalog.Match(chosen).Count == 0 ? NoRows(chosen) : null);
 			}
 			var rom = !string.IsNullOrWhiteSpace(runningRom) ? runningRom.Trim() : string.IsNullOrWhiteSpace(identity.Key) ? null : identity.Key.Trim();
 			var declared = string.IsNullOrWhiteSpace(gameName) ? null : gameName.Trim();
@@ -69,17 +63,12 @@ namespace VisualPinball.Engine.DOF.Player
 			}
 			var fallback = rom ?? declared;
 			if (fallback == null) {
-				return (null, tableConfig == null
-					? "The game has no ROM and the table declares no DOF game name; choose one in the game's DOF settings."
-					: $"The game has no ROM and the table declares no DOF game name, so only what the table config {tableConfig} defines responds; "
-						+ "choose a game name in the game's DOF settings for the configuration's rows.");
+				return (null, "The game has no ROM and the table declares no DOF game name; choose one in the game's DOF settings.");
 			}
-			return (fallback, catalog != null ? NoRows(fallback, tableConfig) : null);
+			return (fallback, catalog != null ? NoRows(fallback) : null);
 		}
 
-		private static string NoRows(string rom, string tableConfig) => tableConfig == null
-			? $"The configuration has no rows for {rom}, so nothing in the cabinet responds to this game."
-			: $"The configuration has no rows for {rom}, so only what the table config {tableConfig} defines responds to this game.";
+		private static string NoRows(string rom) => $"The configuration has no rows for {rom}, so nothing in the cabinet responds to this game.";
 
 		/// <summary>The table mapping for one of the table's names: the mapped name and the ROM, or null.</summary>
 		internal static KeyValuePair<string, string>? TableMapping(DofCatalog catalog, IEnumerable<string> tableNames)
@@ -100,31 +89,7 @@ namespace VisualPinball.Engine.DOF.Player
 			return null;
 		}
 
-		/// <summary>The table XML config to bind (a name from <paramref name="tableConfigs"/>), or null for none.</summary>
-		/// <param name="setting"><see cref="Auto"/>, <see cref="None"/> or a config name.</param>
-		/// <param name="tableConfigs">The configs of the revision.</param>
-		/// <param name="tableNames">Names of the table automatic binding looks for, in order.</param>
-		internal static string ResolveTableConfig(string setting, IReadOnlyList<string> tableConfigs, IEnumerable<string> tableNames)
-		{
-			if (string.Equals(setting, None, StringComparison.Ordinal) || tableConfigs == null || tableConfigs.Count == 0) {
-				return null;
-			}
-			if (!string.IsNullOrWhiteSpace(setting) && !string.Equals(setting, Auto, StringComparison.Ordinal)) {
-				return tableConfigs.FirstOrDefault(c => string.Equals(c, setting, StringComparison.OrdinalIgnoreCase));
-			}
-			foreach (var name in tableNames ?? Enumerable.Empty<string>()) {
-				if (string.IsNullOrWhiteSpace(name)) {
-					continue;
-				}
-				var match = tableConfigs.FirstOrDefault(c => string.Equals(c, name.Trim(), StringComparison.OrdinalIgnoreCase));
-				if (match != null) {
-					return match;
-				}
-			}
-			return null;
-		}
-
-		/// <summary>The names a table goes by for table mappings and table configs: its package file name, then its title.</summary>
+		/// <summary>The names a table goes by for table mappings: its package file name, then its title.</summary>
 		internal static IEnumerable<string> TableNames(string packagePath, string title)
 		{
 			if (!string.IsNullOrEmpty(packagePath)) {
