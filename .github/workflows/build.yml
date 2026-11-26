@@ -161,7 +161,7 @@ jobs:
             library: win-x64/VpeDof.dll
             dmd-rid: win-x64
             python: python
-          # the DMD package's Linux libraries need glibc 2.38 or newer
+          # the DMD package's prebuilt Linux libraries target a current distribution
           - os: ubuntu-24.04
             artifact: VpeDof-linux-x64
             library: linux-x64/libVpeDof.so

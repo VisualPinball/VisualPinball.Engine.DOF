@@ -50,7 +50,7 @@ The tests listen on UDP port 6454 on 127.0.0.1 and never open real devices.
 The [build workflow](.github/workflows/build.yml) builds and tests every platform: Windows x64 with MSVC and the static CRT, Linux x64 in an Ubuntu 22.04 container (glibc 2.35, libstdc++ linked statically) and macOS 12.0 for arm64 and x86_64. Each job uploads its `Plugins/<rid>` and `Plugins/Managed`. A pushed `v*` tag drafts a release with those, the licence texts and the source archive. The checks it runs can be run locally:
 
 - `native/release-check.py <library>` checks that `VpeDof` exports exactly the functions `native/include/vpe_dof.h` declares and imports only system libraries, and with `--unity-meta` that its import settings are next to it (on Linux also the newest glibc it needs, on macOS its architectures and minimum version).
-- `native/tests/load-with-dmd.py <library> <DMD package>/Plugins/<rid>` loads every native library in the DMD package's folder (libusb, libserialport, ZeDMD, Serum, sockpp and the others it ships) and `VpeDof` into one process, in both orders, and calls into each. All of them must load.
+- `native/tests/load-with-dmd.py <library> <DMD package>/Plugins/<rid>` loads the DMD package's libusb and libserialport, the libraries `VpeDof` also contains, and `VpeDof` into one process, in both orders, and calls into each: both load and work next to each other, and `VpeDof` exposes none of the hardware libraries' symbols. Checking DMD's other native libraries belongs to DMD's CI.
 - `native/source-archive.py` writes the complete corresponding source of a commit: the repository with the submodules at their pinned revisions, the patches and the build scripts. Licences are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 ## Using DOF in VPE

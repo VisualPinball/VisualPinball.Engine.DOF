@@ -4,24 +4,20 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Loads the DMD package's native libraries and VpeDof into one process, in both orders, and calls into each.
+"""Loads the DMD package's libusb and libserialport and VpeDof into one process, in both orders, and calls into each.
 
-The DMD package ships its own libusb and libserialport, and ZeDMD, Serum, sockpp, FTDI's driver library and others,
-some of which use them. VpeDof links its copies statically and exports only its C ABI, so the two can be loaded together
-in either order: neither resolves a symbol in the other's copy. The libraries are loaded with RTLD_GLOBAL, the worst case
-for symbol interposition on Linux and macOS, and DMD's folder is on the library path, as it is for the player's plugins.
+The DMD package ships its own libusb and libserialport, the libraries VpeDof also contains. VpeDof links its copies
+statically and exports only its C ABI, so the two can be loaded together in either order: neither resolves a symbol in
+the other's copy. The libraries are loaded with RTLD_GLOBAL, the worst case for symbol interposition on Linux and macOS.
 Each order runs in a process of its own.
 
-Every native library in the DMD folder is loaded, as the player ships the folder: the DMD build puts there what LibDmd's
-NuGet package has for the platform, and every one must load. A library that cannot load fails the check, with the
-dependencies it misses when that is the reason (Windows).
+Only those two are loaded: they are what VpeDof shares with DMD. Whether the rest of DMD's libraries load is DMD's to
+check, not VpeDof's.
 
 The calls do not depend on hardware: DMD's libusb and libserialport report their versions, VpeDof enumerates the
 connected devices (which succeeds with none), and VpeDof must not resolve any of the hardware libraries' functions.
 
-Usage: load-with-dmd.py <VpeDof library> <the DMD package's Plugins/<rid> folder> [--skip serum|sockpp|zedmd]...
---skip (Linux only) leaves out Serum, sockpp or ZeDMD, which need a newer libstdc++ (GLIBCXX_3.4.32) or glibc (2.38)
-than Ubuntu 22.04 has. It is for local runs on such a system; CI runs on Ubuntu 24.04 and does not use it.
+Usage: load-with-dmd.py <VpeDof library> <the DMD package's Plugins/<rid> folder>
 Exits with 1 when a library does not load, a call fails or VpeDof resolves a hardware library function.
 """
 
@@ -33,8 +29,8 @@ import struct
 import subprocess
 import sys
 
-# what --skip may leave out, on Linux only
-SKIPPABLE = ["serum", "sockpp", "zedmd"]
+# the DMD libraries VpeDof also contains
+SHARED = ["usb", "serialport"]
 
 # what VpeDof links statically and must not export
 HIDDEN = ["libusb_init", "libusb_get_version", "hid_init", "hid_enumerate", "sp_list_ports", "sp_get_lib_version_string", "ftdi_new"]
@@ -65,9 +61,9 @@ def component(name):
 	return re.sub(r"(64)?(-\d+)?$", "", base)
 
 
-def dmd_libraries(folder, skip):
-	names = sorted(name for name in os.listdir(folder) if is_native(name) and os.path.isfile(os.path.join(folder, name)))
-	return [name for name in names if component(name) not in skip], [name for name in names if component(name) in skip]
+def dmd_libraries(folder):
+	return sorted(name for name in os.listdir(folder)
+		if is_native(name) and os.path.isfile(os.path.join(folder, name)) and component(name) in SHARED)
 
 
 def pe_imports(path):
@@ -119,10 +115,11 @@ def load(path):
 	return ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
 
 
-def load_dmd(folder, skip):
-	names, skipped = dmd_libraries(folder, skip)
-	for name in skipped:
-		print("  skipped DMD's " + name)
+def load_dmd(folder):
+	names = dmd_libraries(folder)
+	for prefix in SHARED:
+		if not any(component(name) == prefix for name in names):
+			raise RuntimeError("the DMD folder has no {} library".format(prefix))
 	libraries = {}
 	failed = []
 	for name in names:
@@ -192,36 +189,30 @@ def call_dof(dof):
 	print("  VpeDof resolves none of " + ", ".join(HIDDEN))
 
 
-def child(order, dof_path, dmd_folder, skip):
+def child(order, dof_path, dmd_folder):
 	if sys.platform == "win32":
-		# DMD's natives load their own dependencies (ZeDMD needs libserialport and sockpp) from their folder
+		# as the player loads plugin natives: their own dependencies come from their folder
 		os.add_dll_directory(os.path.abspath(dmd_folder))
 	if order == "dmd-first":
-		dmd = load_dmd(dmd_folder, skip)
+		dmd = load_dmd(dmd_folder)
 		dof = load_dof(dof_path)
 	else:
 		dof = load_dof(dof_path)
-		dmd = load_dmd(dmd_folder, skip)
+		dmd = load_dmd(dmd_folder)
 	call_dmd(dmd)
 	call_dof(dof)
 	call_dmd(dmd)
 
 
 def main():
-	parser = argparse.ArgumentParser(description="Loads DMD's native libraries and VpeDof into one process, in both orders.")
+	parser = argparse.ArgumentParser(description="Loads DMD's libusb and libserialport and VpeDof into one process, in both orders.")
 	parser.add_argument("dof", help="the VpeDof library")
 	parser.add_argument("dmd", help="the DMD package's Plugins/<rid> folder")
-	parser.add_argument("--skip", action="append", default=[], choices=SKIPPABLE,
-		help="Linux, local runs only: leaves out a DMD library Ubuntu 22.04 cannot load")
 	parser.add_argument("--order", choices=["dmd-first", "dof-first"], help=argparse.SUPPRESS)
 	args = parser.parse_args()
-	if args.skip and not sys.platform.startswith("linux"):
-		print("--skip is for Linux only")
-		return 2
-
 	if args.order:
 		try:
-			child(args.order, args.dof, args.dmd, set(args.skip))
+			child(args.order, args.dof, args.dmd)
 		except (OSError, RuntimeError) as error:
 			print("  FAIL: {}".format(error))
 			return 1
@@ -237,8 +228,6 @@ def main():
 		print(order + ":")
 		sys.stdout.flush()
 		command = [sys.executable, os.path.abspath(__file__), args.dof, args.dmd, "--order", order]
-		for name in args.skip:
-			command += ["--skip", name]
 		result = subprocess.call(command, env=env)
 		print("  " + ("OK" if result == 0 else "FAILED"))
 		failed = failed or result != 0
