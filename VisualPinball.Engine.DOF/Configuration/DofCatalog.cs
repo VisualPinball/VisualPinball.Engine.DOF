@@ -141,7 +141,9 @@ namespace VisualPinball.Engine.DOF.Configuration
 				devices.Add(new DofCatalogDevice(ini.Device, ini.Name, ini.PortNames, ini.Roms));
 				rows.AddRange(ini.Roms.Select(r => new DofRomRow(ini.Device, r)));
 			}
-			var effective = revision.ReadLibdofRows();
+			// libdof lists the ini files in directory order, which differs between file systems; a stable sort by device
+			// keeps the order within each device, which is the one libdof matches in.
+			var effective = revision.ReadLibdofRows()?.OrderBy(r => r.Device).ToList();
 			return new DofCatalog(revision, devices, effective ?? rows, effective != null, mappings, revision.TableConfigs, cabinetControllers);
 		}
 
