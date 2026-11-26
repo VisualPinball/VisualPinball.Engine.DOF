@@ -80,12 +80,12 @@ namespace VisualPinball.Engine.DOF.Test
 		/// <summary>Imports an Art-Net cabinet on one universe and a row for the ROM, the way the player does.</summary>
 		private DofRevisionLease Import(int universe, string row) => Import(_dir, universe, row);
 
-		private static DofRevisionLease Import(string dir, int universe, string row)
+		private static DofRevisionLease Import(string dir, int universe, string row, string otherControllers = "")
 		{
 			var source = Path.Combine(dir, "source");
 			Directory.CreateDirectory(source);
 			File.WriteAllText(Path.Combine(source, "Cabinet.xml"), "<?xml version=\"1.0\"?>\r\n<Cabinet><Name>Test</Name><AutoConfigEnabled>false</AutoConfigEnabled>"
-				+ $"<OutputControllers><ArtNet><Name>ArtNet 1</Name><Universe>{universe}</Universe><BroadcastAddress>127.0.0.1</BroadcastAddress></ArtNet></OutputControllers>"
+				+ $"<OutputControllers><ArtNet><Name>ArtNet 1</Name><Universe>{universe}</Universe><BroadcastAddress>127.0.0.1</BroadcastAddress></ArtNet>{otherControllers}</OutputControllers>"
 				+ "<Toys><LedWizEquivalent><Name>LedWizEquivalent 1</Name><LedWizNumber>1</LedWizNumber><Outputs>"
 				+ string.Concat(Enumerable.Range(1, 8).Select(p => $"<LedWizEquivalentOutput><OutputName>ArtNet 1.{p:00}</OutputName><LedWizEquivalentOutputNumber>{p}</LedWizEquivalentOutputNumber></LedWizEquivalentOutput>"))
 				+ "</Outputs></LedWizEquivalent></Toys></Cabinet>\r\n");
@@ -206,6 +206,123 @@ namespace VisualPinball.Engine.DOF.Test
 			session.Publish(Game, DofElementKind.Solenoid, 1, 255);
 			Expect(universe, f => f[0] == 255, "the outputs work");
 			Wait(session.StopAsync());
+		}
+
+		[Test]
+		public void ACabinetWithAControllerLibdofCannotReadStartsTheOthers()
+		{
+			// The import accepts the cabinet without libdof reading it, so setup must not refuse it as a whole.
+			const int universe = 305;
+			using var lease = Import(_dir, universe, "vpetest,S1",
+				"<ArtNet><Name>ArtNet 2</Name><Universe>unset</Universe><BroadcastAddress>127.0.0.1</BroadcastAddress></ArtNet>");
+			var session = Session(lease.Revision, false);
+			var started = Wait(session.StartAsync());
+			Assert.That(started.Started, Is.True, started.Error);
+			Assert.That(started.Cabinet.Controllers.Select(c => c.Name), Is.EqualTo(new[] { "ArtNet 1" }), "the controller libdof cannot read is skipped");
+			session.Publish(Game, DofElementKind.Solenoid, 1, 255);
+			Expect(universe, f => f[0] == 255, "the other controller works");
+			Wait(session.StopAsync());
+		}
+
+		[Test]
+		public void ACabinetWithAControllerWhoseSettingsLibdofRefusesStartsTheOthers()
+		{
+			// libdof throws for some settings out of range (a PAC Id), and needs an Id or a number that some entries
+			// leave out; each such controller is skipped, as one it cannot read is.
+			const int universe = 307;
+			using var lease = Import(_dir, universe, "vpetest,S1",
+				"<PacUIO Name=\"Out of range\" Id=\"2\" /><PacLed64 Name=\"Also out of range\" Id=\"5\" />"
+				+ "<PacUIO Name=\"No Id\" /><PacLed64 Name=\"Bad Id\" Id=\"one\" /><LedWiz><Name>No number</Name></LedWiz>");
+			var session = Session(lease.Revision, false);
+			var started = Wait(session.StartAsync());
+			Assert.That(started.Started, Is.True, started.Error);
+			Assert.That(started.Cabinet.Controllers.Select(c => c.Name), Is.EqualTo(new[] { "ArtNet 1" }), "the controllers libdof refuses are skipped");
+			session.Publish(Game, DofElementKind.Solenoid, 1, 255);
+			Expect(universe, f => f[0] == 255, "the other controller works");
+			Wait(session.StopAsync());
+		}
+
+		[Test, Platform("Win")]
+		public void ReopensAStoreThroughAnotherPathToItsFolder()
+		{
+			// The import writes the store's folder into the generated config as it was given, here through a junction. A
+			// session given the same folder through another junction reads it: what counts is the folder, not its path.
+			const int universe = 308;
+			var dir = Path.Combine(_dir, "real");
+			Directory.CreateDirectory(dir);
+			var imported = Path.Combine(_dir, "imported through");
+			var reopened = Path.Combine(_dir, "reopened through");
+			Junction(imported, dir);
+			try {
+				Junction(reopened, dir);
+				using var lease = Import(imported, universe, "vpetest,S1");
+				var basePath = Path.Combine(reopened, Path.GetRelativePath(imported, lease.Revision.BasePath));
+				var session = new DofSession(new DofSessionOptions {
+					BasePath = basePath,
+					RomName = "vpetest_l1",
+					GameSession = Game,
+					WaitForSnapshot = false,
+				});
+				_sessions.Add(session);
+				var started = Wait(session.StartAsync());
+				Assert.That(started.Started, Is.True, started.Error);
+				Assert.That(started.Cabinet.Controllers.Select(c => c.Name), Is.EqualTo(new[] { "ArtNet 1" }), "the imported cabinet");
+				session.Publish(Game, DofElementKind.Solenoid, 1, 255);
+				Expect(universe, f => f[0] == 255, "the outputs work");
+				Wait(session.StopAsync());
+			} finally {
+				// Removes the junctions, not the folder they point to.
+				if (Directory.Exists(reopened)) {
+					Directory.Delete(reopened);
+				}
+				Directory.Delete(imported);
+			}
+		}
+
+		private static void Junction(string link, string target)
+		{
+			using var mklink = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("cmd.exe", $"/c mklink /J \"{link}\" \"{target}\"") {
+				UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true,
+			});
+			mklink.WaitForExit();
+			Assert.That(mklink.ExitCode, Is.EqualTo(0), "the junction is created");
+		}
+
+		[Test, Platform("Win")]
+		public void RunsAUnicodeStoreReachedThroughAJunction()
+		{
+			// The import writes the store's 8.3 spelling into the generated config; the root is given through the junction.
+			const int universe = 306;
+			var dir = Path.Combine(_dir, "Jürgen");
+			Directory.CreateDirectory(dir);
+			try {
+				DofPaths.ToNative(dir);
+			} catch (DofException) {
+				Assert.Ignore("This volume has no short (8.3) names, so libdof cannot open a non-ASCII folder on Windows.");
+			}
+			using var lease = Import(dir, universe, "vpetest,S1");
+			var link = Path.Combine(_dir, "link");
+			Junction(link, dir);
+			try {
+				var basePath = Path.Combine(link, Path.GetRelativePath(dir, lease.Revision.BasePath));
+				Assert.That(DofPaths.IsAscii(basePath), Is.True);
+				var session = new DofSession(new DofSessionOptions {
+					BasePath = basePath,
+					RomName = "vpetest_l1",
+					GameSession = Game,
+					WaitForSnapshot = false,
+				});
+				_sessions.Add(session);
+				var started = Wait(session.StartAsync());
+				Assert.That(started.Started, Is.True, started.Error);
+				Assert.That(started.Cabinet.Controllers.Select(c => c.Name), Is.EqualTo(new[] { "ArtNet 1" }), "the imported cabinet");
+				session.Publish(Game, DofElementKind.Solenoid, 1, 255);
+				Expect(universe, f => f[0] == 255, "the outputs work");
+				Wait(session.StopAsync());
+			} finally {
+				// Removes the junction, not the folder it points to.
+				Directory.Delete(link);
+			}
 		}
 
 		[Test]

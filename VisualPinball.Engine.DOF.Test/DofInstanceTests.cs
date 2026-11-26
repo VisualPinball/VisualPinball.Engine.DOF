@@ -10,6 +10,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 using NUnit.Framework;
 
 namespace VisualPinball.Engine.DOF.Test
@@ -711,21 +712,58 @@ namespace VisualPinball.Engine.DOF.Test
 			Expect(unit.Universe, f => f[0] == 0, "closed", start);
 			var mark = _capture.Count(unit.Universe);
 
-			// Finish right after the opening: the input queued before it still goes first.
+			// Finish right after the opening: the input queued before it still goes first. Whether that input is still
+			// queued when the opening comes depends on how fast DOF's main thread is, so the backlog makes it likely and
+			// the test asserts only what holds either way: finish applies the opening, and S1 is off when it does. The
+			// order itself is decided by the queue and tested with the input held in place, natively
+			// (FinishRunsTheInputQueuedBeforeAnOpening in native/tests/internal.cpp).
 			Backlog(dof);
 			dof.Data('S', 1, 0);
-			var queued = dof.PendingInput;
 			var open = dof.SetOutputGate(true);
 			dof.Finish();
 			Thread.Sleep(100);
-			// What the test is about: the opening came with input still queued before it, and finish applied it.
-			Assert.That(queued, Is.GreaterThan(0), "input was queued before the opening");
 			Assert.That(open, Is.GreaterThanOrEqualTo(0), "the opening was accepted");
 			var opening = dof.GetGateState(open);
 			Assert.That((opening.Applied, opening.Superseded), Is.EqualTo((true, false)), "finish applied the opening: " + opening);
 			var after = _capture.Frames(unit.Universe).Skip(mark).ToList();
 			Assert.That(after, Is.Not.Empty, "finish sends a final frame");
 			Assert.That(after.All(f => f[0] == 0), Is.True, "S1 was off before the gate opened: " + string.Join(",", after.Select(f => f[0])));
+		}
+
+		[Test]
+		public void ClosingDuringFinishLatchesTheGate()
+		{
+			var unit = Unit("ArtNetA");
+			using var config = new TestConfig().GlobalConfig().Cabinet(8, unit).Ini(1, "vpetest,S1");
+			using var dof = Start(config);
+			dof.Data('S', 1, 1);
+			Expect(unit.Universe, f => f[0] == 255, "S1 on");
+
+			// Finish is held at its first log line, once it started, while the gate is changed.
+			using var finishing = new ManualResetEventSlim();
+			using var release = new ManualResetEventSlim();
+			DofLibrary.SetLog((level, message) => {
+				_log.Enqueue($"[{level}] {message}");
+				if (message.Contains("Finishing framework")) {
+					finishing.Set();
+					release.Wait(5000);
+				}
+			}, DofLogLevel.Debug);
+			try {
+				var finish = Task.Run(() => dof.Finish());
+				Assert.That(finishing.Wait(5000), Is.True, "finish started");
+				var opening = dof.SetOutputGate(true);
+				var closing = dof.SetOutputGate(false);
+				release.Set();
+				Assert.That(finish.Wait(10000), Is.True, "finish ended");
+				Assert.That(opening, Is.EqualTo(-1), "an opening is refused once finish started");
+				Assert.That(closing, Is.GreaterThan(0), "a closing latches the gate");
+				var state = dof.GetGateState(closing);
+				Assert.That((state.Applied, state.Superseded, state.Written, state.Failed), Is.EqualTo((true, false, 1, 0)), state.ToString());
+			} finally {
+				release.Set();
+				DofLibrary.SetLog((level, message) => _log.Enqueue($"[{level}] {message}"), DofLogLevel.Debug);
+			}
 		}
 
 		[Test]
