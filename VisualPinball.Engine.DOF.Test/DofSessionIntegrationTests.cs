@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -25,6 +26,9 @@ namespace VisualPinball.Engine.DOF.Test
 
 		private ArtNetCapture _capture;
 		private string _dir;
+		// Every session a test starts, so one that a failed assertion left running is stopped before the next test,
+		// which would otherwise find DOF's single instance busy.
+		private readonly List<DofSession> _sessions = new List<DofSession>();
 
 		[OneTimeSetUp]
 		public void SetUpCapture()
@@ -46,6 +50,12 @@ namespace VisualPinball.Engine.DOF.Test
 		[TearDown]
 		public void TearDown()
 		{
+			foreach (var session in _sessions) {
+				if (!session.StopAsync().Wait(Timeout)) {
+					TestContext.Out.WriteLine("A session did not stop within " + Timeout);
+				}
+			}
+			_sessions.Clear();
 			try {
 				Directory.Delete(_dir, true);
 			} catch (IOException) {
@@ -86,12 +96,17 @@ namespace VisualPinball.Engine.DOF.Test
 			return store.Acquire();
 		}
 
-		private static DofSession Session(DofRevision revision, bool waitForSnapshot = true) => new DofSession(new DofSessionOptions {
-			BasePath = revision.BasePath,
-			RomName = "vpetest_l1",
-			GameSession = Game,
-			WaitForSnapshot = waitForSnapshot,
-		});
+		private DofSession Session(DofRevision revision, bool waitForSnapshot = true)
+		{
+			var session = new DofSession(new DofSessionOptions {
+				BasePath = revision.BasePath,
+				RomName = "vpetest_l1",
+				GameSession = Game,
+				WaitForSnapshot = waitForSnapshot,
+			});
+			_sessions.Add(session);
+			return session;
+		}
 
 		[Test]
 		public void NamedEventsDriveNamedElementsOnly()

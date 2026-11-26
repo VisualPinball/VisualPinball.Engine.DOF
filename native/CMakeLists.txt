@@ -67,6 +67,8 @@ endif()
 
 file(GLOB_RECURSE LIBDOF_SOURCES "${LIBDOF}/src/*.cpp")
 list(FILTER LIBDOF_SOURCES EXCLUDE REGEX "/src/tools/")
+# PinOne's named pipe server is not used by libdof (it would create and unlink a pipe under /tmp).
+list(FILTER LIBDOF_SOURCES EXCLUDE REGEX "/src/cab/out/pinone/NamedPipeServer\.cpp$")
 list(APPEND LIBDOF_SOURCES "${LIBDOF}/third-party/include/tinyxml2/tinyxml2.cpp")
 
 # ---------------------------------------------------------------------------------------------------------------------
