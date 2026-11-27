@@ -69,12 +69,17 @@ namespace VisualPinball.Engine.DOF.Test
 			return task.Result;
 		}
 
-		private void Expect(int universe, Func<byte[], bool> match, string what, int after = 0)
+		private void Expect(int universe, Func<byte[], bool> match, string what, int after = 0) => ExpectIndex(universe, match, what, after);
+
+		/// <summary>Like <see cref="Expect"/>, and returns the matching frame's number.</summary>
+		private int ExpectIndex(int universe, Func<byte[], bool> match, string what, int after = 0)
 		{
-			if (_capture.WaitFor(universe, match, after) == null) {
+			var index = _capture.WaitForIndex(universe, match, after);
+			if (index < 0) {
 				var latest = _capture.Latest(universe);
 				Assert.Fail($"{what}: no matching frame on universe {universe}; last: {(latest == null ? "none" : string.Join(",", latest.Take(8)))}");
 			}
+			return index;
 		}
 
 		/// <summary>Imports an Art-Net cabinet on one universe and a row for the ROM, the way the player does.</summary>
@@ -121,11 +126,11 @@ namespace VisualPinball.Engine.DOF.Test
 			session.PublishNamed("S1", 1);
 			Expect(universe, f => f[2] == 255, "the element named S1 shows");
 			session.PublishNamed("Knocker", 1);
-			Expect(universe, f => f[1] == 255, "the knocker shows");
+			var shown = ExpectIndex(universe, f => f[1] == 255, "the knocker shows");
 			session.PublishNamed("KNOCKER", 1);
 			session.PublishNamed("knocker", 0);
-			var mark = _capture.Count(universe);
-			Expect(universe, f => f[1] == 0, "the knocker goes off, however it is spelled", mark);
+			// The knocker is on from that frame until it goes off.
+			Expect(universe, f => f[1] == 0, "the knocker goes off, however it is spelled", shown + 1);
 			Assert.That(_capture.Frames(universe).All(f => f[0] == 0), Is.True, "\"S1\" as a name never drives solenoid 1");
 			Wait(session.StopAsync());
 		}
@@ -173,7 +178,7 @@ namespace VisualPinball.Engine.DOF.Test
 			var session = Session(revision, false);
 			var started = Wait(session.StartAsync());
 			Assert.That(started.Started, Is.True, started.Error);
-			var mark = _capture.Count(universe);
+			var mark = _capture.Mark(universe);
 			session.Publish(Game, DofElementKind.Solenoid, 1, 255);
 			Expect(universe, f => f[0] == 255, $"the ini row drives the port ({what})", mark);
 			Wait(session.StopAsync());
@@ -353,15 +358,16 @@ namespace VisualPinball.Engine.DOF.Test
 			session.Publish(Game, DofElementKind.Switch, 3, 1);
 			Expect(universe, f => f[0] == 255 && f[1] == 128 && f[2] == 255, "changes show");
 
+			// Each mark comes before the transition, so its frame is after the mark.
+			var mark = _capture.Mark(universe);
 			var paused = Wait(session.PauseAsync());
 			Assert.That(paused.Settled, Is.True, paused.ToString());
-			var mark = _capture.Count(universe);
 			Expect(universe, f => f.Take(8).All(v => v == 0), "pause darkens", mark);
 			session.Publish(Game, DofElementKind.Solenoid, 1, 0);
 
+			mark = _capture.Mark(universe);
 			var resumed = Wait(session.ResumeAsync());
 			Assert.That(resumed.Settled, Is.True, resumed.ToString());
-			mark = _capture.Count(universe);
 			Expect(universe, f => f[0] == 0 && f[1] == 128 && f[2] == 255, "resume shows the current state", mark);
 
 			var stopped = Wait(session.StopAsync());

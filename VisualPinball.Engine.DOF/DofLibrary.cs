@@ -45,6 +45,8 @@ namespace VisualPinball.Engine.DOF
 		private static readonly object LogLock = new object();
 		private static readonly DofNative.LogCallback LogCallback = OnLog;
 		private static volatile Action<DofLogLevel, string> _logSink;
+		[ThreadStatic]
+		private static int t_inLogCallback;
 		private static bool? _compatible;
 
 		/// <summary>The ABI version of the loaded native library.</summary>
@@ -104,12 +106,18 @@ namespace VisualPinball.Engine.DOF
 			if (sink == null) {
 				return;
 			}
+			t_inLogCallback++;
 			try {
 				sink((DofLogLevel)level, Utf8.Decode(message) ?? string.Empty);
 			} catch {
 				// An exception must not unwind into native code.
+			} finally {
+				t_inLogCallback--;
 			}
 		}
+
+		/// <summary>Whether this thread is in the log sink, called for a line libdof wrote.</summary>
+		internal static bool InLogCallback => t_inLogCallback > 0;
 
 		/// <summary>
 		/// Lists the table rows of the ini files libdof finds for a configuration folder, with their device numbers. Needs

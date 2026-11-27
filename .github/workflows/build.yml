@@ -52,7 +52,7 @@ jobs:
         run: dotnet build VisualPinball.Engine.DOF -c Release
 
       - name: Test
-        run: dotnet test VisualPinball.Engine.DOF.Test -c Release
+        run: dotnet test VisualPinball.Engine.DOF.Test -c Release --blame-hang-timeout 120s --blame-hang-dump-type none
 
       - uses: actions/upload-artifact@v4
         with:
@@ -99,7 +99,7 @@ jobs:
         run: dotnet build VisualPinball.Engine.DOF -c Release
 
       - name: Test
-        run: dotnet test VisualPinball.Engine.DOF.Test -c Release
+        run: dotnet test VisualPinball.Engine.DOF.Test -c Release --blame-hang-timeout 120s --blame-hang-dump-type none
 
       - uses: actions/upload-artifact@v4
         with:
@@ -135,7 +135,7 @@ jobs:
         run: dotnet build VisualPinball.Engine.DOF -c Release
 
       - name: Test
-        run: dotnet test VisualPinball.Engine.DOF.Test -c Release
+        run: dotnet test VisualPinball.Engine.DOF.Test -c Release --blame-hang-timeout 120s --blame-hang-dump-type none
 
       - uses: actions/upload-artifact@v4
         with:
