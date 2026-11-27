@@ -47,6 +47,10 @@ namespace VisualPinball.Engine.DOF.Test
 		public int OutsideLatches;
 		/// <summary>How many latches there were, from any thread.</summary>
 		public int Latches;
+		/// <summary>Runs at the start of every <see cref="LatchOutputGate"/>, on the thread that latches.</summary>
+		public volatile Action OnLatch;
+		/// <summary>How many times <see cref="GetGateState"/> was asked.</summary>
+		public int GateStateCalls;
 		public volatile bool Disposed;
 		public volatile bool Finished;
 		public readonly ManualResetEventSlim FinishStarted = new ManualResetEventSlim(false);
@@ -124,6 +128,7 @@ namespace VisualPinball.Engine.DOF.Test
 
 		public long LatchOutputGate()
 		{
+			OnLatch?.Invoke();
 			if (GateError) {
 				throw new DofException(DofStatus.Error, "the gate failed");
 			}
@@ -142,6 +147,7 @@ namespace VisualPinball.Engine.DOF.Test
 
 		public DofGateState GetGateState(long generation)
 		{
+			Interlocked.Increment(ref GateStateCalls);
 			if (!UnitWrites) {
 				return new DofGateState(true, 0, 1, 0);
 			}

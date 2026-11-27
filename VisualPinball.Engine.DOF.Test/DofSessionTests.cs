@@ -691,6 +691,38 @@ namespace VisualPinball.Engine.DOF.Test
 			Assert.That(Wait(session.Completion).Completed, Is.True);
 		}
 
+		[Test]
+		public void PauseThatTheEmergencyStopsLatchEndsReportsTheStop()
+		{
+			// An emergency stop latches before it asks the worker to stop. Its latch is held until the waiting pause
+			// returned, so the pause certainly ends inside that window, and it reports the stop, not the latch.
+			var native = new FakeNative();
+			var (session, _) = Create(o => o.GateTimeout = TimeSpan.FromSeconds(3), native);
+			Wait(session.StartAsync());
+			WaitUntil(() => native.GateOpen, "the gate to open");
+			native.UnitWrites = false;
+			var pause = session.PauseAsync();
+			WaitUntil(() => !native.GateOpen, "the pause to close the gate");
+			// The worker waits for the closing, outside the native lock, so the stop's own thread latches.
+			var asked = Volatile.Read(ref native.GateStateCalls);
+			WaitUntil(() => Volatile.Read(ref native.GateStateCalls) > asked, "the pause to wait");
+			// Asked inside the latch, before the stop asks the worker to stop: the pause it ended, and a resume asked then.
+			string pauseReason = null, resumeReason = null;
+			native.OnLatch = () => {
+				if (Thread.CurrentThread.Name != "DOF session" && pause.Wait(Timeout)) {
+					pauseReason = pause.Result.Reason;
+					var resume = session.ResumeAsync();
+					resumeReason = resume.Wait(Timeout) ? resume.Result.Reason : "no answer";
+				}
+			};
+			session.EmergencyStop();
+			native.OnLatch = null;
+			Assert.That(pauseReason, Is.EqualTo("The session is stopping."), "the pause the latch ended");
+			Assert.That(resumeReason, Is.EqualTo("The session is stopping."), "a resume asked while the stop latches");
+			native.UnitWrites = true;
+			Assert.That(Wait(session.Completion).Completed, Is.True);
+		}
+
 		private const string UpstreamOverflow = "The real-time feed overflowed.";
 
 		[Test]

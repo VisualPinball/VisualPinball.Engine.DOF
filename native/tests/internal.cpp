@@ -40,6 +40,7 @@
 #include "fx/EffectList.h"
 #include "fx/matrixfx/RGBAMatrixShiftEffect.h"
 #include "fx/timmedfx/DelayEffect.h"
+#include "general/DirectoryInfo.h"
 #include "general/FileInfo.h"
 #include "general/FilePattern.h"
 #include "general/FileReader.h"
@@ -61,6 +62,8 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #endif
+
+#include "../src/vpe_dof_text.h"
 
 using namespace DOF;
 
@@ -750,6 +753,171 @@ void ConnectThatFailsAfterItsTestEndsDark()
 	}
 }
 
+// A controller that sends its connect test as it is configured, before Init, as a UMX controller does, and whose
+// settings then turn out wrong: Init starts no updater, which would end the session with the blackout.
+class TestedBeforeInitController : public OutputControllerCompleteBase
+{
+public:
+	std::string GetXmlElementName() const override { return "TestedBeforeInitController"; }
+
+	void SendConnectTest()
+	{
+		RegisterGateUnit();
+		ConnectTestSent(ObserveGate());
+	}
+
+	std::atomic<bool> blackoutWorks { true };
+	std::atomic<int> blackouts { 0 };
+
+protected:
+	int GetNumberOfConfiguredOutputs() override { return 2; }
+	bool VerifySettings() override { return false; }
+	void ConnectToController() override { }
+	void UpdateOutputs(const std::vector<uint8_t>&) override { }
+
+	void DisconnectFromController() override
+	{
+		if (!m_deviceUsed)
+			return;
+		blackouts++;
+		if (!blackoutWorks)
+			throw std::runtime_error("the device does not answer");
+		m_disconnectTurnedOff = true;
+	}
+};
+
+// A controller that took its connect test before an Init that starts no updater is turned off by Init, and Finish
+// reports a blackout that did not get there. One that took no test is left alone.
+void ConnectTestBeforeAFailedInitEndsDark()
+{
+	for (int run = 0; run < 3; run++)
+	{
+		bool tested = run != 2;
+		bool blackoutWorks = run == 0;
+		OutputGate& gate = OutputGate::BeginSession();
+		Change(gate, true);
+		TestedBeforeInitController controller;
+		controller.SetName("tested");
+		controller.blackoutWorks = blackoutWorks;
+		if (tested)
+			controller.SendConnectTest();
+		controller.Init(nullptr);
+		std::string error;
+		try
+		{
+			controller.Finish();
+		}
+		catch (const std::exception& e)
+		{
+			error = e.what();
+		}
+		if (!tested)
+		{
+			CHECK(controller.blackouts == 0 && error.empty(), "an untested controller is not turned off");
+			continue;
+		}
+		CHECK(controller.blackouts == 1, "the tested controller is turned off as Init gives up");
+		if (blackoutWorks)
+			CHECK(error.empty(), "a blackout that got there finishes cleanly");
+		else
+			CHECK(error.find("after its connect test") != std::string::npos && error.find("the device does not answer") != std::string::npos,
+				"one that did not fails the finish, with the reason");
+	}
+}
+
+// The error of an init whose rollback could not turn everything off leads with that, so a short buffer keeps it, and
+// the text is cut once, at the buffer, on a character boundary.
+void InitFailureLeadsWithOutputsLeftOn()
+{
+	const std::string warning = "stopping what init started failed, outputs may still be on: ";
+	CHECK(vpe_dof_text::InitFailure("no cabinet", "") == "no cabinet", "an init that stopped cleanly reports why it failed");
+	CHECK(vpe_dof_text::InitFailure("no cabinet", "UMX Controller 01: off failed") == warning + "no cabinet; UMX Controller 01: off failed",
+		"then why stopping failed");
+	const std::string longInit(1500, 'i');
+	for (int32_t size : { 16, 128, 1024 })
+	{
+		std::vector<char> buffer(static_cast<size_t>(size), 'x');
+		vpe_dof_text::WriteError(buffer.data(), size, vpe_dof_text::InitFailure(longInit, "the blackout failed").c_str());
+		std::string written(buffer.data());
+		CHECK(written.size() == static_cast<size_t>(size) - 1, "the text fills the buffer");
+		CHECK(warning.compare(0, written.size(), written) == 0 || written.compare(0, warning.size(), warning) == 0, "and starts with the warning");
+	}
+	// "abc" and a two-byte character that does not fit whole.
+	char cut[5];
+	vpe_dof_text::WriteError(cut, sizeof(cut), "abc\xC3\xA9");
+	CHECK(std::string(cut) == "abc", "a character is not cut in half");
+	vpe_dof_text::WriteError(cut, 1, "abc");
+	CHECK(cut[0] == '\0', "a buffer of one byte gets an empty text");
+}
+
+// A controller whose Init fails, as one whose device is gone does.
+class FailingInitController : public OutputControllerCompleteBase
+{
+public:
+	std::string GetXmlElementName() const override { return "FailingInitController"; }
+
+protected:
+	int GetNumberOfConfiguredOutputs() override { return 2; }
+	bool VerifySettings() override { throw std::runtime_error("the device is gone"); }
+	void ConnectToController() override { }
+	void DisconnectFromController() override { }
+	void UpdateOutputs(const std::vector<uint8_t>&) override { }
+};
+
+// A controller that took its connect test as it was auto-configured, after one whose Init fails: the session's Init
+// never reaches it, so no Init and no updater turns it off. Finishing the list does, before it frees the devices, and
+// the unit confirms the latch made after the test, or fails with the error the list reports.
+void ConnectTestBeforeAnotherControllersFailedInitEndsDark()
+{
+	for (bool blackoutWorks : { true, false })
+	{
+		OutputGate& gate = OutputGate::BeginSession();
+		Change(gate, true);
+		OutputControllerList controllers;
+		FailingInitController* failing = new FailingInitController();
+		failing->SetName("failing");
+		controllers.push_back(failing);
+		TestedBeforeInitController* tested = new TestedBeforeInitController();
+		tested->SetName("tested");
+		tested->blackoutWorks = blackoutWorks;
+		controllers.push_back(tested);
+		tested->SendConnectTest();
+		int64_t latched = gate.Latch();
+		bool initFailed = false;
+		try
+		{
+			controllers.Init(nullptr);
+		}
+		catch (const std::exception&)
+		{
+			initFailed = true;
+		}
+		CHECK(initFailed && tested->blackouts == 0, "the session's Init fails before it reaches the tested controller");
+		std::string error;
+		try
+		{
+			controllers.Finish();
+		}
+		catch (const std::exception& e)
+		{
+			error = e.what();
+		}
+		CHECK(tested->blackouts == 1, "finishing the list turns the tested controller off");
+		OutputGate::Counts counts;
+		CHECK(gate.GetState(latched, counts) == OutputGate::Status::Applied && counts.pending == 0, "the latch is settled");
+		if (blackoutWorks)
+		{
+			CHECK(error.empty(), "a blackout that got there finishes cleanly");
+			CHECK(counts.confirmed == 1 && counts.failed == 0, "and confirms the latch");
+		}
+		else
+		{
+			CHECK(error.find("tested") != std::string::npos && error.find("after its connect test") != std::string::npos, "one that did not fails the finish");
+			CHECK(counts.failed == 1 && counts.confirmed == 0, "and the latch");
+		}
+	}
+}
+
 // A unit registered while the gate is closed turns its device off first, also when the gate opened before its first
 // update: a session that starts closed starts dark on every unit, whatever an earlier one left lit. A connect test
 // does not go out before that.
@@ -1092,6 +1260,52 @@ void PathThroughALinkIsCheckedAsItIsOpened()
 #endif
 }
 
+// The names a folder listing returns.
+template <typename Entry> std::vector<std::string> ListedNames(const std::vector<Entry>& entries)
+{
+	std::vector<std::string> names;
+	for (const Entry& entry : entries)
+		names.push_back(entry.Name());
+	std::sort(names.begin(), names.end());
+	return names;
+}
+
+// A folder listing returns the entries whose name matches that are of the type asked for and inside the root: files
+// for GetFiles, folders for GetDirectories, and on POSIX no link that leads outside the root.
+void FolderListingsMatchNameTypeAndRoot()
+{
+	std::filesystem::path root = NewTempDirectory("vpe-dof-internal-listing");
+	std::filesystem::path outside = NewTempDirectory("vpe-dof-internal-listing-outside");
+	CHECK(!root.empty() && !outside.empty(), "the test has folders of its own");
+	if (root.empty() || outside.empty())
+		return;
+	std::error_code ec;
+	for (const std::filesystem::path& file : { root / "a.xml", root / "B.XML", root / "c.ini", outside / "far.xml" })
+	{
+		FILE* handle = std::fopen(file.string().c_str(), "wb");
+		if (handle)
+			std::fclose(handle);
+	}
+	std::filesystem::create_directory(root / "folder.xml", ec);
+	std::filesystem::create_directory(root / "other", ec);
+	std::filesystem::create_directory(outside / "far", ec);
+	std::vector<std::string> files = { "B.XML", "a.xml" };
+	std::vector<std::string> folders = { "folder.xml" };
+#ifndef _WIN32
+	std::filesystem::create_symlink(outside / "far.xml", root / "link.xml", ec);
+	CHECK(!ec, "the file link is created");
+	std::filesystem::create_directory_symlink(outside / "far", root / "linked.xml", ec);
+	CHECK(!ec, "the folder link is created");
+#endif
+	PathConfinement::SetRoot(root.string());
+	DirectoryInfo folder(root.string());
+	CHECK(ListedNames(folder.GetFiles("*.xml")) == files, "the files whose name matches are listed, and no folder or link out");
+	CHECK(ListedNames(folder.GetDirectories("*.xml")) == folders, "the folders whose name matches are listed, and no file or link out");
+	PathConfinement::SetRoot("");
+	std::filesystem::remove_all(root, ec);
+	std::filesystem::remove_all(outside, ec);
+}
+
 // A path inside the root is read whatever its spelling: through the junction the root was given through or another
 // one, in 8.3 or long names per component, in any case (non-ASCII too). A path on another share, in a device namespace
 // or a UNC path is refused without being looked up, also when it names a file inside. Windows only, and the 8.3 checks
@@ -1340,6 +1554,12 @@ void CabinetCheckReportsWhatASessionSkips()
 			  "<LedWiz><Name>ledwiz without number</Name></LedWiz>"
 			  "<LedWiz><Name>ledwiz word</Name><Number>one</Number></LedWiz>"
 			  "<PacLed64 Name=\"led64 out of range\" Id=\"5\" />"
+			  "<PacUIO Name=\"uio hex\" Id=\"0x1\" />"
+			  "<PacLed64 Name=\"led64 hex\" Id=\"0X2\" />"
+			  "<PacLed64 Name=\"led64 hex out of range\" Id=\"0x5\" />"
+			  "<PacUIO Name=\"uio hex suffix\" Id=\"0x1z\" />"
+			  "<PacUIO Name=\"uio bare prefix\" Id=\"0x\" />"
+			  "<PacLed64 Name=\"led64 suffix\" Id=\"1old\" />"
 			  "<TeensyStripController><Name>teensy</Name><ComPortBaudRate>fast</ComPortBaudRate></TeensyStripController>"
 			  "<NoSuchController><Name>unknown</Name></NoSuchController>"
 			  "<PacUIO Id=\"x\" />"
@@ -1362,6 +1582,12 @@ void CabinetCheckReportsWhatASessionSkips()
 		{ "LedWiz", "ledwiz without number", false, "no Number" },
 		{ "LedWiz", "ledwiz word", false, "Number \"one\" is not a whole number" },
 		{ "PacLed64", "led64 out of range", false, "PacLed64 Ids must be between 1-4. The supplied Id 5 is out of range." },
+		{ "PacUIO", "uio hex", true, "" },
+		{ "PacLed64", "led64 hex", true, "" },
+		{ "PacLed64", "led64 hex out of range", false, "PacLed64 Ids must be between 1-4. The supplied Id 5 is out of range." },
+		{ "PacUIO", "uio hex suffix", false, "Id \"0x1z\" is not a whole number" },
+		{ "PacUIO", "uio bare prefix", false, "Id \"0x\" is not a whole number" },
+		{ "PacLed64", "led64 suffix", false, "Id \"1old\" is not a whole number" },
 		{ "TeensyStripController", "teensy", false, "ComPortBaudRate \"fast\" is not a valid value" },
 		{ "NoSuchController", "unknown", false, "libdof has no output controller of this type" },
 		{ "PacUIO", "", false, "Id \"x\" is not a whole number" },
@@ -1726,6 +1952,9 @@ int main()
 	FinishTakesNoOpening();
 	ConnectTestCountsAsUse();
 	ConnectThatFailsAfterItsTestEndsDark();
+	ConnectTestBeforeAFailedInitEndsDark();
+	ConnectTestBeforeAnotherControllersFailedInitEndsDark();
+	InitFailureLeadsWithOutputsLeftOn();
 	SessionThatStartsClosedStartsDark();
 	SessionThatStartsClosedTestsOnNoReconnect();
 	LatchBeforeTheConnectTestSkipsIt();
@@ -1740,6 +1969,7 @@ int main()
 	GateChangeIsPublishedWhateverAnOutputThrows();
 	LookupsOutsideTheRootAreRefused();
 	PathThroughALinkIsCheckedAsItIsOpened();
+	FolderListingsMatchNameTypeAndRoot();
 	RootSpellingsAreOneFolder();
 	TableFolderNamesComeFromTheFilename();
 	UnreadableControllerIsSkipped();

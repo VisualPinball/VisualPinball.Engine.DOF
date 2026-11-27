@@ -806,6 +806,8 @@ namespace VisualPinball.Engine.DOF.Test
 		{
 			// Checks run on another thread while instances are created, started, finished and destroyed, which builds and
 			// frees their gates and clears the device lists: every check reports the same, and every session runs as usual.
+			// Each init and each finish is held at its first log line until a check that started after the hold returned, so
+			// checks certainly overlap them, however the threads are scheduled.
 			var unit = Unit("ArtNetA");
 			using var config = StandardConfig(unit);
 			using var other = new TestConfig().GlobalConfig().Write("Cabinet.xml", "<?xml version=\"1.0\"?>\n<Cabinet><OutputControllers>"
@@ -837,25 +839,57 @@ namespace VisualPinball.Engine.DOF.Test
 					checkError = e;
 				}
 			}) { IsBackground = true };
+			var testThread = Environment.CurrentManagedThreadId;
+			var hold = 0;
+			string step = null;
+			var overlapped = new ConcurrentQueue<string>();
+			DofLibrary.SetLog((level, message) => {
+				_log.Enqueue($"[{level}] {message}");
+				// Only a line the step writes on this thread holds it, once; the checks' own lines never wait.
+				if (Environment.CurrentManagedThreadId != testThread || Interlocked.Exchange(ref hold, 0) == 0) {
+					return;
+				}
+				// A check that was running when the hold began may return first: the second one started inside the hold.
+				var before = Volatile.Read(ref checks);
+				var watch = Stopwatch.StartNew();
+				while (Volatile.Read(ref checks) < before + 2 && Volatile.Read(ref checkError) == null && watch.ElapsedMilliseconds < 10000) {
+					Thread.Sleep(1);
+				}
+				if (Volatile.Read(ref checks) >= before + 2) {
+					overlapped.Enqueue(step);
+				}
+			}, DofLogLevel.Debug);
+			// Asked right after each step, so a stalled checker fails the step it stalled, within one hold.
+			void Overlapped() => Assert.That(overlapped.Contains(step), Is.True, $"a whole check ran while {step} was held{(checkError == null ? "" : ": " + checkError)}");
 			checker.Start();
 			try {
 				var seen = 0;
 				for (var i = 0; i < 6; i++) {
-					using var dof = Start(config);
+					using var dof = DofInstance.Create(config.Root);
+					step = $"init {i + 1}";
+					Volatile.Write(ref hold, 1);
+					dof.Init(config.TableFile, "vpetest");
+					Volatile.Write(ref hold, 0);
+					Overlapped();
 					dof.Data('S', 1, 1);
 					var lit = ExpectIndex(unit.Universe, f => f[0] == 255, $"S1 on in session {i + 1}", seen);
 					dof.Data('S', 1, 0);
 					seen = ExpectIndex(unit.Universe, f => f[0] == 0, $"S1 off in session {i + 1}", lit + 1) + 1;
 					var state = WaitSettled(dof, dof.SetOutputGate(false));
 					Assert.That((state.Written, state.Pending, state.Failed), Is.EqualTo((1, 0, 0)), $"session {i + 1} settles");
+					step = $"finish {i + 1}";
+					Volatile.Write(ref hold, 1);
 					dof.Finish();
+					Volatile.Write(ref hold, 0);
+					Overlapped();
 				}
 			} finally {
+				Volatile.Write(ref hold, 0);
 				Volatile.Write(ref stop, 1);
 				Assert.That(Joined(checker, 30000), Is.True, "the checks returned");
+				RestoreLog();
 			}
 			Assert.That(checkError, Is.Null, checkError?.ToString());
-			Assert.That(Volatile.Read(ref checks), Is.GreaterThan(0), "checks ran beside the sessions");
 		}
 
 		[Test]

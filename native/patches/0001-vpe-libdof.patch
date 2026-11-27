@@ -537,7 +537,7 @@ index f222f0c..bdd8bf0 100644
  }
  
 diff --git a/src/cab/out/OutputControllerCompleteBase.cpp b/src/cab/out/OutputControllerCompleteBase.cpp
-index 2b1478c..672f722 100644
+index 2b1478c..55a8ec8 100644
 --- a/src/cab/out/OutputControllerCompleteBase.cpp
 +++ b/src/cab/out/OutputControllerCompleteBase.cpp
 @@ -1,5 +1,7 @@
@@ -548,21 +548,37 @@ index 2b1478c..672f722 100644
  #include "../../Log.h"
  #include "../../general/StringExtensions.h"
  #include <algorithm>
-@@ -36,16 +38,53 @@ void OutputControllerCompleteBase::Init(Cabinet* cabinet)
+@@ -22,6 +24,7 @@ OutputControllerCompleteBase::~OutputControllerCompleteBase() { FinishUpdaterThr
+ 
+ void OutputControllerCompleteBase::Init(Cabinet* cabinet)
+ {
++   m_finishError.clear();
+    bool settingsValid = false;
+    try
+    {
+@@ -30,22 +33,91 @@ void OutputControllerCompleteBase::Init(Cabinet* cabinet)
+    catch (const std::exception& e)
+    {
+       Log::Exception(StringExtensions::Build("Exception occurred when verifying settings for {0} {1}: {2}. Cannot initialize.", GetXmlElementName(), GetName(), e.what()));
++      TurnOffWithoutUpdater();
+       throw;
+    }
+ 
     if (settingsValid)
     {
        SetupOutputs();
+-      m_finishError.clear();
+-      InitUpdaterThread();
 +      RegisterGateUnit();
 +      // VPE: a connect test is used up here when the unit registered under a closing (TakeConnectTest).
 +      m_connectTestEligible = m_gateUnit->Observe().open;
-       m_finishError.clear();
--      InitUpdaterThread();
 +      try
 +      {
 +         InitUpdaterThread();
 +      }
 +      catch (...)
 +      {
++         TurnOffWithoutUpdater();
 +         m_gateUnit->Die();
 +         throw;
 +      }
@@ -571,12 +587,43 @@ index 2b1478c..672f722 100644
     else
     {
 +      // A unit registered before (a connect test) fails as well.
++      TurnOffWithoutUpdater();
 +      RegisterGateUnit();
 +      m_gateUnit->Die();
        Log::Warning(StringExtensions::Build("Settings for {0} {1} are not correct. Cannot initialize.", GetXmlElementName(), GetName()));
     }
  }
  
++// VPE: a device that took a connect test before its updater ran (a UMX controller, as it is auto-configured) is turned
++// off when no updater will run to end the session with the blackout: the test may still light it. A blackout that does
++// not get through is the error Finish reports.
++void OutputControllerCompleteBase::TurnOffWithoutUpdater()
++{
++   if (!m_deviceUsed)
++      return;
++   m_disconnectTurnedOff = false;
++   std::string error;
++   try
++   {
++      DisconnectFromController();
++   }
++   catch (const std::exception& e)
++   {
++      error = e.what();
++   }
++   catch (...)
++   {
++      error = "unknown error";
++   }
++   if (!m_disconnectTurnedOff)
++   {
++      m_finishError = StringExtensions::Build("{0} {1} could not turn its outputs off after its connect test, they may still be on{2}", GetXmlElementName(), GetName(),
++         error.empty() ? std::string() : ": " + error);
++      Log::Exception(m_finishError);
++   }
++   m_deviceUsed = false;
++}
++
 +void OutputControllerCompleteBase::ConnectTestSent(const OutputGate::Snapshot& gate)
 +{
 +   m_deviceUsed = true;
@@ -603,7 +650,36 @@ index 2b1478c..672f722 100644
  void OutputControllerCompleteBase::Finish()
  {
     FinishUpdaterThread();
-@@ -91,6 +130,11 @@ void OutputControllerCompleteBase::SetValues(int firstOutput, const uint8_t* val
+@@ -58,6 +130,28 @@ void OutputControllerCompleteBase::Finish()
+    }
+ }
+ 
++void OutputControllerCompleteBase::FinishWithoutInit()
++{
++   if (m_deviceUsed)
++   {
++      OutputGate::Snapshot before = ObserveGate();
++      TurnOffWithoutUpdater();
++      // As at the end of an updater: a blackout that got there confirms the closing, one that did not fails the unit.
++      if (m_gateUnit && !m_disconnectTurnedOff)
++         m_gateUnit->Die();
++      else if (m_gateUnit)
++         m_gateUnit->AckOff(before);
++   }
++   if (m_gateUnit)
++      m_gateUnit->Stop();
++   if (!m_finishError.empty())
++   {
++      std::string error = m_finishError;
++      m_finishError.clear();
++      throw std::runtime_error(error);
++   }
++}
++
+ void OutputControllerCompleteBase::Update()
+ {
+    if (m_updateRequired)
+@@ -91,6 +185,11 @@ void OutputControllerCompleteBase::SetValues(int firstOutput, const uint8_t* val
  
  void OutputControllerCompleteBase::SetupOutputs()
  {
@@ -615,7 +691,7 @@ index 2b1478c..672f722 100644
     int numberOfOutputs = std::max(0, GetNumberOfConfiguredOutputs());
  
     if (!GetOutputs())
-@@ -269,15 +313,37 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -269,15 +368,37 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
  {
     Log::Write(StringExtensions::Build("Updater thread started for {0} {1}", GetXmlElementName(), GetName()));
  
@@ -653,7 +729,7 @@ index 2b1478c..672f722 100644
           try
           {
              DisconnectFromController();
-@@ -285,6 +351,10 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -285,6 +406,10 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
           catch (...)
           {
           }
@@ -664,7 +740,7 @@ index 2b1478c..672f722 100644
           m_updaterThreadFinished = true;
           return;
        }
-@@ -295,13 +365,20 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -295,13 +420,20 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
        bool fullTransferRequired = true;
        while (m_keepUpdaterThreadAlive)
        {
@@ -685,7 +761,7 @@ index 2b1478c..672f722 100644
           try
           {
              if (m_inUseState == InUseState::ValueChanged)
-@@ -312,14 +389,30 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -312,14 +444,30 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
                 m_inUseState = InUseState::Running;
              }
  
@@ -718,7 +794,7 @@ index 2b1478c..672f722 100644
           }
  
           if (!updateOK)
-@@ -345,7 +438,7 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -345,7 +493,7 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
              Log::Write("Reconnected to controller");
           }
  
@@ -727,7 +803,7 @@ index 2b1478c..672f722 100644
           {
              std::unique_lock<std::mutex> lock(m_conditionMutex);
              m_updateCondition.wait_for(lock, std::chrono::milliseconds(50), [this] { return !m_keepUpdaterThreadAlive || m_updateRequired; });
-@@ -353,18 +446,23 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -353,18 +501,23 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
           m_updateRequired = false;
        }
  
@@ -754,7 +830,7 @@ index 2b1478c..672f722 100644
                    m_finishError = StringExtensions::Build("{0} {1} could not send its final update", GetXmlElementName(), GetName());
              }
           }
-@@ -390,20 +488,42 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -390,20 +543,42 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
        catch (...)
        {
        }
@@ -798,7 +874,7 @@ index 2b1478c..672f722 100644
     try
     {
        UpdateOutputs(values);
-@@ -411,10 +531,19 @@ bool OutputControllerCompleteBase::Transfer(const std::vector<uint8_t>& values,
+@@ -411,10 +586,19 @@ bool OutputControllerCompleteBase::Transfer(const std::vector<uint8_t>& values,
     catch (...)
     {
        m_forceFullTransfer = false;
@@ -820,7 +896,7 @@ index 2b1478c..672f722 100644
 +
  }
 diff --git a/src/cab/out/OutputControllerCompleteBase.h b/src/cab/out/OutputControllerCompleteBase.h
-index e625193..6fb346a 100644
+index e625193..4bd4279 100644
 --- a/src/cab/out/OutputControllerCompleteBase.h
 +++ b/src/cab/out/OutputControllerCompleteBase.h
 @@ -3,6 +3,7 @@
@@ -831,7 +907,19 @@ index e625193..6fb346a 100644
  #include <atomic>
  #include <mutex>
  #include <string>
-@@ -31,6 +32,8 @@ public:
+@@ -20,6 +21,11 @@ public:
+ 
+    virtual void Init(Cabinet* cabinet) override;
+    virtual void Finish() override;
++   // VPE: ends a controller the session's Init never reached (one before it failed), called by OutputControllerList::Finish
++   // while the devices are still open: a connect test it took as it was auto-configured (a UMX controller) is ended with
++   // the blackout, which its unit confirms, and the unit retires; it fails if the blackout did not get there, which then
++   // throws.
++   void FinishWithoutInit();
+    void Update() override;
+ 
+ 
+@@ -31,6 +37,8 @@ public:
  
  protected:
     void SetupOutputs();
@@ -840,7 +928,7 @@ index e625193..6fb346a 100644
     void RenameOutputs();
  
     virtual int GetNumberOfConfiguredOutputs() = 0;
-@@ -49,6 +52,27 @@ protected:
+@@ -49,6 +57,27 @@ protected:
     bool m_forceFullTransfer = false;
     bool m_transferSkipped = false;
     bool m_disconnectTurnedOff = false;
@@ -868,7 +956,7 @@ index e625193..6fb346a 100644
  
  
     void InitUpdaterThread();
-@@ -76,9 +100,13 @@ private:
+@@ -76,9 +105,14 @@ private:
     mutable std::mutex m_conditionMutex;
     bool m_keepUpdaterThreadAlive;
     std::atomic<bool> m_updaterThreadFinished { false };
@@ -879,6 +967,7 @@ index e625193..6fb346a 100644
 +   bool m_transferCancelled = false;
     void UpdaterThreadDoIt();
 -   bool Transfer(const std::vector<uint8_t>& values, bool full);
++   void TurnOffWithoutUpdater();
 +   bool Transfer(const std::vector<uint8_t>& values, bool full, const OutputGate::Snapshot& gate);
  };
  
@@ -916,10 +1005,19 @@ index 58588e9..1d414cf 100644
  
     return true;
 diff --git a/src/cab/out/OutputControllerList.cpp b/src/cab/out/OutputControllerList.cpp
-index 0d7a194..58cf6dc 100644
+index 0d7a194..0bf08ef 100644
 --- a/src/cab/out/OutputControllerList.cpp
 +++ b/src/cab/out/OutputControllerList.cpp
-@@ -37,6 +37,13 @@
+@@ -5,6 +5,8 @@
+ #include "../../Log.h"
+ #include "../../general/StringExtensions.h"
+ #include "NullOutputController.h"
++#include "OutputControllerCompleteBase.h"
++#include <functional>
+ 
+ #ifdef __HIDAPI__
+ #include "ps/Pinscape.h"
+@@ -37,6 +39,13 @@
  namespace DOF
  {
  
@@ -933,7 +1031,49 @@ index 0d7a194..58cf6dc 100644
  OutputControllerList::OutputControllerList()
     : m_initializedCount(0)
  {
-@@ -178,12 +185,83 @@ IOutputController* OutputControllerList::CreateController(const std::string& typ
+@@ -71,16 +80,13 @@ void OutputControllerList::Finish()
+ 
+    std::string failures;
+    bool failed = false;
+-   size_t count = m_initializedCount < size() ? m_initializedCount : size();
+-   m_initializedCount = 0;
+-   for (size_t i = 0; i < count; i++)
++   auto finish = [&](IOutputController* controller, const std::function<void()>& end)
+    {
+-      IOutputController* controller = at(i);
+       std::string error;
+       try
+       {
+-         controller->Finish();
+-         continue;
++         end();
++         return;
+       }
+       catch (const std::exception& e)
+       {
+@@ -93,6 +99,21 @@ void OutputControllerList::Finish()
+       failed = true;
+       Log::Exception(StringExtensions::Build("Finishing output controller {0} failed: {1}", controller->GetName(), error));
+       failures += (failures.empty() ? "" : "; ") + controller->GetName() + ": " + error;
++   };
++   size_t count = m_initializedCount < size() ? m_initializedCount : size();
++   m_initializedCount = 0;
++   for (size_t i = 0; i < count; i++)
++   {
++      IOutputController* controller = at(i);
++      finish(controller, [controller]() { controller->Finish(); });
++   }
++   // VPE: the controllers Init never reached (one before them failed) end here too, before the devices are freed below,
++   // which they still point to: one that took a connect test as it was auto-configured (UMX) turns its outputs off now.
++   for (size_t i = count; i < size(); i++)
++   {
++      OutputControllerCompleteBase* controller = dynamic_cast<OutputControllerCompleteBase*>(at(i));
++      if (controller)
++         finish(controller, [controller]() { controller->FinishWithoutInit(); });
+    }
+ 
+ #ifdef __HIDAPI__
+@@ -178,12 +199,83 @@ IOutputController* OutputControllerList::CreateController(const std::string& typ
     else if (typeName == "ArtNet")
        return new ArtNet();
     else
@@ -965,11 +1105,11 @@ index 0d7a194..58cf6dc 100644
 +   catch (const std::exception& e)
 +   {
 +      reason = e.what();
-+   }
+    }
 +   catch (...)
 +   {
 +      reason = "unknown error";
-    }
++   }
 +   if (controller)
 +   {
 +      name = controller->GetName();
@@ -1019,7 +1159,7 @@ index 0d7a194..58cf6dc 100644
  tinyxml2::XMLElement* OutputControllerList::ToXml(tinyxml2::XMLDocument& doc) const
  {
     tinyxml2::XMLElement* element = doc.NewElement(GetXmlElementName().c_str());
-@@ -212,33 +290,23 @@ bool OutputControllerList::FromXml(const tinyxml2::XMLElement* element)
+@@ -212,33 +304,23 @@ bool OutputControllerList::FromXml(const tinyxml2::XMLElement* element)
     while (controllerElement)
     {
        std::string typeName = controllerElement->Name();
@@ -2329,7 +2469,7 @@ index 4475b47..07e2e83 100644
     virtual bool IsLost() const { return false; }
     virtual void Release() { }
 diff --git a/src/cab/out/adressableledstrip/WemosD1StripController.cpp b/src/cab/out/adressableledstrip/WemosD1StripController.cpp
-index cb013c8..4305acf 100644
+index cb013c8..6829a3b 100644
 --- a/src/cab/out/adressableledstrip/WemosD1StripController.cpp
 +++ b/src/cab/out/adressableledstrip/WemosD1StripController.cpp
 @@ -1,5 +1,6 @@
@@ -2350,7 +2490,7 @@ index cb013c8..4305acf 100644
  
              receiveData = std::vector<uint8_t>(1);
              bytesRead = -1;
-@@ -66,14 +65,34 @@ void WemosD1MPStripController::SetupController()
+@@ -66,41 +65,54 @@ void WemosD1MPStripController::SetupController()
        }
     }
  
@@ -2368,10 +2508,18 @@ index cb013c8..4305acf 100644
 -      enum sp_return result = sp_blocking_write(GetComPort(), commandData.data(), 1, GetComPortTimeOutMs());
 -      if (result < 0)
 -         throw std::runtime_error(StringExtensions::Build("Failed to write test command: {0}", sp_last_error_message()));
+-
+-      std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+-
+-      receiveData = std::vector<uint8_t>(1);
+-      bytesRead = -1;
+-
+-      try
 +      OutputGate::Snapshot gate = ObserveGate();
 +      bool sent = false;
 +      if (gate.open && OutputGate::Instance().AllowsConnectTests())
-+      {
+       {
+-         bytesRead = ReadPortWait(receiveData.data(), 0, 1);
 +         OutputGate::Transfer transfer(GateUnit(), gate);
 +         if (!TransferCancelled())
 +         {
@@ -2382,16 +2530,27 @@ index cb013c8..4305acf 100644
 +            sent = true;
 +            ConnectTestSent(gate);
 +         }
-+      }
+       }
+-      catch (const std::exception& e)
 +      if (!sent)
-+      {
+       {
+-         throw std::runtime_error("Expected 1 bytes after requesting a test sequence, but the read operation resulted in a exception. Will not send data to the controller.");
 +         Log::Write("The test request is not sent, the output gate closed");
 +         return;
-+      }
+       }
  
-       std::this_thread::sleep_for(std::chrono::milliseconds(2000));
- 
-@@ -95,12 +114,10 @@ void WemosD1MPStripController::SetupController()
++      // VPE: the firmware runs the whole test before it reads the next command, and acknowledges it once the strips are
++      // off again. The acknowledgement is taken as soon as it comes, within the 2 s the test was given before plus the
++      // port's timeout, so a closing or a latch since the test was sent goes out as soon as the controller can take it,
++      // not after a fixed 2 s.
++      receiveData = std::vector<uint8_t>(1);
++      bytesRead = sp_blocking_read(GetComPort(), receiveData.data(), 1, 2000 + GetComPortTimeOutMs());
++      if (bytesRead < 0)
++         throw std::runtime_error("Expected 1 bytes after requesting a test sequence, but the read operation resulted in a exception. Will not send data to the controller.");
++
+       if (bytesRead != 1 || receiveData[0] != (uint8_t)'A')
+       {
+          char receivedChar = (char)receiveData[0];
           throw std::runtime_error(StringExtensions::Build(
              "Expected a Ack (A) after requesting a test sequence, but received no answer or a unexpected answer ({0}). Will not send data to the controller.", std::string(1, receivedChar)));
        }
@@ -2405,7 +2564,7 @@ index cb013c8..4305acf 100644
  {
     if (m_useCompression)
     {
-@@ -148,18 +165,23 @@ void WemosD1MPStripController::SendLedstripData(const std::vector<uint8_t>& outp
+@@ -148,18 +160,23 @@ void WemosD1MPStripController::SendLedstripData(const std::vector<uint8_t>& outp
  
           std::vector<uint8_t> commandData = { (uint8_t)'Q', (uint8_t)(targetPosition >> 8), (uint8_t)(targetPosition & 255), (uint8_t)(nbData >> 8), (uint8_t)(nbData & 255),
              (uint8_t)(nbLeds >> 8), (uint8_t)(nbLeds & 255) };
@@ -2434,7 +2593,7 @@ index cb013c8..4305acf 100644
     }
  }
  
-@@ -169,7 +191,8 @@ bool WemosD1MPStripController::FromXml(const tinyxml2::XMLElement* element)
+@@ -169,7 +186,8 @@ bool WemosD1MPStripController::FromXml(const tinyxml2::XMLElement* element)
        return false;
  
     bool strict = Config::GetInstance()->IsStrictSetup();
@@ -2444,7 +2603,7 @@ index cb013c8..4305acf 100644
     auto loadElement = [&](const char* name, auto setter)
     {
        const tinyxml2::XMLElement* elem = element->FirstChildElement(name);
-@@ -181,8 +204,8 @@ bool WemosD1MPStripController::FromXml(const tinyxml2::XMLElement* element)
+@@ -181,8 +199,8 @@ bool WemosD1MPStripController::FromXml(const tinyxml2::XMLElement* element)
           }
           catch (...)
           {
@@ -2455,7 +2614,7 @@ index cb013c8..4305acf 100644
           }
        }
     };
-@@ -198,7 +221,9 @@ bool WemosD1MPStripController::FromXml(const tinyxml2::XMLElement* element)
+@@ -198,7 +216,9 @@ bool WemosD1MPStripController::FromXml(const tinyxml2::XMLElement* element)
     loadElement("UseCompression", [&](const char* text) { SetUseCompression(toBool(text)); });
     loadElement("TestOnConnect", [&](const char* text) { SetTestOnConnect(toBool(text)); });
  
@@ -3862,7 +4021,7 @@ index c71dc9d..01698a1 100644
     bool PacLed64SetLEDStates(int index, int group, uint8_t data);
     bool PacLed64SetLEDFadeTime(int index, uint8_t fadeTime);
 diff --git a/src/cab/out/pac/PacLed64.cpp b/src/cab/out/pac/PacLed64.cpp
-index 71fcd00..bc69ab6 100644
+index 71fcd00..c3f9297 100644
 --- a/src/cab/out/pac/PacLed64.cpp
 +++ b/src/cab/out/pac/PacLed64.cpp
 @@ -1,4 +1,6 @@
@@ -3959,13 +4118,13 @@ index 71fcd00..bc69ab6 100644
 -      SetId(id);
 +   // VPE: the Id selects the unit; without one (or with one that is not a number) the controller would drive no unit
 +   // and fail its Init, which fails the whole cabinet, so it is not read, and says why (OutputControllerList::Load), as
-+   // does SetId for one out of range. The whole text is the number: one that only starts with a number ("0.5", "1old")
-+   // selects no unit.
++   // does SetId for one out of range. The whole text is the number, decimal or, as tinyxml2 reads the attribute,
++   // hexadecimal after 0x: one that only starts with a number ("0.5", "1old") selects no unit.
 +   const char* idText = element->Attribute("Id");
 +   if (!idText)
 +      throw std::invalid_argument("no Id");
 +   int id = -1;
-+   if (!StringExtensions::TryParseInt(idText, id))
++   if (!StringExtensions::TryParseXmlInt(idText, id))
 +      throw std::invalid_argument(StringExtensions::Build("Id \"{0}\" is not a whole number", std::string(idText)));
 +   SetId(id);
  
@@ -4278,7 +4437,7 @@ index 640daa8..7a6da19 100644
        void ResetFadeTime();
        void EnforceMinUpdateInterval();
 diff --git a/src/cab/out/pac/PacUIO.cpp b/src/cab/out/pac/PacUIO.cpp
-index e35bbf8..7e3de7d 100644
+index e35bbf8..24769f6 100644
 --- a/src/cab/out/pac/PacUIO.cpp
 +++ b/src/cab/out/pac/PacUIO.cpp
 @@ -1,5 +1,7 @@
@@ -4364,13 +4523,13 @@ index e35bbf8..7e3de7d 100644
 -      SetId(id);
 +   // VPE: the Id selects the unit; without one (or with one that is not a number) the controller would drive no unit
 +   // and fail its Init, which fails the whole cabinet, so it is not read, and says why (OutputControllerList::Load), as
-+   // does SetId for one out of range. The whole text is the number: one that only starts with a number ("0.5", "1old")
-+   // selects no unit.
++   // does SetId for one out of range. The whole text is the number, decimal or, as tinyxml2 reads the attribute,
++   // hexadecimal after 0x: one that only starts with a number ("0.5", "1old") selects no unit.
 +   const char* idText = element->Attribute("Id");
 +   if (!idText)
 +      throw std::invalid_argument("no Id");
 +   int id = -1;
-+   if (!StringExtensions::TryParseInt(idText, id))
++   if (!StringExtensions::TryParseXmlInt(idText, id))
 +      throw std::invalid_argument(StringExtensions::Build("Id \"{0}\" is not a whole number", std::string(idText)));
 +   SetId(id);
  
@@ -5429,7 +5588,7 @@ index 303936f..afd013f 100644
     std::ofstream file(fileName);
     if (file.is_open())
 diff --git a/src/general/DirectoryInfo.cpp b/src/general/DirectoryInfo.cpp
-index 920f2e3..6f887d1 100644
+index 920f2e3..103df71 100644
 --- a/src/general/DirectoryInfo.cpp
 +++ b/src/general/DirectoryInfo.cpp
 @@ -1,4 +1,5 @@
@@ -5465,54 +5624,48 @@ index 920f2e3..6f887d1 100644
     std::error_code ec;
     if (recursive)
        std::filesystem::remove_all(m_path, ec);
-@@ -42,11 +51,19 @@ std::vector<FileInfo> DirectoryInfo::GetFiles(const std::string& pattern) const
+@@ -42,12 +51,18 @@ std::vector<FileInfo> DirectoryInfo::GetFiles(const std::string& pattern) const
     std::regex rx(WildcardToRegex(pattern), std::regex::ECMAScript | std::regex::icase);
     for (auto const& entry : std::filesystem::directory_iterator(m_path))
     {
 -      if (entry.is_regular_file())
 +      try
-+      {
-+         if (entry.is_regular_file())
-+         {
-+            auto name = entry.path().filename().string();
-+            // VPE: an entry that leads outside (a symbolic link) is not listed.
-+            if (std::regex_match(name, rx) && PathConfinement::IsLookupAllowed(entry.path().string()))
-+               result.emplace_back(entry.path().string());
-+         }
-+      }
-+      catch (...)
        {
--         auto name = entry.path().filename().string();
++         // VPE: the name first, which needs no lookup: the type follows a symbolic link to its target, which can be slow to
++         // reach (a share), and so does the check that an entry leading outside is not listed.
+          auto name = entry.path().filename().string();
 -         if (std::regex_match(name, rx))
--            result.emplace_back(entry.path().string());
-+         // VPE: a name the narrow encoding cannot hold is skipped.
++         if (std::regex_match(name, rx) && entry.is_regular_file() && PathConfinement::IsLookupAllowed(entry.path().string()))
+             result.emplace_back(entry.path().string());
        }
++      catch (...)
++      {
++         // VPE: a name the narrow encoding cannot hold is skipped.
++      }
     }
     return result;
-@@ -62,11 +79,19 @@ std::vector<DirectoryInfo> DirectoryInfo::GetDirectories(const std::string& patt
+ }
+@@ -62,12 +77,18 @@ std::vector<DirectoryInfo> DirectoryInfo::GetDirectories(const std::string& patt
     std::regex rx(WildcardToRegex(pattern), std::regex::ECMAScript | std::regex::icase);
     for (auto const& entry : std::filesystem::directory_iterator(m_path))
     {
 -      if (entry.is_directory())
 +      try
-+      {
-+         if (entry.is_directory())
-+         {
-+            auto name = entry.path().filename().string();
-+            // VPE: an entry that leads outside (a symbolic link) is not listed.
-+            if (std::regex_match(name, rx) && PathConfinement::IsLookupAllowed(entry.path().string()))
-+               result.emplace_back(entry.path().string());
-+         }
-+      }
-+      catch (...)
        {
--         auto name = entry.path().filename().string();
++         // VPE: the name first, which needs no lookup: the type follows a symbolic link to its target, which can be slow to
++         // reach (a share), and so does the check that an entry leading outside is not listed.
+          auto name = entry.path().filename().string();
 -         if (std::regex_match(name, rx))
--            result.emplace_back(entry.path().string());
-+         // VPE: a name the narrow encoding cannot hold is skipped.
++         if (std::regex_match(name, rx) && entry.is_directory() && PathConfinement::IsLookupAllowed(entry.path().string()))
+             result.emplace_back(entry.path().string());
        }
++      catch (...)
++      {
++         // VPE: a name the narrow encoding cannot hold is skipped.
++      }
     }
     return result;
+ }
 diff --git a/src/general/FileInfo.cpp b/src/general/FileInfo.cpp
 index be1ad30..1ce2188 100644
 --- a/src/general/FileInfo.cpp
@@ -5965,7 +6118,7 @@ index 0000000..d0402db
 +
 +}
 diff --git a/src/general/StringExtensions.cpp b/src/general/StringExtensions.cpp
-index 6c25106..51d74de 100644
+index 6c25106..98c6428 100644
 --- a/src/general/StringExtensions.cpp
 +++ b/src/general/StringExtensions.cpp
 @@ -1,4 +1,5 @@
@@ -5983,6 +6136,45 @@ index 6c25106..51d74de 100644
     std::ofstream ofs;
     ofs.exceptions(std::ios::failbit | std::ios::badbit);
     ofs.open(filename, append ? (std::ios::out | std::ios::app) : std::ios::out);
+@@ -269,6 +272,24 @@ bool StringExtensions::TryParseInt(const std::string& str, int& value)
+    return result.ec == std::errc { } && result.ptr == last;
+ }
+ 
++bool StringExtensions::TryParseXmlInt(const std::string& str, int& value)
++{
++   std::string s = Trim(str);
++   if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
++   {
++      // As tinyxml2's XMLUtil::ToInt: read unsigned, kept as int.
++      unsigned int hex = 0;
++      const char* first = s.c_str() + 2;
++      const char* last = s.c_str() + s.length();
++      std::from_chars_result result = std::from_chars(first, last, hex, 16);
++      if (result.ec != std::errc { } || result.ptr != last)
++         return false;
++      value = static_cast<int>(hex);
++      return true;
++   }
++   return TryParseInt(s, value);
++}
++
+ bool StringExtensions::IsHexString(const std::string& s)
+ {
+    if (s.empty())
+diff --git a/src/general/StringExtensions.h b/src/general/StringExtensions.h
+index 4ba5978..5383c5a 100644
+--- a/src/general/StringExtensions.h
++++ b/src/general/StringExtensions.h
+@@ -36,6 +36,9 @@ public:
+    static std::string Build(const std::string& format, const std::string& arg0, const std::string& arg1, const std::string& arg2, const std::string& arg3);
+    static std::string Build(const std::string& format, const std::vector<std::string>& args);
+    static bool TryParseInt(const std::string& str, int& value);
++   // VPE: a whole number as tinyxml2 reads an int attribute (decimal, or hexadecimal after 0x), but only the whole text:
++   // "1old" or "0x1z" is none.
++   static bool TryParseXmlInt(const std::string& str, int& value);
+    static bool IsHexString(const std::string& s);
+    static int HexToInt(const std::string& s);
+    static std::string FormatNumber(int value, int padding);
 diff --git a/src/general/bitmap/Image.cpp b/src/general/bitmap/Image.cpp
 index 023ce64..c2f72fd 100644
 --- a/src/general/bitmap/Image.cpp

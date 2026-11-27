@@ -230,6 +230,9 @@ namespace VisualPinball.Engine.DOF.Session
 		private volatile bool _admitting = true;
 		private bool _commandsClosed;
 		private int _stopRequested;
+		// A stop began: set before its latch (an emergency stop latches before it asks the worker to stop), so a wait that
+		// the latch ends, a refusal and a start report the stop from the latch on.
+		private int _stopping;
 		private long _stopRequestedAt;
 		private int _stopOverdue;
 		private int _overflow;
@@ -404,8 +407,9 @@ namespace VisualPinball.Engine.DOF.Session
 		/// </summary>
 		public void EmergencyStop()
 		{
-			// The latch first, before the worker wakes for the stop.
+			// The latch first, before the worker wakes for the stop; what the latch ends reports the stop.
 			_admitting = false;
+			Interlocked.Exchange(ref _stopping, 1);
 			LatchSoon();
 			RequestStop();
 		}
@@ -478,6 +482,7 @@ namespace VisualPinball.Engine.DOF.Session
 		private void RequestStop()
 		{
 			_admitting = false;
+			Interlocked.Exchange(ref _stopping, 1);
 			// Pauses and closings still waiting stop waiting; the final closing latches.
 			Interlocked.Exchange(ref _latchWanted, 1);
 			if (Interlocked.Exchange(ref _stopRequested, 1) != 0) {
@@ -605,7 +610,7 @@ namespace VisualPinball.Engine.DOF.Session
 			native.SetOutputGate(false);
 			// A stop or a fault that came before the instance existed.
 			LatchIfWanted();
-			if (Volatile.Read(ref _stopRequested) != 0) {
+			if (Volatile.Read(ref _stopping) != 0) {
 				return false;
 			}
 			try {
@@ -755,17 +760,16 @@ namespace VisualPinball.Engine.DOF.Session
 		/// <summary>Why the gate must not open any more, or null: a stop, an overflow or a fault latches it closed.</summary>
 		private string OpenRefusal()
 		{
-			if (Volatile.Read(ref _stopRequested) != 0) {
+			// The latch first: a stop sets _stopping, and a fault or an overflow its reason, before it wants the latch, so
+			// once the latch is seen, what wants it is seen too and named, not only the latch.
+			var latchWanted = Volatile.Read(ref _latchWanted) != 0;
+			if (Volatile.Read(ref _stopping) != 0) {
 				return "The session is stopping.";
 			}
 			if (Volatile.Read(ref _overflow) != 0 || State == DofSessionState.Faulted || Volatile.Read(ref _pendingFault) != null) {
 				return "The session faulted" + ((Volatile.Read(ref _fault) ?? Volatile.Read(ref _pendingFault)) is string fault ? ": " + fault : ".");
 			}
-			// An emergency stop latches before it asks the worker to stop.
-			if (Volatile.Read(ref _latchWanted) != 0) {
-				return "The gate latches closed.";
-			}
-			return null;
+			return latchWanted ? "The gate latches closed." : null;
 		}
 
 		/// <summary>
