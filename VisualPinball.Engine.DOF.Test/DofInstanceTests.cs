@@ -749,8 +749,9 @@ namespace VisualPinball.Engine.DOF.Test
 					release.Wait(5000);
 				}
 			}, DofLogLevel.Debug);
+			Task finish = null;
 			try {
-				var finish = Task.Run(() => dof.Finish());
+				finish = Task.Run(() => dof.Finish());
 				Assert.That(finishing.Wait(5000), Is.True, "finish started");
 				var opening = dof.SetOutputGate(true);
 				var closing = dof.SetOutputGate(false);
@@ -762,6 +763,11 @@ namespace VisualPinball.Engine.DOF.Test
 				Assert.That((state.Applied, state.Superseded, state.Written, state.Failed), Is.EqualTo((true, false, 1, 0)), state.ToString());
 			} finally {
 				release.Set();
+				// Finish ends before the instance is disposed, also when an assertion above failed.
+				try {
+					finish?.Wait(TimeSpan.FromSeconds(30));
+				} catch (AggregateException) {
+				}
 				DofLibrary.SetLog((level, message) => _log.Enqueue($"[{level}] {message}"), DofLogLevel.Debug);
 			}
 		}

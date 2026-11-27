@@ -903,10 +903,10 @@ index 0d7a194..45b44d2 100644
        controllerElement = controllerElement->NextSiblingElement();
 diff --git a/src/cab/out/OutputGate.cpp b/src/cab/out/OutputGate.cpp
 new file mode 100644
-index 0000000..316d022
+index 0000000..e4adec1
 --- /dev/null
 +++ b/src/cab/out/OutputGate.cpp
-@@ -0,0 +1,379 @@
+@@ -0,0 +1,385 @@
 +#include "OutputGate.h"
 +
 +#include <cstdint>
@@ -949,13 +949,15 @@ index 0000000..316d022
 +OutputGate::Snapshot OutputGate::Unit::Observe() const
 +{
 +   Snapshot current = m_gate->Current();
-+   // The closing in force when the unit registered stays in force for it until it confirmed or failed it: a session
-+   // that starts closed starts dark on every unit, also on one whose first update comes after the gate opened.
-+   int64_t closed = m_closedAtRegistration;
-+   if (current.open && closed != 0 && m_ackedClosed.load(std::memory_order_acquire) < closed && m_failed.load(std::memory_order_acquire) < closed)
-+      return { closed, false };
++   // The closing in force when the unit registered stays in force for it until it confirmed it: a session that starts
++   // closed starts dark on every unit, also on one whose first update comes after the gate opened, and on one whose
++   // first blackout failed, which sends it again once its device is back (Classify reports the openings failed meanwhile).
++   if (current.open && HeldClosed())
++      return { m_closedAtRegistration, false };
 +   return current;
 +}
++
++bool OutputGate::Unit::HeldClosed() const { return m_closedAtRegistration != 0 && m_ackedClosed.load(std::memory_order_acquire) < m_closedAtRegistration; }
 +
 +bool OutputGate::Unit::IsAcked(const Snapshot& snapshot) const
 +{
@@ -1213,6 +1215,10 @@ index 0000000..316d022
 +      return UnitState::Confirmed;
 +   if (unit.m_failed.load(std::memory_order_acquire) >= generation)
 +      return UnitState::Failed;
++   // A unit still held at the closing it registered under (Unit::Observe) that failed it delivers no later change before
++   // that closing got through: it fails them, as a unit that failed them itself does.
++   if (unit.HeldClosed() && generation > unit.m_closedAtRegistration && unit.m_failed.load(std::memory_order_acquire) >= unit.m_closedAtRegistration)
++      return UnitState::Failed;
 +   if (known && open && unit.m_untouched.load(std::memory_order_acquire) >= generation)
 +      return UnitState::Untouched;
 +   // Finished cleanly: what it confirmed or left alone stays so, and it delivers nothing later.
@@ -1288,10 +1294,10 @@ index 0000000..316d022
 +}
 diff --git a/src/cab/out/OutputGate.h b/src/cab/out/OutputGate.h
 new file mode 100644
-index 0000000..7ea71ed
+index 0000000..ec0236e
 --- /dev/null
 +++ b/src/cab/out/OutputGate.h
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,259 @@
 +#pragma once
 +
 +#include <atomic>
@@ -1355,8 +1361,9 @@ index 0000000..7ea71ed
 +   {
 +   public:
 +      // Called by the unit's updater before it copies the values it sends, under the lock the values are set with. A unit
-+      // registered while the gate was closed gets that closing until it confirmed or failed it, also once the gate
-+      // opened: its device, which an earlier session may have left lit, is turned off before any opening reaches it.
++      // registered while the gate was closed gets that closing until it confirmed it, also once the gate opened and also
++      // after a write of it failed: its device, which an earlier session may have left lit, is turned off before any
++      // opening reaches it.
 +      Snapshot Observe() const;
 +      // Whether the hardware already got the state of `snapshot`, or the gate is open at a unit DOF leaves alone; until
 +      // then the updater transfers every output.
@@ -1389,6 +1396,8 @@ index 0000000..7ea71ed
 +      std::atomic<bool> m_stopped { false };
 +      // The closing the gate was at when the unit registered, or 0 if it was open.
 +      int64_t m_closedAtRegistration = 0;
++      // Whether the unit registered under a closing it has not confirmed yet.
++      bool HeldClosed() const;
 +   };
 +
 +   // A unit, and with it its session's gate: the gate lives as long as any handle to one of its units.
@@ -1676,10 +1685,10 @@ index e112579..6ce43dc 100644
  }
 \ No newline at end of file
 diff --git a/src/cab/out/adressableledstrip/TeensyStripController.cpp b/src/cab/out/adressableledstrip/TeensyStripController.cpp
-index d3678e4..c502afc 100644
+index d3678e4..fe6213e 100644
 --- a/src/cab/out/adressableledstrip/TeensyStripController.cpp
 +++ b/src/cab/out/adressableledstrip/TeensyStripController.cpp
-@@ -213,18 +213,20 @@ bool TeensyStripController::VerifySettings()
+@@ -213,18 +213,28 @@ bool TeensyStripController::VerifySettings()
     return true;
  }
  
@@ -1697,16 +1706,24 @@ index d3678e4..c502afc 100644
 -   enum sp_return result = sp_blocking_write(m_comPort, commandData.data(), 5, m_comPortTimeOutMs);
 -   if (result < 0)
 -      throw std::runtime_error(StringExtensions::Build("Failed to write command data: {0}", sp_last_error_message()));
--
--   result = sp_blocking_write(m_comPort, outputValues.data(), outputValues.size(), m_comPortTimeOutMs);
-+   enum sp_return result = sp_blocking_write(m_comPort, commandData.data(), commandData.size(), m_comPortTimeOutMs);
-    if (result < 0)
-       throw std::runtime_error(StringExtensions::Build("Failed to write output values: {0}", sp_last_error_message()));
++   // VPE: as two writes, the command and the values had a timeout each; the one write keeps that time.
++   WritePort(commandData.data(), commandData.size(), 2 * m_comPortTimeOutMs, "output values");
 +   return true;
++}
+ 
+-   result = sp_blocking_write(m_comPort, outputValues.data(), outputValues.size(), m_comPortTimeOutMs);
++void TeensyStripController::WritePort(const uint8_t* data, size_t size, int timeoutMs, const std::string& what) const
++{
++   enum sp_return result = sp_blocking_write(m_comPort, data, size, static_cast<unsigned int>(timeoutMs));
+    if (result < 0)
+-      throw std::runtime_error(StringExtensions::Build("Failed to write output values: {0}", sp_last_error_message()));
++      throw std::runtime_error(StringExtensions::Build("Failed to write {0}: {1}", what, sp_last_error_message()));
++   if (static_cast<size_t>(result) != size)
++      throw std::runtime_error(StringExtensions::Build("Failed to write {0}: the port took {1} of {2} bytes in time", what, std::to_string(result), std::to_string(size)));
  }
  
  void TeensyStripController::UpdateOutputs(const std::vector<uint8_t>& outputValues)
-@@ -245,7 +247,9 @@ void TeensyStripController::UpdateOutputs(const std::vector<uint8_t>& outputValu
+@@ -245,7 +255,9 @@ void TeensyStripController::UpdateOutputs(const std::vector<uint8_t>& outputValu
           int targetPosition = i * m_numberOfLedsPerChannel;
  
           std::vector<uint8_t> stripData(outputValues.begin() + sourcePosition * 3, outputValues.begin() + sourcePosition * 3 + nrOfLedsOnStrip * 3);
@@ -1717,20 +1734,68 @@ index d3678e4..c502afc 100644
  
           bytesRead = -1;
           answerData = std::vector<uint8_t>(1);
-@@ -270,6 +274,8 @@ void TeensyStripController::UpdateOutputs(const std::vector<uint8_t>& outputValu
+@@ -270,9 +282,9 @@ void TeensyStripController::UpdateOutputs(const std::vector<uint8_t>& outputValu
     }
  
     commandData = { (uint8_t)'O' };
+-   enum sp_return result = sp_blocking_write(m_comPort, commandData.data(), 1, m_comPortTimeOutMs);
+-   if (result < 0)
+-      throw std::runtime_error(StringExtensions::Build("Failed to write output command: {0}", sp_last_error_message()));
 +   if (TransferCancelled())
 +      return;
-    enum sp_return result = sp_blocking_write(m_comPort, commandData.data(), 1, m_comPortTimeOutMs);
-    if (result < 0)
-       throw std::runtime_error(StringExtensions::Build("Failed to write output command: {0}", sp_last_error_message()));
++   WritePort(commandData.data(), 1, m_comPortTimeOutMs, "output command");
+ 
+    bytesRead = -1;
+    answerData = std::vector<uint8_t>(1);
+@@ -296,9 +308,7 @@ void TeensyStripController::UpdateOutputs(const std::vector<uint8_t>& outputValu
+ void TeensyStripController::SetupController()
+ {
+    uint8_t command = 'M';
+-   enum sp_return result = sp_blocking_write(m_comPort, &command, 1, m_comPortTimeOutMs);
+-   if (result < 0)
+-      throw std::runtime_error(StringExtensions::Build("Failed to write max leds query: {0}", sp_last_error_message()));
++   WritePort(&command, 1, m_comPortTimeOutMs, "max leds query");
+ 
+    std::vector<uint8_t> receiveData(3);
+    int bytesRead = -1;
+@@ -340,9 +350,7 @@ void TeensyStripController::SetupController()
+    uint16_t nrOfLeds = (uint16_t)m_numberOfLedsPerChannel;
+    std::vector<uint8_t> commandData = { (uint8_t)'L', (uint8_t)(nrOfLeds >> 8), (uint8_t)(nrOfLeds & 255) };
+ 
+-   result = sp_blocking_write(m_comPort, commandData.data(), 3, m_comPortTimeOutMs);
+-   if (result < 0)
+-      throw std::runtime_error(StringExtensions::Build("Failed to write leds per channel command: {0}", sp_last_error_message()));
++   WritePort(commandData.data(), 3, m_comPortTimeOutMs, "leds per channel command");
+ 
+    receiveData.resize(1);
+    bytesRead = -1;
+@@ -493,9 +501,7 @@ void TeensyStripController::ConnectToController()
+    std::vector<uint8_t> commandData;
+ 
+    commandData = { (uint8_t)'C' };
+-   result = sp_blocking_write(m_comPort, commandData.data(), 1, m_comPortTimeOutMs);
+-   if (result < 0)
+-      throw std::runtime_error(StringExtensions::Build("Failed to write clear command: {0}", sp_last_error_message()));
++   WritePort(commandData.data(), 1, m_comPortTimeOutMs, "clear command");
+ 
+    receiveData.resize(1);
+    bytesRead = -1;
+@@ -517,9 +523,7 @@ void TeensyStripController::ConnectToController()
+    }
+ 
+    commandData = { (uint8_t)'O' };
+-   result = sp_blocking_write(m_comPort, commandData.data(), 1, m_comPortTimeOutMs);
+-   if (result < 0)
+-      throw std::runtime_error(StringExtensions::Build("Failed to write output command: {0}", sp_last_error_message()));
++   WritePort(commandData.data(), 1, m_comPortTimeOutMs, "output command");
+ 
+    receiveData.resize(1);
+    bytesRead = -1;
 diff --git a/src/cab/out/adressableledstrip/TeensyStripController.h b/src/cab/out/adressableledstrip/TeensyStripController.h
-index e910f68..51c6565 100644
+index e910f68..30a1cae 100644
 --- a/src/cab/out/adressableledstrip/TeensyStripController.h
 +++ b/src/cab/out/adressableledstrip/TeensyStripController.h
-@@ -107,7 +107,9 @@ protected:
+@@ -107,13 +107,19 @@ protected:
     virtual void DisconnectFromController() override;
     virtual void UpdateOutputs(const std::vector<uint8_t>& outputValues) override;
  
@@ -1741,6 +1806,16 @@ index e910f68..51c6565 100644
     virtual void SetupController();
     int ReadPortWait(uint8_t* buffer, int bufferOffset, int numberOfBytes);
  
+    const std::vector<int>& GetNumberOfLedsPerStrip() const { return m_numberOfLedsPerStrip; }
+    int GetNumberOfLedsPerChannel() const { return m_numberOfLedsPerChannel; }
+    struct sp_port* GetComPort() const { return m_comPort; }
++   // VPE: writes all `size` bytes within `timeoutMs`, or throws. A write the port took only part of leaves the device
++   // waiting for the rest of a command, so it fails the update, and the controller reconnects (a new handshake) rather
++   // than wait for an answer to a command the device did not get.
++   void WritePort(const uint8_t* data, size_t size, int timeoutMs, const std::string& what) const;
+ 
+ private:
+    std::string m_comPortName;
 diff --git a/src/cab/out/adressableledstrip/UMXController.cpp b/src/cab/out/adressableledstrip/UMXController.cpp
 index 9cbe817..cb58397 100644
 --- a/src/cab/out/adressableledstrip/UMXController.cpp
@@ -1944,7 +2019,7 @@ index 4475b47..07e2e83 100644
     virtual bool IsLost() const { return false; }
     virtual void Release() { }
 diff --git a/src/cab/out/adressableledstrip/WemosD1StripController.cpp b/src/cab/out/adressableledstrip/WemosD1StripController.cpp
-index cb013c8..81f5327 100644
+index cb013c8..c9ffd8a 100644
 --- a/src/cab/out/adressableledstrip/WemosD1StripController.cpp
 +++ b/src/cab/out/adressableledstrip/WemosD1StripController.cpp
 @@ -1,5 +1,6 @@
@@ -1954,7 +2029,18 @@ index cb013c8..81f5327 100644
  #include "../../../Log.h"
  #include "../../../general/StringExtensions.h"
  #include <chrono>
-@@ -66,14 +67,38 @@ void WemosD1MPStripController::SetupController()
+@@ -37,9 +38,7 @@ void WemosD1MPStripController::SetupController()
+ 
+             Log::Write(StringExtensions::Build("Resize ledstrip {0} to {1} leds.", std::to_string(numled), std::to_string(nbleds)));
+ 
+-            enum sp_return result = sp_blocking_write(GetComPort(), commandData.data(), 5, GetComPortTimeOutMs());
+-            if (result < 0)
+-               throw std::runtime_error(StringExtensions::Build("Failed to write ledstrip resize command: {0}", sp_last_error_message()));
++            WritePort(commandData.data(), 5, GetComPortTimeOutMs(), "ledstrip resize command");
+ 
+             receiveData = std::vector<uint8_t>(1);
+             bytesRead = -1;
+@@ -66,14 +65,34 @@ void WemosD1MPStripController::SetupController()
        }
     }
  
@@ -1980,11 +2066,7 @@ index cb013c8..81f5327 100644
 +         if (!TransferCancelled())
 +         {
 +            commandData = { (uint8_t)'T' };
-+            enum sp_return result = sp_blocking_write(GetComPort(), commandData.data(), 1, GetComPortTimeOutMs());
-+            if (result < 0)
-+               throw std::runtime_error(StringExtensions::Build("Failed to write test command: {0}", sp_last_error_message()));
-+            if (result == 0)
-+               throw std::runtime_error("Failed to write test command: the port took nothing within its timeout");
++            WritePort(commandData.data(), 1, GetComPortTimeOutMs(), "test command");
 +            // VPE: the port took the test, which may light the strip whatever the controller answers: the session ends
 +            // with the blackout from here on, also if the setup fails below.
 +            sent = true;
@@ -1999,7 +2081,7 @@ index cb013c8..81f5327 100644
  
        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
  
-@@ -95,12 +120,10 @@ void WemosD1MPStripController::SetupController()
+@@ -95,12 +114,10 @@ void WemosD1MPStripController::SetupController()
           throw std::runtime_error(StringExtensions::Build(
              "Expected a Ack (A) after requesting a test sequence, but received no answer or a unexpected answer ({0}). Will not send data to the controller.", std::string(1, receivedChar)));
        }
@@ -2013,18 +2095,20 @@ index cb013c8..81f5327 100644
  {
     if (m_useCompression)
     {
-@@ -148,18 +171,22 @@ void WemosD1MPStripController::SendLedstripData(const std::vector<uint8_t>& outp
+@@ -148,18 +165,23 @@ void WemosD1MPStripController::SendLedstripData(const std::vector<uint8_t>& outp
  
           std::vector<uint8_t> commandData = { (uint8_t)'Q', (uint8_t)(targetPosition >> 8), (uint8_t)(targetPosition & 255), (uint8_t)(nbData >> 8), (uint8_t)(nbData & 255),
              (uint8_t)(nbLeds >> 8), (uint8_t)(nbLeds & 255) };
+-
+-         sp_blocking_write(GetComPort(), commandData.data(), 7, GetComPortTimeOutMs());
+-         sp_blocking_write(GetComPort(), m_compressedData.data(), m_compressedData.size(), GetComPortTimeOutMs());
 +         // VPE: as in TeensyStripController, one write, checked once the values are compressed.
 +         commandData.insert(commandData.end(), m_compressedData.begin(), m_compressedData.end());
 +         if (TransferCancelled())
 +            return false;
- 
--         sp_blocking_write(GetComPort(), commandData.data(), 7, GetComPortTimeOutMs());
--         sp_blocking_write(GetComPort(), m_compressedData.data(), m_compressedData.size(), GetComPortTimeOutMs());
-+         sp_blocking_write(GetComPort(), commandData.data(), commandData.size(), GetComPortTimeOutMs());
++
++         // VPE: the command and the values had a timeout each as two writes, and a short write was not noticed.
++         WritePort(commandData.data(), commandData.size(), 2 * GetComPortTimeOutMs(), "compressed output values");
 +         return true;
        }
        else

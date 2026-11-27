@@ -272,6 +272,10 @@ public:
 	std::atomic<bool> failAfterTest { false };
 	std::atomic<bool> handshakeFailsOnce { false };
 	std::function<void()> beforeTest;
+	// Runs at the start of the first connect, before the updater observes the gate for the first time.
+	std::function<void()> onFirstConnect;
+	// Every write fails while it is set; reconnects still work.
+	std::atomic<bool> failWrites { false };
 
 protected:
 	int GetNumberOfConfiguredOutputs() override { return 2; }
@@ -280,6 +284,8 @@ protected:
 	void ConnectToController() override
 	{
 		int attempt = connects++;
+		if (attempt == 0 && onFirstConnect)
+			onFirstConnect();
 		if (attempt > 0 && failReconnect)
 			throw std::runtime_error("the device is gone");
 		if (attempt == 0 && handshakeFailsOnce)
@@ -315,7 +321,7 @@ protected:
 
 	void UpdateOutputs(const std::vector<uint8_t>& values) override
 	{
-		if (failNextWrite.exchange(false))
+		if (failNextWrite.exchange(false) || failWrites)
 			throw std::runtime_error("the write failed");
 		for (int i = 0; i < 2 && i < static_cast<int>(values.size()); i++)
 		{
@@ -694,7 +700,9 @@ void ConnectTestCountsAsUse()
 	CHECK(counts.untouched == 1 && counts.confirmed == 0, "the test does not confirm an opening after a closing");
 	CHECK(controller.Written().size() == written, "nothing was written for it");
 	controller.Finish();
-	CHECK(controller.HasWritten("0=0") && controller.HasWritten("1=0"), "the session ends with the blackout");
+	std::vector<std::string> log = controller.Written();
+	auto finished = log.begin() + static_cast<std::ptrdiff_t>(written);
+	CHECK(std::find(finished, log.end(), "0=0") != log.end() && std::find(finished, log.end(), "1=0") != log.end(), "the session ends with the blackout");
 }
 
 // A connect that fails after the device took its connect test ends as a session does: with the blackout, and with an
@@ -745,8 +753,17 @@ void SessionThatStartsClosedStartsDark()
 	ScriptedController controller;
 	controller.SetName("scripted");
 	controller.testOnConnect = true;
+	// The updater is held in its first connect, before it observes the gate, until the opening is published.
+	std::atomic<bool> opened { false };
+	std::atomic<bool> held { false };
+	controller.onFirstConnect = [&]() {
+		held = true;
+		WaitFor([&opened]() { return opened.load(); });
+	};
 	controller.Init(nullptr);
+	CHECK(WaitFor([&held]() { return held.load(); }), "the updater is held in its first connect");
 	int64_t open = Change(gate, true);
+	opened = true;
 	OutputGate::Counts counts;
 	// The opening supersedes the closing; the unit still has to confirm it.
 	CHECK(WaitFor([&]() {
@@ -779,6 +796,34 @@ void SessionThatStartsClosedTestsOnNoReconnect()
 	controller.Finish();
 }
 
+// A unit whose startup blackout failed sends it again once the device is back, before anything else, also when the gate
+// opened meanwhile and no value changed: the device an earlier session left lit is turned off. Until then the unit
+// fails the openings after that closing, rather than leaving them pending.
+void FailedStartupBlackoutIsSentAgain()
+{
+	OutputGate& gate = OutputGate::BeginSession();
+	int64_t closed = Change(gate, false);
+	ScriptedController controller;
+	controller.SetName("scripted");
+	controller.failWrites = true;
+	std::atomic<bool> opened { false };
+	controller.onFirstConnect = [&opened]() { WaitFor([&opened]() { return opened.load(); }); };
+	controller.Init(nullptr);
+	int64_t open = Change(gate, true);
+	opened = true;
+	OutputGate::Counts counts;
+	CHECK(WaitFor([&]() { return controller.connects.load() >= 2 && gate.GetState(open, counts) == OutputGate::Status::Applied && counts.failed == 1; }), "the opening fails while the device takes nothing");
+	controller.failWrites = false;
+	CHECK(WaitFor([&]() {
+		gate.GetState(closed, counts);
+		return counts.confirmed == 1;
+	}),
+		  "the closing is written once the device is back");
+	CHECK(controller.HasWritten("0=0") && controller.HasWritten("1=0"), "to every output");
+	CHECK(WaitFor([&]() { return gate.GetState(open, counts) == OutputGate::Status::Applied && counts.untouched == 1; }), "then the opening leaves the unit alone");
+	controller.Finish();
+}
+
 // A connect test is checked again at its write: a latch between the decision and the write (one in the log line)
 // keeps it from going out.
 void LatchBeforeTheConnectTestSkipsIt()
@@ -788,11 +833,15 @@ void LatchBeforeTheConnectTestSkipsIt()
 	ScriptedController controller;
 	controller.SetName("scripted");
 	controller.testOnConnect = true;
-	int64_t latched = -1;
+	std::atomic<int64_t> latched { -1 };
 	controller.beforeTest = [&]() { latched = gate.Latch(); };
 	controller.Init(nullptr);
 	OutputGate::Counts counts;
-	CHECK(WaitFor([&]() { return latched >= 0 && gate.GetState(latched, counts) == OutputGate::Status::Applied && counts.confirmed == 1; }), "the latch is written");
+	CHECK(WaitFor([&]() {
+		int64_t generation = latched.load();
+		return generation >= 0 && gate.GetState(generation, counts) == OutputGate::Status::Applied && counts.confirmed == 1;
+	}),
+		  "the latch is written");
 	CHECK(!controller.HasWritten("test"), "the test after it is not");
 	controller.Finish();
 }
@@ -1381,6 +1430,7 @@ int main()
 	SessionThatStartsClosedStartsDark();
 	SessionThatStartsClosedTestsOnNoReconnect();
 	LatchBeforeTheConnectTestSkipsIt();
+	FailedStartupBlackoutIsSentAgain();
 	BlackoutConfirmsWhereItIsSent();
 	PermanentFailureOutranksAnAck();
 	CleanFinishKeepsTheSettledResult();
