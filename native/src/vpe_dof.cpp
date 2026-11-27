@@ -7,6 +7,7 @@
 // path and can use the output gate, port tests and file confinement added by native/patches.
 
 #include "vpe_dof.h"
+#include "vpe_dof_text.h"
 
 #include <algorithm>
 #include <atomic>
@@ -110,23 +111,8 @@ int Severity(int32_t level)
 	}
 }
 
-// Copies the message, cut at a character boundary if the buffer is too small.
-void WriteError(char* buffer, int32_t size, const char* message)
-{
-	if (!buffer || size <= 0)
-		return;
-	const char* text = message ? message : "";
-	size_t length = std::strlen(text);
-	size_t capacity = static_cast<size_t>(size) - 1;
-	if (length > capacity)
-	{
-		length = capacity;
-		while (length > 0 && (static_cast<unsigned char>(text[length]) & 0xC0) == 0x80)
-			length--;
-	}
-	std::memcpy(buffer, text, length);
-	buffer[length] = '\0';
-}
+using vpe_dof_text::InitFailure;
+using vpe_dof_text::WriteError;
 
 void LIBDOFCALLBACK OnLibdofLog(DOF_LogLevel level, const char* format, va_list args);
 
@@ -252,8 +238,8 @@ std::string TypeName(const DOF::IToy& toy)
 
 bool IsRunning(vpe_dof* dof) { return dof && dof->state.load(std::memory_order_acquire) == State::Running; }
 
-// Called with dof->lifecycle held.
-int32_t FinishLocked(vpe_dof* dof, char* error, int32_t errorSize)
+// Called with dof->lifecycle held. `error`, if given, gets why finishing failed.
+int32_t FinishLocked(vpe_dof* dof, std::string* error)
 {
 	State state = dof->state.load();
 	if (state == State::Finished)
@@ -271,12 +257,14 @@ int32_t FinishLocked(vpe_dof* dof, char* error, int32_t errorSize)
 	}
 	catch (const std::exception& e)
 	{
-		WriteError(error, errorSize, e.what());
+		if (error)
+			*error = e.what();
 		status = VPE_DOF_ERROR;
 	}
 	catch (...)
 	{
-		WriteError(error, errorSize, "libdof failed to finish");
+		if (error)
+			*error = "libdof failed to finish";
 		status = VPE_DOF_ERROR;
 	}
 	try
@@ -405,6 +393,7 @@ VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_init(vpe_dof* dof, const char* table_fi
 			WriteError(error, error_size, "init was already called");
 			return VPE_DOF_INVALID_STATE;
 		}
+		std::string message;
 		try
 		{
 			// Without its global config libdof would fall back to defaults and auto-configure the cabinet from whatever
@@ -423,15 +412,19 @@ VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_init(vpe_dof* dof, const char* table_fi
 		}
 		catch (const std::exception& e)
 		{
-			WriteError(error, error_size, e.what());
+			message = e.what();
 		}
 		catch (...)
 		{
-			WriteError(error, error_size, "libdof failed to initialize");
+			message = "libdof failed to initialize";
 		}
-		// Init may have started controller threads before it failed: stop what was started.
+		// Init may have started controller threads, or a controller may have taken its connect test, before it failed: stop
+		// what was started. What could not be turned off then is part of the error, ahead of it (InitFailure).
 		dof->state = State::Running;
-		FinishLocked(dof, nullptr, 0);
+		std::string finishError;
+		if (FinishLocked(dof, &finishError) != VPE_DOF_OK && finishError.empty())
+			finishError = "libdof failed to finish";
+		WriteError(error, error_size, InitFailure(message, finishError).c_str());
 		return VPE_DOF_ERROR;
 	}
 	catch (...)
@@ -488,7 +481,11 @@ VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_finish(vpe_dof* dof, char* error, int32
 	try
 	{
 		std::lock_guard<std::mutex> lock(dof->lifecycle);
-		return FinishLocked(dof, error, error_size);
+		std::string message;
+		int32_t status = FinishLocked(dof, &message);
+		if (status != VPE_DOF_OK)
+			WriteError(error, error_size, message.c_str());
+		return status;
 	}
 	catch (...)
 	{
@@ -505,7 +502,7 @@ VPE_DOF_API void VPE_DOF_CALL vpe_dof_destroy(vpe_dof* dof)
 	{
 		{
 			std::lock_guard<std::mutex> lock(dof->lifecycle);
-			FinishLocked(dof, nullptr, 0);
+			FinishLocked(dof, nullptr);
 		}
 		std::lock_guard<std::mutex> lock(g_processLock);
 		try
