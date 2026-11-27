@@ -2718,7 +2718,7 @@ index 302baa3..22ce37c 100644
     {
        try
 diff --git a/src/cab/out/dudescab/DudesCab.cpp b/src/cab/out/dudescab/DudesCab.cpp
-index 813ab26..34833a1 100644
+index 813ab26..8ed34da 100644
 --- a/src/cab/out/dudescab/DudesCab.cpp
 +++ b/src/cab/out/dudescab/DudesCab.cpp
 @@ -1,4 +1,6 @@
@@ -2816,22 +2816,26 @@ index 813ab26..34833a1 100644
     if (GetNumberOfOutputs() != m_dev->NumOutputs())
        SetNumberOfOutputs(m_dev->NumOutputs());
     m_oldOutputValues.assign(GetNumberOfOutputs(), 0);
-@@ -225,9 +241,12 @@ void DudesCab::DisconnectFromController()
+@@ -225,9 +241,16 @@ void DudesCab::DisconnectFromController()
  {
     if (m_inUseState == InUseState::Running && m_dev)
     {
 -      m_disconnectTurnedOff = m_dev->AllOff();
 -      m_dev = nullptr;
-+      // The board stays bound: whatever failed before, the blackout goes to it, through a handle opened again if it
-+      // could be, else the one it has.
++      // The board stays bound: whatever failed before, the blackout goes to it, first through the handle it has (opening
++      // it again can close that handle on macOS and fail), then through one opened again if it could be.
 +      m_connected = false;
        m_cacheInvalid = true;
-+      m_dev->EnsureOpen();
 +      m_disconnectTurnedOff = m_dev->AllOff();
++      if (!m_disconnectTurnedOff && m_dev->NeedsReopen())
++      {
++         m_dev->EnsureOpen();
++         m_disconnectTurnedOff = m_dev->AllOff();
++      }
     }
  }
  
-@@ -254,7 +273,8 @@ std::vector<DudesCab::Device*> DudesCab::FindDevices()
+@@ -254,7 +277,8 @@ std::vector<DudesCab::Device*> DudesCab::FindDevices()
  {
     UMXControllerAutoConfigurator::RemoveAllUMXDevices();
  
@@ -2841,7 +2845,7 @@ index 813ab26..34833a1 100644
     std::vector<Device*> devices;
     std::vector<Device*> unusedDevices;
  
-@@ -322,9 +342,9 @@ std::vector<DudesCab::Device*> DudesCab::FindDevices()
+@@ -322,9 +346,9 @@ std::vector<DudesCab::Device*> DudesCab::FindDevices()
           if (deviceRid != Device::RIDType::None)
           {
              bool alreadyEnumerated = false;
@@ -2853,7 +2857,7 @@ index 813ab26..34833a1 100644
                 {
                    alreadyEnumerated = true;
                    break;
-@@ -349,7 +369,7 @@ std::vector<DudesCab::Device*> DudesCab::FindDevices()
+@@ -349,7 +373,7 @@ std::vector<DudesCab::Device*> DudesCab::FindDevices()
  
                 if (newDevice)
                 {
@@ -2862,7 +2866,7 @@ index 813ab26..34833a1 100644
  
                    if (deviceRid == Device::RIDType::RIDOutputs)
                       devices.push_back(newDevice);
-@@ -500,14 +520,14 @@ std::string HidString(const wchar_t* text)
+@@ -500,14 +524,14 @@ std::string HidString(const wchar_t* text)
  
  }
  
@@ -2881,7 +2885,7 @@ index 813ab26..34833a1 100644
     if (!HasSerial())
        return false;
     const char* candidate = nullptr;
-@@ -533,15 +553,35 @@ bool DudesCab::Device::Reopen()
+@@ -533,15 +557,35 @@ bool DudesCab::Device::Reopen()
        candidate = cur->path;
        break;
     }
@@ -2920,7 +2924,7 @@ index 813ab26..34833a1 100644
        return false;
     m_lastWriteFailed = false;
     m_needsReopen = false;
-@@ -711,13 +751,25 @@ void DudesCab::Device::SendCommand(HIDReportTypeMx command, const std::vector<ui
+@@ -711,13 +755,25 @@ void DudesCab::Device::SendCommand(HIDReportTypeMx command, const std::vector<ui
        SendCommand(m_deviceRid, static_cast<uint8_t>(command), parameters);
  }
  
@@ -2948,7 +2952,7 @@ index 813ab26..34833a1 100644
     }
     m_lastWriteFailed = false;
  
-@@ -750,12 +802,15 @@ void DudesCab::Device::SendCommand(RIDType rid, uint8_t command, const std::vect
+@@ -750,12 +806,15 @@ void DudesCab::Device::SendCommand(RIDType rid, uint8_t command, const std::vect
           sendData.insert(sendData.end(), data.begin() + startPos, data.begin() + startPos + toSend);
        }
  
@@ -2964,7 +2968,7 @@ index 813ab26..34833a1 100644
  }
  
  DudesCab::Device::HIDCommonReportType DudesCab::Device::RemapCommonCommand(HIDCommonReportType command)
-@@ -836,15 +891,12 @@ bool DudesCab::FromXml(const tinyxml2::XMLElement* element)
+@@ -836,15 +895,12 @@ bool DudesCab::FromXml(const tinyxml2::XMLElement* element)
     const tinyxml2::XMLElement* numberElement = element->FirstChildElement("Number");
     if (numberElement && numberElement->GetText())
     {
