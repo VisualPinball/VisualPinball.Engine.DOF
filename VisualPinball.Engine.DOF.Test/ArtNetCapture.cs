@@ -25,12 +25,25 @@ namespace VisualPinball.Engine.DOF.Test
 		private readonly object _lock = new object();
 		private readonly Dictionary<int, List<byte[]>> _frames = new Dictionary<int, List<byte[]>>();
 		private volatile bool _running = true;
+		private static readonly byte[] SyncMagic = { (byte)'V', (byte)'P', (byte)'E', (byte)'S', (byte)'Y', (byte)'N', (byte)'C', 0 };
+		private int _syncSent;
+		private int _syncReceived;
 
 		public ArtNetCapture()
 		{
+			// The port is ours alone: a second test run or another Art-Net listener on it would take some of the packets.
+			// libdof's Art-Net socket only sends, so it doesn't bind the port.
 			_client = new UdpClient(AddressFamily.InterNetwork);
-			_client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-			_client.Client.Bind(new IPEndPoint(IPAddress.Loopback, Port));
+			try {
+				if (OperatingSystem.IsWindows()) {
+					_client.Client.ExclusiveAddressUse = true;
+				}
+				_client.Client.Bind(new IPEndPoint(IPAddress.Loopback, Port));
+			} catch (SocketException e) {
+				_client.Dispose();
+				throw new InvalidOperationException($"The Art-Net capture can't listen on 127.0.0.1:{Port} ({e.SocketErrorCode}): another test run "
+					+ "or Art-Net listener is using the port. Run one test process at a time, with nothing else listening on it.", e);
+			}
 			_client.Client.ReceiveTimeout = 100;
 			_thread = new Thread(Receive) { IsBackground = true, Name = "Art-Net capture" };
 			_thread.Start();
@@ -58,8 +71,42 @@ namespace VisualPinball.Engine.DOF.Test
 			}
 		}
 
+		/// <summary>
+		/// The number of frames received for a universe once the packets queued on the capture socket ahead of a marker
+		/// packet sent by this call have been processed. On loopback that includes, in practice, what libdof sent before
+		/// the call; UDP gives no send order between two sockets, though, so this is no proof of ordering. Tests use it to
+		/// keep stale frames out of an "after" window. A test whose result depends on the order of frames uses frame
+		/// numbers instead (<see cref="WaitForIndex"/>): a frame its content identifies, and the frames after it.
+		/// </summary>
+		public int Mark(int universe, int timeoutMs = 3000)
+		{
+			// Waits for the marker: whatever was queued on the socket ahead of it has been processed by then.
+			var id = Interlocked.Increment(ref _syncSent);
+			var packet = new byte[SyncMagic.Length + 4];
+			Buffer.BlockCopy(SyncMagic, 0, packet, 0, SyncMagic.Length);
+			BitConverter.GetBytes(id).CopyTo(packet, SyncMagic.Length);
+			using (var sender = new UdpClient(AddressFamily.InterNetwork)) {
+				sender.Send(packet, packet.Length, new IPEndPoint(IPAddress.Loopback, Port));
+			}
+			var watch = Stopwatch.StartNew();
+			while (Volatile.Read(ref _syncReceived) < id) {
+				if (watch.ElapsedMilliseconds > timeoutMs) {
+					throw new TimeoutException("the Art-Net capture didn't receive its own sync packet");
+				}
+				Thread.Sleep(1);
+			}
+			return Count(universe);
+		}
+
 		/// <summary>Waits until a frame received after frame number <paramref name="after"/> matches.</summary>
 		public byte[] WaitFor(int universe, Func<byte[], bool> match, int after = 0, int timeoutMs = 3000)
+		{
+			var index = WaitForIndex(universe, match, after, timeoutMs);
+			return index < 0 ? null : Frames(universe)[index];
+		}
+
+		/// <summary>Like <see cref="WaitFor"/>, but returns the matching frame's number, or -1.</summary>
+		public int WaitForIndex(int universe, Func<byte[], bool> match, int after = 0, int timeoutMs = 3000)
 		{
 			var watch = Stopwatch.StartNew();
 			while (watch.ElapsedMilliseconds < timeoutMs) {
@@ -67,14 +114,14 @@ namespace VisualPinball.Engine.DOF.Test
 					if (_frames.TryGetValue(universe, out var list)) {
 						for (var i = Math.Max(0, after); i < list.Count; i++) {
 							if (match(list[i])) {
-								return list[i];
+								return i;
 							}
 						}
 					}
 				}
 				Thread.Sleep(5);
 			}
-			return null;
+			return -1;
 		}
 
 		private void Receive()
@@ -88,6 +135,10 @@ namespace VisualPinball.Engine.DOF.Test
 					continue;
 				} catch (ObjectDisposedException) {
 					return;
+				}
+				if (IsSync(packet)) {
+					Volatile.Write(ref _syncReceived, BitConverter.ToInt32(packet, SyncMagic.Length));
+					continue;
 				}
 				// "Art-Net\0", OpDmx 0x5000 little-endian, protocol version, sequence, physical, universe (LE), length (BE).
 				if (packet.Length < 18 || packet[0] != (byte)'A' || packet[7] != 0 || packet[8] != 0x00 || packet[9] != 0x50) {
@@ -104,6 +155,19 @@ namespace VisualPinball.Engine.DOF.Test
 					list.Add(data);
 				}
 			}
+		}
+
+		private static bool IsSync(byte[] packet)
+		{
+			if (packet.Length != SyncMagic.Length + 4) {
+				return false;
+			}
+			for (var i = 0; i < SyncMagic.Length; i++) {
+				if (packet[i] != SyncMagic[i]) {
+					return false;
+				}
+			}
+			return true;
 		}
 
 		public void Dispose()

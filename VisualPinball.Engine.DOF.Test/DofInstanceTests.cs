@@ -9,6 +9,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Reflection;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 using NUnit.Framework;
@@ -87,12 +89,81 @@ namespace VisualPinball.Engine.DOF.Test
 		}
 
 		/// <summary>Waits for a frame that matches and fails with the last frame received when none does.</summary>
-		private void Expect(int universe, Func<byte[], bool> match, string what, int after = 0)
+		private void Expect(int universe, Func<byte[], bool> match, string what, int after = 0) => ExpectIndex(universe, match, what, after);
+
+		/// <summary>Like <see cref="Expect"/>, and returns the matching frame's number.</summary>
+		private int ExpectIndex(int universe, Func<byte[], bool> match, string what, int after = 0)
 		{
-			if (_capture.WaitFor(universe, match, after) == null) {
+			var index = _capture.WaitForIndex(universe, match, after);
+			if (index < 0) {
 				var latest = _capture.Latest(universe);
 				Assert.Fail($"{what}: no matching frame on universe {universe}; last of {_capture.Count(universe)}: "
 					+ (latest == null ? "none" : string.Join(",", latest.Take(8))));
+			}
+			return index;
+		}
+
+		/// <summary>Waits for a frame received after both a frame number and a fresh mark.</summary>
+		private int ExpectFrameAfter(int universe, int after, string what) => ExpectIndex(universe, f => true, what, Math.Max(after, _capture.Mark(universe)));
+
+		/// <summary>Frames <paramref name="from"/> up to, not including, <paramref name="to"/> (all of them received from there on, without it).</summary>
+		private List<byte[]> FramesBetween(int universe, int from, int to = int.MaxValue) => _capture.Frames(universe).Take(to).Skip(from).ToList();
+
+		private static string Show(byte[] frame) => string.Join(",", frame.Take(8));
+
+		/// <summary>Whether the thread is blocked: in a wait, a sleep, a join or on a lock.</summary>
+		private static bool Blocked(Thread thread) => (thread.ThreadState & System.Threading.ThreadState.WaitSleepJoin) != 0;
+
+		/// <summary>Waits until a thread that set <paramref name="entering"/> right before a call is blocked inside it.</summary>
+		private static bool WaitBlockedInside(Thread thread, ManualResetEventSlim entering, int timeoutMs = 10000)
+		{
+			var watch = Stopwatch.StartNew();
+			if (!entering.Wait(timeoutMs)) {
+				return false;
+			}
+			while (!Blocked(thread)) {
+				if (watch.ElapsedMilliseconds > timeoutMs) {
+					return false;
+				}
+				Thread.Sleep(1);
+			}
+			return true;
+		}
+
+		/// <summary>Joins a thread that may not have been started.</summary>
+		private static bool Joined(Thread thread, int timeoutMs) => (thread.ThreadState & System.Threading.ThreadState.Unstarted) != 0 || thread.Join(timeoutMs);
+
+		private void RestoreLog() => DofLibrary.SetLog((level, message) => _log.Enqueue($"[{level}] {message}"), DofLogLevel.Debug);
+
+		/// <summary>
+		/// Runs a cleanup step on a thread of its own and fails if it does not return in time: a Dispose waits for every
+		/// call, and setting the log sink for the lines in flight, so a thread stuck in libdof would hang the run instead.
+		/// </summary>
+		private static void Bounded(Action cleanup, string what, int timeoutMs = 30000)
+		{
+			Exception error = null;
+			var thread = new Thread(() => {
+				try {
+					cleanup();
+				} catch (Exception e) {
+					error = e;
+				}
+			}) { IsBackground = true };
+			thread.Start();
+			if (!thread.Join(timeoutMs)) {
+				Assert.Fail($"{what} did not return within {timeoutMs} ms: a thread is stuck in libdof, and the instance stays alive.");
+			}
+			if (error != null) {
+				ExceptionDispatchInfo.Capture(error).Throw();
+			}
+		}
+
+		private void BoundedCleanup(DofInstance dof)
+		{
+			try {
+				Bounded(RestoreLog, "Restoring the log sink");
+			} finally {
+				Bounded(dof.Dispose, "The cleanup Dispose");
 			}
 		}
 
@@ -196,27 +267,32 @@ namespace VisualPinball.Engine.DOF.Test
 			dof.Data('S', 1, 1);
 			dof.Data('S', 3, 1);
 			dof.Data('S', 3, 0);
-			Expect(unit.Universe, f => f[0] == 255 && f[2] == 255 && f[3] == 255, "S1, static and inverted on");
+			var shown = ExpectIndex(unit.Universe, f => f[0] == 255 && f[2] == 255 && f[3] == 255, "S1, static and inverted on");
 
 			var closed = dof.SetOutputGate(false);
-			var mark = _capture.Count(unit.Universe);
 			var state = WaitSettled(dof, closed);
 			Assert.That(state.Applied, Is.True);
 			Assert.That((state.Written, state.Pending, state.Failed), Is.EqualTo((1, 0, 0)));
-			Expect(unit.Universe, f => f.Take(8).All(v => v == 0), "all off after closing", mark);
+			// The updater resends the current values every 50 ms, and frames sent while still open can come after the
+			// request. S1 is on from the frame above until the closing is written, so the first frame after it that's all
+			// off is the closing's, and every frame after that one must stay off while the gate is closed.
+			var closing = ExpectIndex(unit.Universe, f => f.Take(8).All(v => v == 0), "all off after closing", shown + 1);
 
 			// Effects keep running while closed, but nothing reaches the outputs.
 			dof.Data('S', 2, 1);
 			dof.Data('S', 3, 1);
-			Thread.Sleep(300);
-			var whileClosed = _capture.Frames(unit.Universe).Skip(mark).ToList();
-			Assert.That(whileClosed, Is.Not.Empty);
-			Assert.That(whileClosed.All(f => f.Take(8).All(v => v == 0)), Is.True, "no output while closed");
+			ExpectFrameAfter(unit.Universe, closing + 1, "a frame while closed, after the effects changed");
+			// Every frame received before the opening is requested was sent while closed.
+			var baseline = _capture.Mark(unit.Universe);
+			var whileClosed = FramesBetween(unit.Universe, closing + 1, baseline);
+			var lit = whileClosed.FindIndex(f => f.Take(8).Any(v => v != 0));
+			Assert.That(lit, Is.EqualTo(-1), () => $"no output while closed: frame {closing + 1 + lit} after the closing's frame {closing} is "
+				+ Show(whileClosed[lit]));
 
 			var open = dof.SetOutputGate(true);
 			Assert.That(open, Is.GreaterThan(closed));
 			Assert.That(WaitSettled(dof, open).Written, Is.EqualTo(1));
-			Expect(unit.Universe, f => f[0] == 255 && f[1] == 128 && f[2] == 255 && f[3] == 0, "opening restores the current state", mark);
+			Expect(unit.Universe, f => f[0] == 255 && f[1] == 128 && f[2] == 255 && f[3] == 0, "opening restores the current state", baseline);
 			dof.Finish();
 		}
 
@@ -238,14 +314,14 @@ namespace VisualPinball.Engine.DOF.Test
 				Assert.That(latched, Is.GreaterThan(open));
 				var state = WaitSettled(dof, latched);
 				Assert.That((state.Applied, state.Written), Is.EqualTo((true, 1)), "the latch reaches the unit");
-				var mark = _capture.Count(unit.Universe);
+				var mark = _capture.Mark(unit.Universe);
 				var later = dof.SetOutputGate(true);
 				Assert.That(later, Is.GreaterThan(latched));
 				Assert.That(WaitSettled(dof, later).Written, Is.EqualTo(1), "a later opening confirms the closed state");
 				dof.Data('S', 2, 1);
-				Thread.Sleep(300);
-				var after = _capture.Frames(unit.Universe).Skip(mark).ToList();
-				Assert.That(after, Is.Not.Empty);
+				// The session started closed, so every frame it ever sent is all off unless something opened it.
+				ExpectFrameAfter(unit.Universe, mark, "a frame after the effect changed");
+				var after = FramesBetween(unit.Universe, mark);
 				Assert.That(after.All(f => f.Take(8).All(v => v == 0)), Is.True, "nothing opens a latched gate");
 				dof.Finish();
 			}
@@ -323,19 +399,23 @@ namespace VisualPinball.Engine.DOF.Test
 			using var config = new TestConfig().GlobalConfig().Cabinet(4, good, bad).Ini(1, "vpetest,S1,0,0,0,S1");
 			using var dof = Start(config);
 			dof.Data('S', 1, 1);
-			Expect(good.Universe, f => f[0] == 255, "frame");
+			var lit = ExpectIndex(good.Universe, f => f[0] == 255, "frame");
 
 			var closed = dof.SetOutputGate(false);
 			var state = WaitSettled(dof, closed);
 			Assert.That((state.Written, state.Pending, state.Failed), Is.EqualTo((1, 0, 1)));
 			Assert.That(dof.GetGatePending(closed), Is.EqualTo(new[] { "ArtNet ArtNetBad" }));
+			var blackout = ExpectIndex(good.Universe, f => f.Take(4).All(v => v == 0), "the closing", lit + 1);
+
+			// Open again, so the final all-off can be told from a refresh: S1 shows from then until finish turns it off.
+			WaitSettled(dof, dof.SetOutputGate(true));
+			var shown = ExpectIndex(good.Universe, f => f[0] == 255, "open again", blackout + 1);
 
 			// The final all-off fails for the bad unit: finish says so, and the good unit still got it.
-			var mark = _capture.Count(good.Universe);
 			var error = Assert.Throws<DofException>(() => dof.Finish());
 			Assert.That(error.Message, Does.Contain("ArtNetBad"));
 			Assert.That(error.Message, Does.Not.Contain("ArtNetGood"));
-			Expect(good.Universe, f => f.Take(4).All(v => v == 0), "the good unit's final all-off", mark);
+			Expect(good.Universe, f => f.Take(4).All(v => v == 0), "the good unit's final all-off", shown + 1);
 		}
 
 		[Test]
@@ -345,7 +425,7 @@ namespace VisualPinball.Engine.DOF.Test
 			using var config = new TestConfig().GlobalConfig().Cabinet(8, new Dictionary<int, string> { [9] = "Matrix1" }, unit).Ini(1, "vpetest,S1");
 			using var dof = Start(config);
 			Assert.That(dof.TestOutput(1, 6, 200), Is.EqualTo(DofStatus.Ok));
-			Expect(unit.Universe, f => f[5] == 200, "frame");
+			var shown = ExpectIndex(unit.Universe, f => f[5] == 200, "frame");
 
 			Assert.That(dof.TestOutput(1, 99, 255), Is.EqualTo(DofStatus.InvalidArgument), "unknown port");
 			Assert.That(dof.TestOutput(2, 1, 255), Is.EqualTo(DofStatus.InvalidArgument), "unknown device");
@@ -353,10 +433,12 @@ namespace VisualPinball.Engine.DOF.Test
 
 			var closed = dof.SetOutputGate(false);
 			WaitSettled(dof, closed);
-			var mark = _capture.Count(unit.Universe);
+			// Port 6 shows from the frame above until the closing is written: the first frame after it that doesn't is the
+			// closing's, and no port shows after it.
+			var closing = ExpectIndex(unit.Universe, f => f[5] == 0, "closed", shown + 1);
 			Assert.That(dof.TestOutput(1, 7, 255), Is.EqualTo(DofStatus.Ok));
-			Thread.Sleep(200);
-			Assert.That(_capture.Frames(unit.Universe).Skip(mark).All(f => f[6] == 0 && f[5] == 0), Is.True, "port test is gated");
+			ExpectFrameAfter(unit.Universe, closing + 1, "a frame after the port test");
+			Assert.That(FramesBetween(unit.Universe, closing).All(f => f[6] == 0 && f[5] == 0), Is.True, "port test is gated");
 			dof.Finish();
 		}
 
@@ -391,17 +473,6 @@ namespace VisualPinball.Engine.DOF.Test
 				using var release = new ManualResetEventSlim();
 				using var disposing = new ManualResetEventSlim();
 				var shutdownThreads = new ConcurrentQueue<int>();
-				DofLibrary.SetLog((level, message) => {
-					_log.Enqueue($"[{level}] {message}");
-					var thread = Environment.CurrentManagedThreadId;
-					if (message.Contains("Bye and thanks for using!")) {
-						shutdownThreads.Enqueue(thread);
-					}
-					if (thread == Volatile.Read(ref initThread) && Interlocked.Exchange(ref held, 1) == 0) {
-						inside.Set();
-						release.Wait(30000);
-					}
-				}, DofLogLevel.Debug);
 				var stop = 0;
 				var unexpected = new ConcurrentQueue<Exception>();
 				var callerThreads = new ConcurrentDictionary<int, bool>();
@@ -443,26 +514,52 @@ namespace VisualPinball.Engine.DOF.Test
 					}
 				}) { IsBackground = true };
 				var disposerThreads = new ConcurrentDictionary<int, bool>();
-				var disposers = Enumerable.Range(0, 2).Select(_ => new Thread(() => {
+				var entering = Enumerable.Range(0, 2).Select(_ => new ManualResetEventSlim()).ToList();
+				var disposers = Enumerable.Range(0, 2).Select(index => new Thread(() => {
 					disposerThreads[Environment.CurrentManagedThreadId] = true;
+					entering[index].Set();
 					dof.Dispose();
 				}) { IsBackground = true }).ToList();
+				DofLibrary.SetLog((level, message) => {
+					_log.Enqueue($"[{level}] {message}");
+					var thread = Environment.CurrentManagedThreadId;
+					if (message.Contains("Bye and thanks for using!")) {
+						shutdownThreads.Enqueue(thread);
+					}
+					if (thread == Volatile.Read(ref initThread) && Interlocked.Exchange(ref held, 1) == 0) {
+						inside.Set();
+						release.Wait(30000);
+					}
+				}, DofLogLevel.Debug);
+				var ended = false;
 				try {
 					callers.ForEach(t => t.Start());
 					init.Start();
 					Assert.That(inside.Wait(10000), Is.True, "init is held in libdof");
 					disposers.ForEach(t => t.Start());
 					Assert.That(disposing.Wait(10000), Is.True, "the callers see the dispose");
-					Assert.That(disposers.Any(t => t.Join(0)), Is.False, "no disposer returns while a call is in flight");
+					// Both disposers are inside Dispose, blocked there (one waits for the calls, the other for the first),
+					// while the call is still held.
+					for (var i = 0; i < disposers.Count; i++) {
+						Assert.That(WaitBlockedInside(disposers[i], entering[i]), Is.True, $"disposer {i} is blocked in Dispose");
+					}
+					Assert.That(disposers.Any(t => !t.IsAlive), Is.False, "no disposer returns while a call is in flight");
 					release.Set();
 					Assert.That(init.Join(30000), Is.True, "init returned");
 					Assert.That(disposers.All(t => t.Join(30000)), Is.True, "both disposers returned");
 				} finally {
-					release.Set();
-					Volatile.Write(ref stop, 1);
-					Assert.That(callers.All(t => t.Join(10000)), Is.True, "the callers ended");
-					DofLibrary.SetLog((level, message) => _log.Enqueue($"[{level}] {message}"), DofLogLevel.Debug);
+					try {
+						release.Set();
+						Volatile.Write(ref stop, 1);
+						ended = Joined(init, 30000) & callers.All(t => Joined(t, 10000));
+						// The instance never outlives the test, also when an assertion above failed: a Dispose after the
+						// disposers' returns at once, one while they still run waits for them.
+						BoundedCleanup(dof);
+					} finally {
+						entering.ForEach(e => e.Dispose());
+					}
 				}
+				Assert.That(ended, Is.True, "init and the callers ended");
 				Assert.That(unexpected, Is.Empty, string.Join("\n", unexpected));
 				Assert.That(shutdownThreads.Count, Is.EqualTo(1), "libdof shut down once");
 				Assert.That(shutdownThreads.All(disposerThreads.ContainsKey), Is.True, "on a disposing thread");
@@ -480,6 +577,191 @@ namespace VisualPinball.Engine.DOF.Test
 				// The instance is gone once Dispose returned: the next one can be created.
 				using (DofInstance.Create(config.Root)) {
 				}
+			}
+		}
+
+		[Test]
+		public void LogSinkThatDisposesDuringShutdownReturns()
+		{
+			// Every line written once the instance is disposed calls Dispose again: the lines the destruction writes on its
+			// own thread, and those of libdof's threads it stops. None of them waits for the destruction.
+			var unit = Unit("ArtNetA");
+			using var config = StandardConfig(unit);
+			var dof = Start(config);
+			var disposing = 0;
+			var calls = 0;
+			var unexpected = new ConcurrentQueue<Exception>();
+			try {
+				dof.Data('S', 1, 1);
+				Expect(unit.Universe, f => f[0] == 255, "S1 on");
+				DofLibrary.SetLog((level, message) => {
+					_log.Enqueue($"[{level}] {message}");
+					if (Volatile.Read(ref disposing) == 0) {
+						return;
+					}
+					Interlocked.Increment(ref calls);
+					try {
+						dof.Dispose();
+					} catch (Exception e) {
+						unexpected.Enqueue(e);
+					}
+				}, DofLogLevel.Debug);
+				Volatile.Write(ref disposing, 1);
+				var disposer = new Thread(() => dof.Dispose()) { IsBackground = true };
+				disposer.Start();
+				Assert.That(disposer.Join(30000), Is.True, "Dispose returns");
+			} finally {
+				BoundedCleanup(dof);
+			}
+			Assert.That(calls, Is.GreaterThan(0), "the shutdown wrote lines");
+			Assert.That(unexpected, Is.Empty, string.Join("\n", unexpected));
+			Assert.That(dof.SetOutputGate(true), Is.EqualTo(-1), "the instance is disposed");
+			using (DofInstance.Create(config.Root)) {
+			}
+		}
+
+		[Test]
+		public void DisposeFromALogLineDuringACallIsRefused()
+		{
+			// A Dispose from a line of a call on the same thread would wait for that call, and one from a line of libdof's
+			// own threads would have them run or wait for their own shutdown: both are refused, and the instance goes on.
+			var unit = Unit("ArtNetA");
+			using var config = StandardConfig(unit);
+			var dof = DofInstance.Create(config.Root);
+			var caller = 0;
+			var armed = 1;
+			var sameThread = new ConcurrentQueue<Exception>();
+			var otherThread = new ConcurrentQueue<Exception>();
+			Exception initError = null;
+			// Init runs on a thread of its own, so a Dispose that waits for the call it is made from fails the test
+			// instead of hanging it.
+			var init = new Thread(() => {
+				Volatile.Write(ref caller, Environment.CurrentManagedThreadId);
+				try {
+					dof.Init(config.TableFile, "vpetest");
+				} catch (Exception e) {
+					initError = e;
+				}
+			}) { IsBackground = true };
+			try {
+				DofLibrary.SetLog((level, message) => {
+					_log.Enqueue($"[{level}] {message}");
+					if (Volatile.Read(ref armed) == 0) {
+						return;
+					}
+					var mine = Environment.CurrentManagedThreadId == Volatile.Read(ref caller);
+					var results = mine ? sameThread : otherThread;
+					if (!results.IsEmpty) {
+						return;
+					}
+					try {
+						dof.Dispose();
+						results.Enqueue(null);
+					} catch (Exception e) {
+						results.Enqueue(e);
+					}
+				}, DofLogLevel.Debug);
+				init.Start();
+				Assert.That(init.Join(30000), Is.True, "init returned");
+				Assert.That(initError, Is.Null, initError?.ToString());
+				var watch = Stopwatch.StartNew();
+				while (otherThread.IsEmpty && watch.ElapsedMilliseconds < 5000) {
+					Thread.Sleep(5);
+				}
+				Volatile.Write(ref armed, 0);
+				Assert.That(sameThread.TryPeek(out var same), Is.True, "init wrote a line on its thread");
+				Assert.That(same, Is.InstanceOf<InvalidOperationException>(), "refused inside the call");
+				Assert.That(otherThread.TryPeek(out var other), Is.True, "one of libdof's threads wrote a line");
+				Assert.That(other, Is.InstanceOf<InvalidOperationException>(), "refused on libdof's thread");
+				dof.Data('S', 1, 1);
+				Expect(unit.Universe, f => f[0] == 255, "the instance goes on");
+				dof.Finish();
+			} finally {
+				BoundedCleanup(dof);
+			}
+		}
+
+		[Test]
+		public void InterruptedDisposeStillDestroysTheInstance()
+		{
+			// The disposer is interrupted, twice, while it waits for a call held in libdof: it keeps waiting, destroys the
+			// instance once the call returned, and raises the interrupt after that. The held call's own thread is interrupted
+			// too: the call returns as usual, wakes the disposer, and leaves the interrupt for that thread's next wait.
+			var unit = Unit("ArtNetA");
+			using var config = StandardConfig(unit);
+			var dof = DofInstance.Create(config.Root);
+			var initThread = 0;
+			var held = 0;
+			using var inside = new ManualResetEventSlim();
+			using var release = new ManualResetEventSlim();
+			using var entering = new ManualResetEventSlim();
+			var shutdownThreads = new ConcurrentQueue<int>();
+			Exception initError = null;
+			Exception disposeError = null;
+			var disposerThread = 0;
+			bool? initInterruptKept = null;
+			var init = new Thread(() => {
+				Volatile.Write(ref initThread, Environment.CurrentManagedThreadId);
+				try {
+					dof.Init(config.TableFile, "vpetest");
+				} catch (Exception e) {
+					initError = e;
+				}
+				try {
+					Thread.Sleep(5000);
+					initInterruptKept = false;
+				} catch (ThreadInterruptedException) {
+					initInterruptKept = true;
+				}
+			}) { IsBackground = true };
+			var disposer = new Thread(() => {
+				disposerThread = Environment.CurrentManagedThreadId;
+				entering.Set();
+				try {
+					dof.Dispose();
+				} catch (Exception e) {
+					disposeError = e;
+				}
+			}) { IsBackground = true };
+			DofLibrary.SetLog((level, message) => {
+				_log.Enqueue($"[{level}] {message}");
+				var thread = Environment.CurrentManagedThreadId;
+				if (message.Contains("Bye and thanks for using!")) {
+					shutdownThreads.Enqueue(thread);
+				}
+				if (thread == Volatile.Read(ref initThread) && Interlocked.Exchange(ref held, 1) == 0) {
+					inside.Set();
+					// Spun, not waited: a wait would take the interrupt this thread gets meanwhile.
+					var watch = Stopwatch.StartNew();
+					while (!release.IsSet && watch.ElapsedMilliseconds < 30000) {
+						Thread.SpinWait(100);
+					}
+				}
+			}, DofLogLevel.Debug);
+			try {
+				init.Start();
+				Assert.That(inside.Wait(10000), Is.True, "init is held in libdof");
+				disposer.Start();
+				Assert.That(WaitBlockedInside(disposer, entering), Is.True, "the disposer waits for init");
+				for (var i = 0; i < 2; i++) {
+					disposer.Interrupt();
+					Assert.That(disposer.Join(200), Is.False, $"the disposer still waits for init after interrupt {i + 1}");
+					Assert.That(Blocked(disposer), Is.True, $"and is blocked again after interrupt {i + 1}");
+				}
+				init.Interrupt();
+				release.Set();
+				Assert.That(init.Join(30000), Is.True, "init returned");
+				Assert.That(disposer.Join(30000), Is.True, "the disposer returned");
+			} finally {
+				release.Set();
+				Joined(init, 30000);
+				BoundedCleanup(dof);
+			}
+			Assert.That(initError, Is.Null, initError?.ToString());
+			Assert.That(initInterruptKept, Is.True, "the last call left its thread's interrupt for the next wait");
+			Assert.That(disposeError, Is.InstanceOf<ThreadInterruptedException>(), "the interrupt is raised once the instance is gone");
+			Assert.That(shutdownThreads, Is.EqualTo(new[] { disposerThread }), "the interrupted disposer destroyed it");
+			using (DofInstance.Create(config.Root)) {
 			}
 		}
 
@@ -502,6 +784,40 @@ namespace VisualPinball.Engine.DOF.Test
 			}
 			Measure();
 			Assert.That(Measure(), Is.Zero, "the handle is held for each call without allocating");
+
+			// The last call to return while a Dispose waits signals it, also with an interrupt pending on its thread.
+			const BindingFlags Private = BindingFlags.NonPublic | BindingFlags.Instance;
+			var calls = typeof(DofInstance).GetField("_calls", Private);
+			var state = typeof(DofInstance).GetField("_state", Private);
+			var drained = (ManualResetEvent)typeof(DofInstance).GetField("_drained", Private).GetValue(dof);
+			var release = (Action)Delegate.CreateDelegate(typeof(Action), dof, typeof(DofInstance).GetMethod("Release", Private));
+			long Signal()
+			{
+				calls.SetValue(dof, 1);
+				drained.Reset();
+				var before = GC.GetAllocatedBytesForCurrentThread();
+				release();
+				return GC.GetAllocatedBytesForCurrentThread() - before;
+			}
+			state.SetValue(dof, 1);
+			try {
+				Signal();
+				Assert.That(drained.WaitOne(0), Is.True, "the last call signalled the Dispose");
+				Thread.CurrentThread.Interrupt();
+				var signalled = Signal();
+				Assert.That(() => Thread.Sleep(1000), Throws.InstanceOf<ThreadInterruptedException>(), "the interrupt is left for the next wait");
+				Assert.That(drained.WaitOne(0), Is.True, "and the Dispose signalled");
+				Assert.That(signalled, Is.Zero, "the signal does not allocate");
+			} finally {
+				try {
+					Thread.Sleep(0);
+				} catch (ThreadInterruptedException) {
+					// Not left to a later test.
+				}
+				state.SetValue(dof, 0);
+				calls.SetValue(dof, 0);
+				drained.Reset();
+			}
 			dof.Finish();
 			dof.Dispose();
 			Assert.That(Measure(), Is.Zero, "nor once disposed");
@@ -537,7 +853,7 @@ namespace VisualPinball.Engine.DOF.Test
 				Expect(first.Universe, f => f[0] == 255, "frame");
 				dof.Finish();
 			}
-			var firstCount = _capture.Count(first.Universe);
+			var firstCount = _capture.Mark(first.Universe);
 
 			var second = Unit("ArtNetSecond");
 			using (var config = new TestConfig().GlobalConfig().Cabinet(8, second).Ini(1, "vpetest,0,S1")) {
@@ -548,7 +864,7 @@ namespace VisualPinball.Engine.DOF.Test
 				Thread.Sleep(100);
 				dof.Finish();
 			}
-			Assert.That(_capture.Count(first.Universe), Is.EqualTo(firstCount), "the first cabinet is gone");
+			Assert.That(_capture.Mark(first.Universe), Is.EqualTo(firstCount), "the first cabinet is gone");
 		}
 
 		[Test]
@@ -712,7 +1028,7 @@ namespace VisualPinball.Engine.DOF.Test
 			Expect(unit.Universe, f => f[0] == 255, "frame");
 			var first = dof.SetOutputGate(false);
 			Assert.That(WaitSettled(dof, first).Written, Is.EqualTo(1));
-			var mark = _capture.Count(unit.Universe);
+			var mark = _capture.Mark(unit.Universe);
 			var second = dof.SetOutputGate(false);
 			Assert.That(second, Is.GreaterThan(first));
 			var state = WaitSettled(dof, second);
@@ -744,8 +1060,12 @@ namespace VisualPinball.Engine.DOF.Test
 				}
 			}
 			TestContext.Out.WriteLine($"{superseded} of 20 closes were superseded");
-			var mark = _capture.Count(unit.Universe);
-			Expect(unit.Universe, f => f[0] == 255 && f[2] == 255, "open at the end", mark);
+			// The refresh after the open frame shows the state the unit ended in.
+			var mark = _capture.Mark(unit.Universe);
+			var shown = ExpectIndex(unit.Universe, f => f[0] == 255 && f[2] == 255, "open at the end", mark);
+			var next = ExpectIndex(unit.Universe, f => true, "a frame after it", shown + 1);
+			var refresh = _capture.Frames(unit.Universe)[next];
+			Assert.That(refresh[0] == 255 && refresh[2] == 255, Is.True, "the unit stays open: " + Show(refresh));
 			dof.Finish();
 		}
 
@@ -805,23 +1125,21 @@ namespace VisualPinball.Engine.DOF.Test
 			using var dof = Start(config);
 			// Used while open, so the opening below has to send its frame.
 			dof.Data('S', 1, 1);
-			Expect(unit.Universe, f => f[0] == 255, "S1 on");
+			var shown = ExpectIndex(unit.Universe, f => f[0] == 255, "S1 on");
 			// Past the minimum effect duration (60 ms), which would hold S1 on for a moment after it goes off.
 			Thread.Sleep(100);
-			var start = _capture.Count(unit.Universe);
 			Assert.That(WaitSettled(dof, dof.SetOutputGate(false)).Settled, Is.True);
-			// The closing's frame was sent; frames sent before it may still be on their way.
-			Expect(unit.Universe, f => f[0] == 0, "closed", start);
-			var mark = _capture.Count(unit.Universe);
+			// S1 is on from the frame above until the closing is written: the first frame after it with S1 off is the
+			// closing's, and S1 must not show after it.
+			var closing = ExpectIndex(unit.Universe, f => f[0] == 0, "closed", shown + 1);
 
 			// The opening comes behind a backlog of input that ends with S1 going off: it applies after that input.
 			Backlog(dof);
 			dof.Data('S', 1, 0);
 			var open = dof.SetOutputGate(true);
 			Assert.That(WaitSettled(dof, open).Settled, Is.True);
-			Thread.Sleep(200);
-			var after = _capture.Frames(unit.Universe).Skip(mark).ToList();
-			Assert.That(after, Is.Not.Empty);
+			ExpectFrameAfter(unit.Universe, closing + 1, "a frame after the opening");
+			var after = FramesBetween(unit.Universe, closing + 1);
 			Assert.That(after.All(f => f[0] == 0), Is.True, "S1 was off before the gate opened: " + string.Join(",", after.Select(f => f[0])));
 			dof.Finish();
 		}
@@ -834,14 +1152,13 @@ namespace VisualPinball.Engine.DOF.Test
 			using var dof = Start(config);
 			// Used while open, so finish has to send its final frame.
 			dof.Data('S', 1, 1);
-			Expect(unit.Universe, f => f[0] == 255, "S1 on");
+			var shown = ExpectIndex(unit.Universe, f => f[0] == 255, "S1 on");
 			// Past the minimum effect duration (60 ms), which would hold S1 on for a moment after it goes off.
 			Thread.Sleep(100);
-			var start = _capture.Count(unit.Universe);
 			Assert.That(WaitSettled(dof, dof.SetOutputGate(false)).Settled, Is.True);
-			// The closing's frame was sent; frames sent before it may still be on their way.
-			Expect(unit.Universe, f => f[0] == 0, "closed", start);
-			var mark = _capture.Count(unit.Universe);
+			// S1 is on from the frame above until the closing is written: the first frame after it with S1 off is the
+			// closing's, and S1 must not show after it.
+			var closing = ExpectIndex(unit.Universe, f => f[0] == 0, "closed", shown + 1);
 
 			// Finish right after the opening: the input queued before it still goes first. Whether that input is still
 			// queued when the opening comes depends on how fast DOF's main thread is, so the backlog makes it likely and
@@ -852,11 +1169,11 @@ namespace VisualPinball.Engine.DOF.Test
 			dof.Data('S', 1, 0);
 			var open = dof.SetOutputGate(true);
 			dof.Finish();
-			Thread.Sleep(100);
 			Assert.That(open, Is.GreaterThanOrEqualTo(0), "the opening was accepted");
 			var opening = dof.GetGateState(open);
 			Assert.That((opening.Applied, opening.Superseded), Is.EqualTo((true, false)), "finish applied the opening: " + opening);
-			var after = _capture.Frames(unit.Universe).Skip(mark).ToList();
+			// Finish returned: what it sent is all there once the capture caught up.
+			var after = FramesBetween(unit.Universe, closing + 1, _capture.Mark(unit.Universe));
 			Assert.That(after, Is.Not.Empty, "finish sends a final frame");
 			Assert.That(after.All(f => f[0] == 0), Is.True, "S1 was off before the gate opened: " + string.Join(",", after.Select(f => f[0])));
 		}
@@ -907,13 +1224,13 @@ namespace VisualPinball.Engine.DOF.Test
 			using var config = new TestConfig().GlobalConfig().Cabinet(8, unit).Ini(1, "vpetest,S1");
 			using var dof = Start(config);
 			dof.Data('S', 1, 1);
-			Expect(unit.Universe, f => f[0] == 255, "S1 on");
+			var shown = ExpectIndex(unit.Universe, f => f[0] == 255, "S1 on");
 			// Rounds with and without input still queued when the closing comes, so the main thread is busy or idle.
 			for (var round = 0; round < 6; round++) {
-				var start = _capture.Count(unit.Universe);
+				// S1 is on from the frame shown until it goes off: the first frame after it with S1 off is that change's,
+				// and S1 must not show again until the gate opens.
 				dof.Data('S', 1, 0);
-				Expect(unit.Universe, f => f[0] == 0, "S1 off", start);
-				var mark = _capture.Count(unit.Universe);
+				var off = ExpectIndex(unit.Universe, f => f[0] == 0, "S1 off", shown + 1);
 				if (round % 2 == 1) {
 					Backlog(dof);
 				}
@@ -921,13 +1238,13 @@ namespace VisualPinball.Engine.DOF.Test
 				dof.Data('S', 1, 1);
 				Assert.That(WaitSettled(dof, closed).Settled, Is.True, "round " + round);
 				WaitForInput(dof);
-				var after = _capture.Frames(unit.Universe).Skip(mark).ToList();
-				Assert.That(after, Is.Not.Empty, "round " + round);
+				ExpectFrameAfter(unit.Universe, off + 1, $"round {round}: a frame after the input");
+				var after = FramesBetween(unit.Universe, off + 1);
 				Assert.That(after.All(f => f[0] == 0), Is.True, $"round {round}: S1 came on after the closing");
 
 				var open = dof.SetOutputGate(true);
 				Assert.That(WaitSettled(dof, open).Settled, Is.True, "round " + round);
-				Expect(unit.Universe, f => f[0] == 255, "S1 shows once the gate opens", mark);
+				shown = ExpectIndex(unit.Universe, f => f[0] == 255, "S1 shows once the gate opens", off + 1);
 			}
 			dof.Finish();
 		}

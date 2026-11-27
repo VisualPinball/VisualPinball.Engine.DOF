@@ -119,9 +119,15 @@ namespace VisualPinball.Engine.DOF
 	/// until it returned; Dispose stops admitting calls, waits for the admitted ones to return, and then destroys the
 	/// instance on its own thread, so a call never runs libdof's shutdown. It returns once the instance is destroyed, so a
 	/// new instance can be created then; a second Dispose waits for that too. A call that is not admitted any more does
-	/// what that member does on a disposed instance. Dispose from inside a call (a log line it writes on the calling
-	/// thread), which would wait for itself, is not supported. <see cref="Finish"/> blocks until libdof's threads stopped,
-	/// which can take as long as the slowest device; call it from a thread that can wait.
+	/// what that member does on a disposed instance. <see cref="Finish"/> blocks until libdof's threads stopped, which
+	/// can take as long as the slowest device; call it from a thread that can wait.
+	/// <para>
+	/// From the log sink (<see cref="DofLibrary.SetLog"/>), Dispose cannot wait: the line comes from a call on that
+	/// thread, from the destruction itself, or from one of libdof's threads, which the destruction joins. A Dispose from a
+	/// line the destruction writes on its thread, or from a line of libdof's threads once a Dispose started, returns at
+	/// once. One from inside a call on the same thread, or from a line of libdof's threads while nothing disposes the
+	/// instance, throws <see cref="InvalidOperationException"/> and leaves the instance as it was.
+	/// </para>
 	/// </remarks>
 	public sealed class DofInstance : IDisposable
 	{
@@ -135,8 +141,17 @@ namespace VisualPinball.Engine.DOF
 		// The calls admitted into libdof (Enter) that have not returned yet.
 		private int _calls;
 		private int _state = Alive;
-		// Dispose waits on it for the admitted calls to return, and a second Dispose for the destruction.
-		private readonly object _disposeLock = new object();
+		// Set by the call that brings the count to 0 once Dispose started; the Dispose that destroys the instance waits on it.
+		// Kernel events, not a monitor, so neither the last call nor the waits need a lock. Never disposed: a late waiter
+		// may still hold one, so they are left to finalization.
+		private readonly ManualResetEvent _drained = new ManualResetEvent(false);
+		// Set once the instance is destroyed; a second Dispose waits on it.
+		private readonly ManualResetEvent _destroyed = new ManualResetEvent(false);
+		// The managed thread that runs the destruction, once a Dispose won.
+		private int _destroyingThread;
+		// The calls this thread is in, so a Dispose from inside one of them is refused instead of waiting for it.
+		[ThreadStatic]
+		private static int t_admitted;
 
 		/// <summary>The folder that contains <c>directoutputconfig/</c>; libdof reads no file outside it.</summary>
 		public string BasePath { get; }
@@ -310,8 +325,8 @@ namespace VisualPinball.Engine.DOF
 		/// write to the device (each report, packet, command or retry), and then sends the closing to every output. A
 		/// write that was already past that check when the latch came can still reach the device after the latch returned:
 		/// at most that one write per controller, followed by the closing. Nothing else of the opening goes out. Takes no
-		/// lock and never allocates, so the simulation thread or a fault handler may call it (the last call to return while
-		/// a Dispose waits for the calls takes its lock to wake it). Once it returned, the gate
+		/// lock and does not allocate, so the simulation thread or a fault handler may call it (the last call to return while
+		/// a Dispose waits for the calls signals an event to wake it). Once it returned, the gate
 		/// reports closed, also to an opening DOF's main thread is applying at that moment. It never reaches a later
 		/// instance's gate.
 		/// </summary>
@@ -397,30 +412,65 @@ namespace VisualPinball.Engine.DOF
 		/// <summary>
 		/// Frees the instance, finishing it first if needed, so a new one can be created. Stops admitting calls, waits for
 		/// the admitted ones to return (a running <see cref="Finish"/> too), destroys the instance on this thread and
-		/// returns. A Dispose while another one runs returns once that one destroyed the instance.
+		/// returns. A Dispose while another one runs returns once that one destroyed the instance. See the remarks of
+		/// <see cref="DofInstance"/> for a Dispose from the log sink.
 		/// </summary>
+		/// <exception cref="InvalidOperationException">
+		/// From inside a call into this instance on the same thread, or from a line of one of libdof's threads while no
+		/// Dispose runs. The instance is left as it was.
+		/// </exception>
+		/// <exception cref="ThreadInterruptedException">
+		/// The thread was interrupted while it waited. The Dispose that destroys the instance still waits for the calls and
+		/// destroys it, and throws once it did. One that waits for another Dispose to destroy it stops waiting and throws:
+		/// it destroys nothing, and the other one still does.
+		/// </exception>
 		public void Dispose()
 		{
-			if (Interlocked.CompareExchange(ref _state, Disposing, Alive) != Alive) {
-				lock (_disposeLock) {
-					while (Volatile.Read(ref _state) != Destroyed) {
-						Monitor.Wait(_disposeLock);
-					}
-				}
+			var thread = Environment.CurrentManagedThreadId;
+			// A line the destruction running on this thread wrote: it is underway.
+			if (Volatile.Read(ref _destroyingThread) == thread) {
 				return;
 			}
-			lock (_disposeLock) {
-				while (Volatile.Read(ref _calls) != 0) {
-					Monitor.Wait(_disposeLock);
+			var state = Volatile.Read(ref _state);
+			if (state == Destroyed) {
+				return;
+			}
+			if (t_admitted > 0) {
+				throw new InvalidOperationException("A DOF instance can't be disposed from inside a call on the same thread, such as a log line it writes.");
+			}
+			if (DofLibrary.InLogCallback) {
+				// One of libdof's threads, which the destruction joins: it can neither run the destruction nor wait for it.
+				if (state == Disposing) {
+					return;
+				}
+				throw new InvalidOperationException("A DOF instance can't be disposed from a log line while no other Dispose runs: the line may come from one of libdof's threads, which the destruction joins.");
+			}
+			if (Interlocked.CompareExchange(ref _state, Disposing, Alive) != Alive) {
+				// Another Dispose destroys it. An interrupt stops this wait and propagates; the other one still destroys it.
+				_destroyed.WaitOne();
+				return;
+			}
+			Volatile.Write(ref _destroyingThread, thread);
+			// The count is read after the state became Disposing, so a call that brought it to 0 before that, and did not
+			// signal, is seen here. Once a call brought it to 0 while disposing, every admitted call returned: what the
+			// count still shows are calls that are being turned away, which take it off again at once. The instance is
+			// destroyed whatever interrupts this thread meanwhile: only then is the interrupt raised.
+			var interrupted = false;
+			while (Volatile.Read(ref _calls) != 0) {
+				try {
+					_drained.WaitOne();
+				} catch (ThreadInterruptedException) {
+					interrupted = true;
 				}
 			}
 			try {
 				DofNative.Destroy(_dof);
 			} finally {
-				lock (_disposeLock) {
-					Volatile.Write(ref _state, Destroyed);
-					Monitor.PulseAll(_disposeLock);
-				}
+				Volatile.Write(ref _state, Destroyed);
+				_destroyed.Set();
+			}
+			if (interrupted) {
+				throw new ThreadInterruptedException("The thread was interrupted while it disposed the DOF instance, which it still destroyed.");
 			}
 		}
 
@@ -437,9 +487,10 @@ namespace VisualPinball.Engine.DOF
 			Interlocked.Increment(ref _calls);
 			// Checked again after the count, both full fences: either Dispose sees this call, or this call sees Dispose.
 			if (Volatile.Read(ref _state) != Alive) {
-				Leave();
+				Release();
 				return false;
 			}
+			t_admitted++;
 			return true;
 		}
 
@@ -450,13 +501,21 @@ namespace VisualPinball.Engine.DOF
 			}
 		}
 
-		/// <summary>Ends an admitted call; the last one to return while Dispose waits wakes it.</summary>
+		/// <summary>Ends an admitted call.</summary>
 		private void Leave()
 		{
+			t_admitted--;
+			Release();
+		}
+
+		/// <summary>
+		/// Takes a call off the count; the last one while Dispose waits wakes it by setting an event, which neither waits
+		/// nor takes a lock, so a call that returns never blocks or throws here.
+		/// </summary>
+		private void Release()
+		{
 			if (Interlocked.Decrement(ref _calls) == 0 && Volatile.Read(ref _state) == Disposing) {
-				lock (_disposeLock) {
-					Monitor.PulseAll(_disposeLock);
-				}
+				_drained.Set();
 			}
 		}
 	}
