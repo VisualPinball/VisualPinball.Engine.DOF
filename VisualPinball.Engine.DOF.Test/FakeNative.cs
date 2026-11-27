@@ -49,6 +49,8 @@ namespace VisualPinball.Engine.DOF.Test
 		public int Latches;
 		/// <summary>Runs at the start of every <see cref="LatchOutputGate"/>, on the thread that latches.</summary>
 		public volatile Action OnLatch;
+		/// <summary>Runs at the start of every <see cref="SetOutputGate"/>, with the state asked for, before DOF takes it.</summary>
+		public volatile Action<bool> OnSetOutputGate;
 		/// <summary>How many times <see cref="GetGateState"/> was asked.</summary>
 		public int GateStateCalls;
 		public volatile bool Disposed;
@@ -118,12 +120,17 @@ namespace VisualPinball.Engine.DOF.Test
 
 		public long SetOutputGate(bool open)
 		{
+			OnSetOutputGate?.Invoke(open);
 			if (GateError) {
 				throw new DofException(DofStatus.Error, "the gate failed");
 			}
-			Record(open ? "gate:open" : "gate:closed");
-			GateOpen = open && !Latched;
-			return Interlocked.Increment(ref _generation);
+			// As DOF does: a change and a latch from another thread are one after the other, and after a latch every
+			// change is a closing.
+			lock (_lock) {
+				Record(open ? "gate:open" : "gate:closed");
+				GateOpen = open && !Latched;
+				return Interlocked.Increment(ref _generation);
+			}
 		}
 
 		public long LatchOutputGate()
@@ -132,17 +139,19 @@ namespace VisualPinball.Engine.DOF.Test
 			if (GateError) {
 				throw new DofException(DofStatus.Error, "the gate failed");
 			}
-			Record("gate:latched");
-			if (LatchedBy == null) {
-				LatchedBy = Thread.CurrentThread;
+			lock (_lock) {
+				Record("gate:latched");
+				if (LatchedBy == null) {
+					LatchedBy = Thread.CurrentThread;
+				}
+				Interlocked.Increment(ref Latches);
+				if (Thread.CurrentThread.Name != "DOF session") {
+					Interlocked.Increment(ref OutsideLatches);
+				}
+				Latched = true;
+				GateOpen = false;
+				return Interlocked.Increment(ref _generation);
 			}
-			Interlocked.Increment(ref Latches);
-			if (Thread.CurrentThread.Name != "DOF session") {
-				Interlocked.Increment(ref OutsideLatches);
-			}
-			Latched = true;
-			GateOpen = false;
-			return Interlocked.Increment(ref _generation);
 		}
 
 		public DofGateState GetGateState(long generation)

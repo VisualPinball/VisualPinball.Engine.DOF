@@ -768,10 +768,17 @@ public:
 
 	std::atomic<bool> blackoutWorks { true };
 	std::atomic<int> blackouts { 0 };
+	// The settings check throws instead of returning false.
+	std::atomic<bool> settingsThrow { false };
 
 protected:
 	int GetNumberOfConfiguredOutputs() override { return 2; }
-	bool VerifySettings() override { return false; }
+	bool VerifySettings() override
+	{
+		if (settingsThrow)
+			throw std::runtime_error("the settings cannot be read");
+		return false;
+	}
 	void ConnectToController() override { }
 	void UpdateOutputs(const std::vector<uint8_t>&) override { }
 
@@ -786,42 +793,70 @@ protected:
 	}
 };
 
-// A controller that took its connect test before an Init that starts no updater is turned off by Init, and Finish
-// reports a blackout that did not get there. One that took no test is left alone.
+// A controller that took its connect test before an Init that starts no updater (its settings are wrong, or cannot be
+// read) is turned off by Init. As at the end of an updater, a blackout that got there confirms the latch made after the
+// test and finishes cleanly; one that did not fails the latch, and Finish reports it. One that took no test is left
+// alone, and its unit fails.
 void ConnectTestBeforeAFailedInitEndsDark()
 {
-	for (int run = 0; run < 3; run++)
+	for (bool settingsThrow : { false, true })
 	{
-		bool tested = run != 2;
-		bool blackoutWorks = run == 0;
-		OutputGate& gate = OutputGate::BeginSession();
-		Change(gate, true);
-		TestedBeforeInitController controller;
-		controller.SetName("tested");
-		controller.blackoutWorks = blackoutWorks;
-		if (tested)
-			controller.SendConnectTest();
-		controller.Init(nullptr);
-		std::string error;
-		try
+		for (int run = 0; run < 3; run++)
 		{
-			controller.Finish();
+			bool tested = run != 2;
+			bool blackoutWorks = run == 0;
+			OutputGate& gate = OutputGate::BeginSession();
+			Change(gate, true);
+			TestedBeforeInitController controller;
+			controller.SetName("tested");
+			controller.blackoutWorks = blackoutWorks;
+			controller.settingsThrow = settingsThrow;
+			if (tested)
+				controller.SendConnectTest();
+			int64_t latched = gate.Latch();
+			bool initThrew = false;
+			try
+			{
+				controller.Init(nullptr);
+			}
+			catch (const std::exception&)
+			{
+				initThrew = true;
+			}
+			CHECK(initThrew == settingsThrow, "Init throws only when the settings check does");
+			std::string error;
+			try
+			{
+				controller.Finish();
+			}
+			catch (const std::exception& e)
+			{
+				error = e.what();
+			}
+			OutputGate::Counts counts;
+			OutputGate::Status status = gate.GetState(latched, counts);
+			if (!tested)
+			{
+				CHECK(controller.blackouts == 0 && error.empty(), "an untested controller is not turned off");
+				// Its unit exists only when the settings were read: one that throws registers none.
+				if (!settingsThrow)
+					CHECK(status == OutputGate::Status::Applied && counts.failed == 1, "and its unit fails");
+				continue;
+			}
+			CHECK(controller.blackouts == 1, "the tested controller is turned off as Init gives up");
+			CHECK(status == OutputGate::Status::Applied && counts.pending == 0, "the latch is settled");
+			if (blackoutWorks)
+			{
+				CHECK(error.empty(), "a blackout that got there finishes cleanly");
+				CHECK(counts.confirmed == 1 && counts.failed == 0, "and confirms the latch");
+			}
+			else
+			{
+				CHECK(error.find("after its connect test") != std::string::npos && error.find("the device does not answer") != std::string::npos,
+					"one that did not fails the finish, with the reason");
+				CHECK(counts.failed == 1 && counts.confirmed == 0, "and the latch");
+			}
 		}
-		catch (const std::exception& e)
-		{
-			error = e.what();
-		}
-		if (!tested)
-		{
-			CHECK(controller.blackouts == 0 && error.empty(), "an untested controller is not turned off");
-			continue;
-		}
-		CHECK(controller.blackouts == 1, "the tested controller is turned off as Init gives up");
-		if (blackoutWorks)
-			CHECK(error.empty(), "a blackout that got there finishes cleanly");
-		else
-			CHECK(error.find("after its connect test") != std::string::npos && error.find("the device does not answer") != std::string::npos,
-				"one that did not fails the finish, with the reason");
 	}
 }
 

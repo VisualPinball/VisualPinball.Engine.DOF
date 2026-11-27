@@ -537,7 +537,7 @@ index f222f0c..bdd8bf0 100644
  }
  
 diff --git a/src/cab/out/OutputControllerCompleteBase.cpp b/src/cab/out/OutputControllerCompleteBase.cpp
-index 2b1478c..55a8ec8 100644
+index 2b1478c..b7ed0e1 100644
 --- a/src/cab/out/OutputControllerCompleteBase.cpp
 +++ b/src/cab/out/OutputControllerCompleteBase.cpp
 @@ -1,5 +1,7 @@
@@ -556,11 +556,11 @@ index 2b1478c..55a8ec8 100644
     bool settingsValid = false;
     try
     {
-@@ -30,22 +33,91 @@ void OutputControllerCompleteBase::Init(Cabinet* cabinet)
+@@ -30,22 +33,90 @@ void OutputControllerCompleteBase::Init(Cabinet* cabinet)
     catch (const std::exception& e)
     {
        Log::Exception(StringExtensions::Build("Exception occurred when verifying settings for {0} {1}: {2}. Cannot initialize.", GetXmlElementName(), GetName(), e.what()));
-+      TurnOffWithoutUpdater();
++      EndWithoutUpdater(true);
        throw;
     }
  
@@ -578,18 +578,17 @@ index 2b1478c..55a8ec8 100644
 +      }
 +      catch (...)
 +      {
-+         TurnOffWithoutUpdater();
-+         m_gateUnit->Die();
++         EndWithoutUpdater(true);
 +         throw;
 +      }
        Log::Write(StringExtensions::Build("{0} {1} initialized and updater thread started.", GetXmlElementName(), GetName()));
     }
     else
     {
-+      // A unit registered before (a connect test) fails as well.
-+      TurnOffWithoutUpdater();
++      // The controller has a unit, which fails, unless a connect test registered it and the blackout after it confirms
++      // the closing (EndWithoutUpdater).
 +      RegisterGateUnit();
-+      m_gateUnit->Die();
++      EndWithoutUpdater(true);
        Log::Warning(StringExtensions::Build("Settings for {0} {1} are not correct. Cannot initialize.", GetXmlElementName(), GetName()));
     }
  }
@@ -650,24 +649,35 @@ index 2b1478c..55a8ec8 100644
  void OutputControllerCompleteBase::Finish()
  {
     FinishUpdaterThread();
-@@ -58,6 +130,28 @@ void OutputControllerCompleteBase::Finish()
+@@ -58,6 +129,39 @@ void OutputControllerCompleteBase::Finish()
     }
  }
  
++// VPE: ends the unit of a controller no updater runs for: its Init failed (`initFailed`), or the session's Init never
++// reached it. As at the end of an updater, a connect test it took is ended with the blackout (TurnOffWithoutUpdater): one
++// that got there confirms the closing and the unit retires, one that did not fails the unit, and Finish reports it. A unit
++// without a test fails when its Init failed, and otherwise retires.
++void OutputControllerCompleteBase::EndWithoutUpdater(bool initFailed)
++{
++   bool tested = m_deviceUsed;
++   OutputGate::Snapshot before = ObserveGate();
++   TurnOffWithoutUpdater();
++   if (!m_gateUnit)
++      return;
++   if (tested && m_disconnectTurnedOff)
++   {
++      m_gateUnit->AckOff(before);
++      m_gateUnit->Stop();
++   }
++   else if (tested || initFailed)
++      m_gateUnit->Die();
++   else
++      m_gateUnit->Stop();
++}
++
 +void OutputControllerCompleteBase::FinishWithoutInit()
 +{
-+   if (m_deviceUsed)
-+   {
-+      OutputGate::Snapshot before = ObserveGate();
-+      TurnOffWithoutUpdater();
-+      // As at the end of an updater: a blackout that got there confirms the closing, one that did not fails the unit.
-+      if (m_gateUnit && !m_disconnectTurnedOff)
-+         m_gateUnit->Die();
-+      else if (m_gateUnit)
-+         m_gateUnit->AckOff(before);
-+   }
-+   if (m_gateUnit)
-+      m_gateUnit->Stop();
++   EndWithoutUpdater(false);
 +   if (!m_finishError.empty())
 +   {
 +      std::string error = m_finishError;
@@ -679,7 +689,7 @@ index 2b1478c..55a8ec8 100644
  void OutputControllerCompleteBase::Update()
  {
     if (m_updateRequired)
-@@ -91,6 +185,11 @@ void OutputControllerCompleteBase::SetValues(int firstOutput, const uint8_t* val
+@@ -91,6 +195,11 @@ void OutputControllerCompleteBase::SetValues(int firstOutput, const uint8_t* val
  
  void OutputControllerCompleteBase::SetupOutputs()
  {
@@ -691,7 +701,7 @@ index 2b1478c..55a8ec8 100644
     int numberOfOutputs = std::max(0, GetNumberOfConfiguredOutputs());
  
     if (!GetOutputs())
-@@ -269,15 +368,37 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -269,15 +378,37 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
  {
     Log::Write(StringExtensions::Build("Updater thread started for {0} {1}", GetXmlElementName(), GetName()));
  
@@ -729,7 +739,7 @@ index 2b1478c..55a8ec8 100644
           try
           {
              DisconnectFromController();
-@@ -285,6 +406,10 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -285,6 +416,10 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
           catch (...)
           {
           }
@@ -740,7 +750,7 @@ index 2b1478c..55a8ec8 100644
           m_updaterThreadFinished = true;
           return;
        }
-@@ -295,13 +420,20 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -295,13 +430,20 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
        bool fullTransferRequired = true;
        while (m_keepUpdaterThreadAlive)
        {
@@ -761,7 +771,7 @@ index 2b1478c..55a8ec8 100644
           try
           {
              if (m_inUseState == InUseState::ValueChanged)
-@@ -312,14 +444,30 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -312,14 +454,30 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
                 m_inUseState = InUseState::Running;
              }
  
@@ -794,7 +804,7 @@ index 2b1478c..55a8ec8 100644
           }
  
           if (!updateOK)
-@@ -345,7 +493,7 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -345,7 +503,7 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
              Log::Write("Reconnected to controller");
           }
  
@@ -803,7 +813,7 @@ index 2b1478c..55a8ec8 100644
           {
              std::unique_lock<std::mutex> lock(m_conditionMutex);
              m_updateCondition.wait_for(lock, std::chrono::milliseconds(50), [this] { return !m_keepUpdaterThreadAlive || m_updateRequired; });
-@@ -353,18 +501,23 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -353,18 +511,23 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
           m_updateRequired = false;
        }
  
@@ -830,7 +840,7 @@ index 2b1478c..55a8ec8 100644
                    m_finishError = StringExtensions::Build("{0} {1} could not send its final update", GetXmlElementName(), GetName());
              }
           }
-@@ -390,20 +543,42 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -390,20 +553,42 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
        catch (...)
        {
        }
@@ -874,7 +884,7 @@ index 2b1478c..55a8ec8 100644
     try
     {
        UpdateOutputs(values);
-@@ -411,10 +586,19 @@ bool OutputControllerCompleteBase::Transfer(const std::vector<uint8_t>& values,
+@@ -411,10 +596,19 @@ bool OutputControllerCompleteBase::Transfer(const std::vector<uint8_t>& values,
     catch (...)
     {
        m_forceFullTransfer = false;
@@ -896,7 +906,7 @@ index 2b1478c..55a8ec8 100644
 +
  }
 diff --git a/src/cab/out/OutputControllerCompleteBase.h b/src/cab/out/OutputControllerCompleteBase.h
-index e625193..4bd4279 100644
+index e625193..7c25aad 100644
 --- a/src/cab/out/OutputControllerCompleteBase.h
 +++ b/src/cab/out/OutputControllerCompleteBase.h
 @@ -3,6 +3,7 @@
@@ -956,7 +966,7 @@ index e625193..4bd4279 100644
  
  
     void InitUpdaterThread();
-@@ -76,9 +105,14 @@ private:
+@@ -76,9 +105,15 @@ private:
     mutable std::mutex m_conditionMutex;
     bool m_keepUpdaterThreadAlive;
     std::atomic<bool> m_updaterThreadFinished { false };
@@ -968,6 +978,7 @@ index e625193..4bd4279 100644
     void UpdaterThreadDoIt();
 -   bool Transfer(const std::vector<uint8_t>& values, bool full);
 +   void TurnOffWithoutUpdater();
++   void EndWithoutUpdater(bool initFailed);
 +   bool Transfer(const std::vector<uint8_t>& values, bool full, const OutputGate::Snapshot& gate);
  };
  
