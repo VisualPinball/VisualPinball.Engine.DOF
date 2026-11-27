@@ -138,9 +138,9 @@ namespace VisualPinball.Engine.DOF.Test
 		[Test]
 		public void TableConfigsDoNotSilenceTheIniRows()
 		{
-			// libdof reads no effect assignments from a table config: loaded, one without AddLedControlConfig would leave
-			// the game without effects. A session passes no table file, so none is looked up, also in a revision whose
-			// global config still names a table config pattern, as earlier imports wrote it, and after a rollback to one.
+			// The player loads no table configs: one without AddLedControlConfig would replace the ini rows. A session
+			// passes no table file, so none is looked up, also in a revision whose global config still names a table
+			// config pattern, as earlier imports wrote it, and after a rollback to one.
 			const int universe = 304;
 			var source = Path.Combine(_dir, "source");
 			Directory.CreateDirectory(source);

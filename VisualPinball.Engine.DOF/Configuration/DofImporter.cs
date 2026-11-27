@@ -850,7 +850,7 @@ namespace VisualPinball.Engine.DOF.Configuration
 				AnalyseCabinet(config.Cabinet, windowsPorts, report);
 			}
 			foreach (var table in config.TableConfigs.Values) {
-				report.Warning(DofReportTopic.Unsupported, $"Table config {table.Name} is kept but not loaded: libdof does not read the effects it assigns to table elements, so the ini rows drive the outputs instead.");
+				report.Warning(DofReportTopic.Unsupported, $"Table config {table.Name} is kept but not loaded: the player does not load table configs yet, so the ini rows drive the outputs instead.");
 			}
 		}
 
