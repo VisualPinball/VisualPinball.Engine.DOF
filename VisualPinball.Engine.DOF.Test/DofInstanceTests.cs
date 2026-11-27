@@ -170,7 +170,7 @@ namespace VisualPinball.Engine.DOF.Test
 		[Test]
 		public void ReportsAbiAndLibdofVersion()
 		{
-			Assert.That(DofLibrary.NativeAbiVersion, Is.EqualTo(4));
+			Assert.That(DofLibrary.NativeAbiVersion, Is.EqualTo(5));
 			Assert.That(DofLibrary.LibdofVersion, Does.Match(@"^\d+\.\d+\.\d+"));
 		}
 
@@ -763,6 +763,132 @@ namespace VisualPinball.Engine.DOF.Test
 			Assert.That(shutdownThreads, Is.EqualTo(new[] { disposerThread }), "the interrupted disposer destroyed it");
 			using (DofInstance.Create(config.Root)) {
 			}
+		}
+
+		[Test]
+		public void CabinetCheckReportsWhatASessionLoads()
+		{
+			var unit = Unit("ArtNetA");
+			using var config = StandardConfig(unit);
+			Assert.That(DofLibrary.CabinetControllers(config.Root).Select(c => (c.Type, c.Name, c.Loaded, c.Reason)),
+				Is.EqualTo(new[] { ("ArtNet", "ArtNetA", true, string.Empty) }));
+			using var empty = new TestConfig().GlobalConfig();
+			var error = Assert.Throws<DofException>(() => DofLibrary.CabinetControllers(empty.Root));
+			Assert.That(error.Message, Does.Contain("Cabinet.xml does not exist"));
+			using var broken = new TestConfig().GlobalConfig().Write("Cabinet.xml", "<Cabinet><Name>");
+			error = Assert.Throws<DofException>(() => DofLibrary.CabinetControllers(broken.Root));
+			Assert.That(error.Message, Does.Contain("is not valid XML"));
+
+			// A global config that is missing or cannot be read fails a session's init, and so the check. One that names no
+			// cabinet config leaves nothing to check.
+			using var none = new TestConfig();
+			error = Assert.Throws<DofException>(() => DofLibrary.CabinetControllers(none.Root));
+			Assert.That(error.Message, Does.Contain("has no").And.Contain("GlobalConfig_B2SServer.xml"));
+			using var malformed = new TestConfig().Write("GlobalConfig_B2SServer.xml", "<GlobalConfig><");
+			error = Assert.Throws<DofException>(() => DofLibrary.CabinetControllers(malformed.Root));
+			Assert.That(error.Message, Does.Contain("GlobalConfig_B2SServer.xml could not be loaded"));
+			using var noCabinet = new TestConfig().Write("GlobalConfig_B2SServer.xml", "<GlobalConfig/>");
+			Assert.That(DofLibrary.CabinetControllers(noCabinet.Root), Is.Empty);
+
+			// The fields come as they are: names that differ only in a separator stay apart.
+			using var names = new TestConfig().GlobalConfig().Write("Cabinet.xml", "<?xml version=\"1.0\"?>\n<Cabinet><OutputControllers>"
+				+ "<PacUIO Name=\"Left|Right\" /><PacUIO Name=\"Left/Right\" /></OutputControllers></Cabinet>\n");
+			Assert.That(DofLibrary.CabinetControllers(names.Root).Select(c => (c.Type, c.Name, c.Loaded, c.Reason)), Is.EqualTo(new[] {
+				("PacUIO", "Left|Right", false, "no Id"), ("PacUIO", "Left/Right", false, "no Id"),
+			}));
+		}
+
+		[Test]
+		public void CabinetCheckRunsBesideSessionsThatStartAndEnd()
+		{
+			// Checks run on another thread while instances are created, started, finished and destroyed, which builds and
+			// frees their gates and clears the device lists: every check reports the same, and every session runs as usual.
+			var unit = Unit("ArtNetA");
+			using var config = StandardConfig(unit);
+			using var other = new TestConfig().GlobalConfig().Write("Cabinet.xml", "<?xml version=\"1.0\"?>\n<Cabinet><OutputControllers>"
+				+ "<LedWiz><Name>LedWiz 1</Name><Number>1</Number></LedWiz><PacUIO Name=\"PacUIO 1\" Id=\"0\" />"
+				+ "<Pinscape><Name>Pinscape 1</Name><Number>1</Number></Pinscape><DudesCab><Name>DudesCab 1</Name><Number>1</Number></DudesCab>"
+				+ "<PinscapePico><Name>Pico 1</Name><Number>1</Number><NumberOfOutputs>32</NumberOfOutputs></PinscapePico>"
+				+ "<UMXController><Name>UMX 1</Name><Number>1</Number></UMXController><PinOne><Name>PinOne 1</Name><Number>1</Number></PinOne>"
+				+ "<TeensyStripController><Name>Teensy 1</Name><NumberOfLedsStrip1>100</NumberOfLedsStrip1></TeensyStripController>"
+				+ "<PacUIO Name=\"PacUIO 2\" /></OutputControllers></Cabinet>\n");
+			var expected = new[] {
+				("LedWiz 1", true), ("PacUIO 1", true), ("Pinscape 1", true), ("DudesCab 1", true), ("Pico 1", true), ("UMX 1", true),
+				("PinOne 1", true), ("Teensy 1", true), ("PacUIO 2", false),
+			};
+			Assert.That(DofLibrary.CabinetControllers(other.Root).Select(c => (c.Name, c.Loaded)), Is.EqualTo(expected));
+
+			var stop = 0;
+			var checks = 0;
+			Exception checkError = null;
+			var checker = new Thread(() => {
+				try {
+					while (Volatile.Read(ref stop) == 0) {
+						var controllers = DofLibrary.CabinetControllers(other.Root).Select(c => (c.Name, c.Loaded)).ToArray();
+						if (!controllers.SequenceEqual(expected)) {
+							throw new AssertionException($"a check reported {string.Join(", ", controllers)}");
+						}
+						Interlocked.Increment(ref checks);
+					}
+				} catch (Exception e) {
+					checkError = e;
+				}
+			}) { IsBackground = true };
+			checker.Start();
+			try {
+				var seen = 0;
+				for (var i = 0; i < 6; i++) {
+					using var dof = Start(config);
+					dof.Data('S', 1, 1);
+					var lit = ExpectIndex(unit.Universe, f => f[0] == 255, $"S1 on in session {i + 1}", seen);
+					dof.Data('S', 1, 0);
+					seen = ExpectIndex(unit.Universe, f => f[0] == 0, $"S1 off in session {i + 1}", lit + 1) + 1;
+					var state = WaitSettled(dof, dof.SetOutputGate(false));
+					Assert.That((state.Written, state.Pending, state.Failed), Is.EqualTo((1, 0, 0)), $"session {i + 1} settles");
+					dof.Finish();
+				}
+			} finally {
+				Volatile.Write(ref stop, 1);
+				Assert.That(Joined(checker, 30000), Is.True, "the checks returned");
+			}
+			Assert.That(checkError, Is.Null, checkError?.ToString());
+			Assert.That(Volatile.Read(ref checks), Is.GreaterThan(0), "checks ran beside the sessions");
+		}
+
+		[Test]
+		public void CabinetCheckLeavesARunningInstanceAlone()
+		{
+			// The check reads controllers that a session opens as USB and HID devices, next to a running instance: it opens
+			// none of them, and the instance goes on as before.
+			var unit = Unit("ArtNetA");
+			using var config = StandardConfig(unit);
+			using var other = new TestConfig().GlobalConfig().Write("Cabinet.xml", "<?xml version=\"1.0\"?>\n<Cabinet><OutputControllers>"
+				+ "<LedWiz><Name>LedWiz 1</Name><Number>1</Number></LedWiz><PacLed64 Name=\"PacLed64 1\" Id=\"1\" /><PacUIO Name=\"PacUIO 1\" Id=\"0\" />"
+				+ "<PacDrive Name=\"PacDrive\" /><Pinscape><Name>Pinscape 1</Name><Number>1</Number></Pinscape><DudesCab><Name>DudesCab 1</Name><Number>1</Number></DudesCab>"
+				+ "<UMXController><Name>UMX 1</Name><Number>1</Number></UMXController><PacUIO Name=\"PacUIO 2\" />"
+				+ "</OutputControllers></Cabinet>\n");
+			using var dof = Start(config);
+			dof.Data('S', 1, 1);
+			var lit = ExpectIndex(unit.Universe, f => f[0] == 255, "S1 on");
+			var settled = WaitSettled(dof, dof.SetOutputGate(true));
+
+			for (var i = 0; i < 20; i++) {
+				var controllers = DofLibrary.CabinetControllers(other.Root);
+				Assert.That(controllers.Select(c => (c.Name, c.Loaded)), Is.EqualTo(new[] {
+					("LedWiz 1", true), ("PacLed64 1", true), ("PacUIO 1", true), ("PacDrive", true), ("Pinscape 1", true),
+					("DudesCab 1", true), ("UMX 1", true), ("PacUIO 2", false),
+				}));
+				Assert.That(DofLibrary.CabinetControllers(config.Root).Single().Loaded, Is.True);
+			}
+
+			// The instance still drives its controller, its gate still counts its one unit, and it finishes cleanly.
+			dof.Data('S', 1, 0);
+			ExpectIndex(unit.Universe, f => f[0] == 0, "S1 off after the checks", lit + 1);
+			var state = WaitSettled(dof, dof.SetOutputGate(false));
+			Assert.That((settled.Written, settled.Pending, settled.Failed), Is.EqualTo((1, 0, 0)));
+			Assert.That((state.Written, state.Pending, state.Failed), Is.EqualTo((1, 0, 0)));
+			Assert.That(dof.Describe().Controllers.Select(c => c.Name), Is.EqualTo(new[] { "ArtNetA" }));
+			dof.Finish();
 		}
 
 		[Test]

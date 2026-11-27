@@ -45,8 +45,9 @@ namespace VisualPinball.Engine.DOF.Configuration
 	/// The import is staged and checked before anything changes: only DOF file types are taken, entries with absolute
 	/// paths or <c>..</c> are rejected, sizes are bounded, every ini and XML file must parse (XML without DTDs). The
 	/// revision gets a generated global config whose file patterns point into it (see <see cref="DofGlobalConfig"/>),
-	/// and libdof reads its ini files once before it is activated. A rejected import leaves the active configuration as
-	/// it was.
+	/// and libdof reads its ini files and its cabinet's output controllers once before it is activated: a controller
+	/// libdof would skip at the start of a session, such as a PacUIO without an Id, is reported with libdof's reason. A
+	/// rejected import leaves the active configuration as it was.
 	/// </remarks>
 	public sealed class DofImporter
 	{
@@ -1040,6 +1041,9 @@ namespace VisualPinball.Engine.DOF.Configuration
 				report.Error("libdof found no table rows in the ini files.");
 				return null;
 			}
+			if (config.Cabinet != null && !ValidateCabinet(revision, config.Cabinet, report)) {
+				return null;
+			}
 			var devices = rows.Select(r => r.Device).Distinct().Count();
 			report.Info(DofReportTopic.General, $"libdof reads {rows.Count} table rows for {devices} device{(devices == 1 ? string.Empty : "s")}.");
 			foreach (var pair in config.Inis) {
@@ -1051,6 +1055,31 @@ namespace VisualPinball.Engine.DOF.Configuration
 				}
 			}
 			return rows;
+		}
+
+		/// <summary>
+		/// Has libdof read the controllers of the revision's cabinet config as a session will, and warns about each one it
+		/// would skip. A type libdof does not support is reported by <see cref="AnalyseCabinet"/> already. Returns false if
+		/// libdof cannot read the global config or the cabinet config, which would fail every session.
+		/// </summary>
+		private static bool ValidateCabinet(DofRevision revision, ConfigFile cabinet, DofImportReport report)
+		{
+			IReadOnlyList<DofCabinetController> controllers;
+			try {
+				controllers = DofLibrary.CabinetControllers(revision.BasePath);
+			} catch (DofException e) {
+				report.Error($"libdof could not read the configuration: {e.Message}");
+				return false;
+			}
+			foreach (var controller in controllers) {
+				if (controller.Loaded || !SupportedControllers.Contains(controller.Type)) {
+					continue;
+				}
+				var name = string.IsNullOrEmpty(controller.Name) ? controller.Type : controller.Name;
+				var reason = controller.Reason.TrimEnd('.');
+				report.Warning(DofReportTopic.Unsupported, $"{cabinet.Name}: {name} is a {controller.Type} libdof can't read ({reason}); this controller definition is skipped.");
+			}
+			return true;
 		}
 
 		#endregion

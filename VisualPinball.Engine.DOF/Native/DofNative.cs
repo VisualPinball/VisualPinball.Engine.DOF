@@ -15,13 +15,16 @@ namespace VisualPinball.Engine.DOF.Native
 	internal static class DofNative
 	{
 		public const string Library = "VpeDof";
-		public const int AbiVersion = 4;
+		public const int AbiVersion = 5;
 
 		[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
 		public delegate void LogCallback(int level, IntPtr message, IntPtr user);
 
 		[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
 		public delegate void StringCallback(IntPtr value, IntPtr user);
+
+		[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+		public delegate void ControllerCallback(int loaded, IntPtr type, IntPtr name, IntPtr reason, IntPtr user);
 
 		[DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "vpe_dof_abi_version")]
 		public static extern int GetAbiVersion();
@@ -76,6 +79,9 @@ namespace VisualPinball.Engine.DOF.Native
 
 		[DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "vpe_dof_rom_names")]
 		public static extern int RomNames(byte[] basePath, byte[] tableFile, StringCallback callback, IntPtr user);
+
+		[DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "vpe_dof_cabinet_controllers")]
+		public static extern int CabinetControllers(byte[] basePath, ControllerCallback callback, IntPtr user, byte[] error, int errorSize);
 
 		[DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "vpe_dof_enumerate_devices")]
 		public static extern int EnumerateDevices(StringCallback callback, IntPtr user);

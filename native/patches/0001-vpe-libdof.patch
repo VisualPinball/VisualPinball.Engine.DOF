@@ -1,3 +1,40 @@
+diff --git a/src/Log.cpp b/src/Log.cpp
+index 9bf30ae..8d447f3 100644
+--- a/src/Log.cpp
++++ b/src/Log.cpp
+@@ -25,6 +25,15 @@ std::unordered_set<std::string> Log::m_activeInstrumentations;
+ std::vector<std::string> Log::m_preLogFileLog;
+ std::unordered_set<std::string> Log::m_onceKeys;
+ 
++namespace
++{
++
++// VPE: guards m_onceKeys, which threads that look up the install folder at the same time share (a session's setup, a
++// cabinet check).
++std::mutex s_onceLocker;
++
++}
++
+ void Log::SetInstrumentations(const std::string& instrumentations)
+ {
+    m_instrumentations = instrumentations;
+@@ -248,11 +257,13 @@ void Log::Debug(const std::string& message)
+ 
+ void Log::Once(const std::string& key, const std::string& message)
+ {
+-   if (m_onceKeys.find(key) == m_onceKeys.end())
+    {
+-      m_onceKeys.insert(key);
+-      Write(message);
++      std::lock_guard<std::mutex> lock(s_onceLocker);
++      if (!m_onceKeys.insert(key).second)
++         return;
+    }
++   // VPE: written without the lock, which a log callback could otherwise hold up.
++   Write(message);
+ }
+ 
+ void Log::Instrumentation(const std::string& key, const std::string& message)
 diff --git a/src/Pinball.cpp b/src/Pinball.cpp
 index 389786b..303c2ff 100644
 --- a/src/Pinball.cpp
@@ -500,17 +537,18 @@ index f222f0c..bdd8bf0 100644
  }
  
 diff --git a/src/cab/out/OutputControllerCompleteBase.cpp b/src/cab/out/OutputControllerCompleteBase.cpp
-index 2b1478c..ed9ce2d 100644
+index 2b1478c..672f722 100644
 --- a/src/cab/out/OutputControllerCompleteBase.cpp
 +++ b/src/cab/out/OutputControllerCompleteBase.cpp
-@@ -1,5 +1,6 @@
+@@ -1,5 +1,7 @@
  #include "OutputControllerCompleteBase.h"
  #include "Output.h"
++#include "OutputControllerList.h"
 +#include "OutputGate.h"
  #include "../../Log.h"
  #include "../../general/StringExtensions.h"
  #include <algorithm>
-@@ -36,16 +37,53 @@ void OutputControllerCompleteBase::Init(Cabinet* cabinet)
+@@ -36,16 +38,53 @@ void OutputControllerCompleteBase::Init(Cabinet* cabinet)
     if (settingsValid)
     {
        SetupOutputs();
@@ -565,7 +603,19 @@ index 2b1478c..ed9ce2d 100644
  void OutputControllerCompleteBase::Finish()
  {
     FinishUpdaterThread();
-@@ -269,15 +307,37 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -91,6 +130,11 @@ void OutputControllerCompleteBase::SetValues(int firstOutput, const uint8_t* val
+ 
+ void OutputControllerCompleteBase::SetupOutputs()
+ {
++   // VPE: the cabinet check builds no outputs. Their number can come from a device list a running session fills
++   // (PinscapePico), and reading an output asks the session's gate (IOutput::GetOutput). Init builds them for a session.
++   if (OutputControllerList::IsChecking())
++      return;
++
+    int numberOfOutputs = std::max(0, GetNumberOfConfiguredOutputs());
+ 
+    if (!GetOutputs())
+@@ -269,15 +313,37 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
  {
     Log::Write(StringExtensions::Build("Updater thread started for {0} {1}", GetXmlElementName(), GetName()));
  
@@ -603,7 +653,7 @@ index 2b1478c..ed9ce2d 100644
           try
           {
              DisconnectFromController();
-@@ -285,6 +345,10 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -285,6 +351,10 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
           catch (...)
           {
           }
@@ -614,7 +664,7 @@ index 2b1478c..ed9ce2d 100644
           m_updaterThreadFinished = true;
           return;
        }
-@@ -295,13 +359,20 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -295,13 +365,20 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
        bool fullTransferRequired = true;
        while (m_keepUpdaterThreadAlive)
        {
@@ -635,7 +685,7 @@ index 2b1478c..ed9ce2d 100644
           try
           {
              if (m_inUseState == InUseState::ValueChanged)
-@@ -312,14 +383,30 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -312,14 +389,30 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
                 m_inUseState = InUseState::Running;
              }
  
@@ -668,7 +718,7 @@ index 2b1478c..ed9ce2d 100644
           }
  
           if (!updateOK)
-@@ -345,7 +432,7 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -345,7 +438,7 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
              Log::Write("Reconnected to controller");
           }
  
@@ -677,7 +727,7 @@ index 2b1478c..ed9ce2d 100644
           {
              std::unique_lock<std::mutex> lock(m_conditionMutex);
              m_updateCondition.wait_for(lock, std::chrono::milliseconds(50), [this] { return !m_keepUpdaterThreadAlive || m_updateRequired; });
-@@ -353,18 +440,23 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -353,18 +446,23 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
           m_updateRequired = false;
        }
  
@@ -704,7 +754,7 @@ index 2b1478c..ed9ce2d 100644
                    m_finishError = StringExtensions::Build("{0} {1} could not send its final update", GetXmlElementName(), GetName());
              }
           }
-@@ -390,20 +482,42 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
+@@ -390,20 +488,42 @@ void OutputControllerCompleteBase::UpdaterThreadDoIt()
        catch (...)
        {
        }
@@ -748,7 +798,7 @@ index 2b1478c..ed9ce2d 100644
     try
     {
        UpdateOutputs(values);
-@@ -411,10 +525,19 @@ bool OutputControllerCompleteBase::Transfer(const std::vector<uint8_t>& values,
+@@ -411,10 +531,19 @@ bool OutputControllerCompleteBase::Transfer(const std::vector<uint8_t>& values,
     catch (...)
     {
        m_forceFullTransfer = false;
@@ -833,26 +883,157 @@ index e625193..6fb346a 100644
  };
  
  }
+diff --git a/src/cab/out/OutputControllerFlexCompleteBase.cpp b/src/cab/out/OutputControllerFlexCompleteBase.cpp
+index 58588e9..1d414cf 100644
+--- a/src/cab/out/OutputControllerFlexCompleteBase.cpp
++++ b/src/cab/out/OutputControllerFlexCompleteBase.cpp
+@@ -1,4 +1,6 @@
+ #include "OutputControllerFlexCompleteBase.h"
++#include <stdexcept>
++#include "../../general/StringExtensions.h"
+ #include <tinyxml2/tinyxml2.h>
+ 
+ namespace DOF
+@@ -35,15 +37,17 @@ bool OutputControllerFlexCompleteBase::FromXml(const tinyxml2::XMLElement* eleme
+    const tinyxml2::XMLElement* numberOfOutputsElement = element->FirstChildElement("NumberOfOutputs");
+    if (numberOfOutputsElement && numberOfOutputsElement->GetText())
+    {
++      // VPE: a controller that cannot be read says why (OutputControllerList::Load).
++      int numberOfOutputs = 0;
+       try
+       {
+-         int numberOfOutputs = std::stoi(numberOfOutputsElement->GetText());
+-         SetNumberOfOutputs(numberOfOutputs);
++         numberOfOutputs = std::stoi(numberOfOutputsElement->GetText());
+       }
+       catch (...)
+       {
+-         return false;
++         throw std::invalid_argument(StringExtensions::Build("NumberOfOutputs \"{0}\" is not a number", std::string(numberOfOutputsElement->GetText())));
+       }
++      SetNumberOfOutputs(numberOfOutputs);
+    }
+ 
+    return true;
 diff --git a/src/cab/out/OutputControllerList.cpp b/src/cab/out/OutputControllerList.cpp
-index 0d7a194..45b44d2 100644
+index 0d7a194..58cf6dc 100644
 --- a/src/cab/out/OutputControllerList.cpp
 +++ b/src/cab/out/OutputControllerList.cpp
-@@ -212,32 +212,39 @@ bool OutputControllerList::FromXml(const tinyxml2::XMLElement* element)
+@@ -37,6 +37,13 @@
+ namespace DOF
+ {
+ 
++namespace
++{
++
++thread_local bool t_checking = false;
++
++}
++
+ OutputControllerList::OutputControllerList()
+    : m_initializedCount(0)
+ {
+@@ -178,12 +185,83 @@ IOutputController* OutputControllerList::CreateController(const std::string& typ
+    else if (typeName == "ArtNet")
+       return new ArtNet();
+    else
+-   {
+-      Log::Warning(StringExtensions::Build("Unknown output controller type: {0}", typeName));
+       return nullptr;
++}
++
++IOutputController* OutputControllerList::Load(const tinyxml2::XMLElement* element, std::string& name, std::string& reason)
++{
++   name.clear();
++   reason.clear();
++   if (!element)
++      return nullptr;
++   IOutputController* controller = nullptr;
++   try
++   {
++      controller = CreateController(element->Name());
++      if (!controller)
++         reason = "libdof has no output controller of this type";
++      else if (controller->FromXml(element))
++      {
++         name = controller->GetName();
++         return controller;
++      }
++      else
++         reason = "its settings cannot be read";
++   }
++   catch (const std::exception& e)
++   {
++      reason = e.what();
++   }
++   catch (...)
++   {
++      reason = "unknown error";
+    }
++   if (controller)
++   {
++      name = controller->GetName();
++      delete controller;
++   }
++   if (name.empty())
++   {
++      const char* attribute = element->Attribute("Name");
++      const tinyxml2::XMLElement* child = element->FirstChildElement("Name");
++      if (attribute)
++         name = attribute;
++      else if (child && child->GetText())
++         name = child->GetText();
++   }
++   return nullptr;
+ }
+ 
++std::vector<OutputControllerList::ControllerCheck> OutputControllerList::Check(const tinyxml2::XMLElement* element)
++{
++   std::vector<ControllerCheck> checks;
++   if (!element)
++      return checks;
++   CheckScope checking;
++   for (const tinyxml2::XMLElement* controllerElement = element->FirstChildElement(); controllerElement;
++      controllerElement = controllerElement->NextSiblingElement())
++   {
++      ControllerCheck check;
++      check.type = controllerElement->Name();
++      IOutputController* controller = Load(controllerElement, check.name, check.reason);
++      check.loaded = controller != nullptr;
++      delete controller;
++      checks.push_back(std::move(check));
++   }
++   return checks;
++}
++
++bool OutputControllerList::IsChecking() { return t_checking; }
++
++OutputControllerList::CheckScope::CheckScope()
++   : m_previous(t_checking)
++{
++   t_checking = true;
++}
++
++OutputControllerList::CheckScope::~CheckScope() { t_checking = m_previous; }
++
+ tinyxml2::XMLElement* OutputControllerList::ToXml(tinyxml2::XMLDocument& doc) const
+ {
+    tinyxml2::XMLElement* element = doc.NewElement(GetXmlElementName().c_str());
+@@ -212,33 +290,23 @@ bool OutputControllerList::FromXml(const tinyxml2::XMLElement* element)
     while (controllerElement)
     {
        std::string typeName = controllerElement->Name();
 -      IOutputController* controller = CreateController(typeName);
 -
--      if (controller)
 +      // VPE: a controller whose configuration cannot be used is skipped, in strict setup too, as toys that cannot be
-+      // read are, so the rest of the cabinet starts: whether its XML is unreadable (FromXml returns false) or a setting
-+      // is refused (a setter throws, such as an Id out of range). VPE imports cabinets without libdof reading them (that
-+      // would open their devices), and must not activate one that setup then refuses as a whole. Nothing a skipped
-+      // controller is made of opens a device or registers with the output gate; that happens in Init.
-+      IOutputController* controller = nullptr;
-+      bool loaded = false;
-+      std::string error;
-+      try
++      // read are, so the rest of the cabinet starts: whether its type is unknown, its XML is unreadable or a setting is
++      // refused (an Id that is missing, not a number or out of range). VPE's import reads the cabinet with the same Load
++      // (Check) to report what a session skips, and must not activate a cabinet that setup then refuses as a whole.
++      // Nothing a skipped controller is made of opens a device or registers with the output gate; that happens in Init.
++      std::string name;
++      std::string reason;
++      IOutputController* controller = Load(controllerElement, name, reason);
+       if (controller)
        {
 -         bool loaded;
 -         try
@@ -871,36 +1052,73 @@ index 0d7a194..45b44d2 100644
 -         }
 -         else
 -         {
-+         controller = CreateController(typeName);
-+         loaded = controller && controller->FromXml(controllerElement);
-+      }
-+      catch (const std::exception& e)
-+      {
-+         error = e.what();
-+      }
-+      catch (...)
-+      {
-+         error = "unknown error";
-+      }
-+      if (controller && loaded)
-+      {
-+         push_back(controller);
-+         Log::Write(StringExtensions::Build("Loaded output controller: {0} ({1})", controller->GetName(), typeName));
-+      }
-+      else if (controller || !error.empty())
-+      {
-+         if (error.empty())
-             Log::Warning(StringExtensions::Build("Failed to load output controller from XML: {0}", typeName));
+-            Log::Warning(StringExtensions::Build("Failed to load output controller from XML: {0}", typeName));
 -            delete controller;
 -            if (Config::GetInstance()->IsStrictSetup())
 -               throw std::runtime_error(StringExtensions::Build("the output controller {0} could not be loaded", typeName));
 -         }
-+         else
-+            Log::Warning(StringExtensions::Build("Failed to load output controller from XML: {0}: {1}", typeName, error));
-+         delete controller;
++         push_back(controller);
++         Log::Write(StringExtensions::Build("Loaded output controller: {0} ({1})", controller->GetName(), typeName));
        }
++      else if (name.empty())
++         Log::Warning(StringExtensions::Build("Failed to load output controller from XML: {0}: {1}", typeName, reason));
++      else
++         Log::Warning(StringExtensions::Build("Failed to load output controller from XML: {0} {1}: {2}", typeName, name, reason));
  
        controllerElement = controllerElement->NextSiblingElement();
+    }
+diff --git a/src/cab/out/OutputControllerList.h b/src/cab/out/OutputControllerList.h
+index 73cf7df..620ce41 100644
+--- a/src/cab/out/OutputControllerList.h
++++ b/src/cab/out/OutputControllerList.h
+@@ -1,5 +1,8 @@
+ #pragma once
+ 
++#include <string>
++#include <vector>
++
+ #include "DOF/DOF.h"
+ #include "IOutputController.h"
+ #include "../../general/generic/IXmlSerializable.h"
+@@ -20,6 +23,38 @@ public:
+    IOutputController* GetByName(const std::string& name) const;
+    IOutputController* operator[](const std::string& name) const;
+    static IOutputController* CreateController(const std::string& typeName);
++
++   // VPE: an output controller element of a cabinet, and whether a session loads it or skips it, and why.
++   struct ControllerCheck
++   {
++      std::string type;
++      std::string name;
++      bool loaded = false;
++      std::string reason;
++   };
++   // VPE: reads a controller element as FromXml does: the controller, or nullptr and the reason it is skipped. Its name
++   // either way, from the controller or the element. Does not log.
++   static IOutputController* Load(const tinyxml2::XMLElement* element, std::string& name, std::string& reason);
++   // VPE: reads each controller element of an OutputControllers element with Load, the way a session does, and keeps
++   // none of them. Reading a controller opens no device, starts no thread and registers nothing with the output gate,
++   // which a controller does in Init; while this runs (CheckScope), the controllers also leave alone the device lists a
++   // running session fills and build no outputs, which would read the session's gate.
++   static std::vector<ControllerCheck> Check(const tinyxml2::XMLElement* element);
++   // VPE: whether this thread runs Check, so a controller that looks its device up as its number is set does not, and
++   // no output is built (OutputControllerCompleteBase::SetupOutputs).
++   static bool IsChecking();
++   // VPE: marks the calling thread as running Check while it exists.
++   class CheckScope
++   {
++   public:
++      CheckScope();
++      ~CheckScope();
++      CheckScope(const CheckScope&) = delete;
++      CheckScope& operator=(const CheckScope&) = delete;
++
++   private:
++      bool m_previous;
++   };
+    virtual tinyxml2::XMLElement* ToXml(tinyxml2::XMLDocument& doc) const override;
+    virtual bool FromXml(const tinyxml2::XMLElement* element) override;
+    virtual std::string GetXmlElementName() const override { return "OutputControllers"; }
 diff --git a/src/cab/out/OutputGate.cpp b/src/cab/out/OutputGate.cpp
 new file mode 100644
 index 0000000..d5d7bbc
@@ -1571,17 +1789,18 @@ index 47b36ec..9e608ae 100644
        output->ValueChanged += [this](void* sender, const OutputEventArgs& args) { OutputValueChanged.Invoke(this, args); };
     }
 diff --git a/src/cab/out/adressableledstrip/DirectStripController.cpp b/src/cab/out/adressableledstrip/DirectStripController.cpp
-index d9a5f85..61b94f7 100644
+index d9a5f85..0543f73 100644
 --- a/src/cab/out/adressableledstrip/DirectStripController.cpp
 +++ b/src/cab/out/adressableledstrip/DirectStripController.cpp
-@@ -1,5 +1,6 @@
+@@ -1,5 +1,7 @@
  #include "DirectStripController.h"
++#include <stdexcept>
  #include "LedStripOutput.h"
 +#include "../OutputGate.h"
  #include "../../Cabinet.h"
  #include "../../../Log.h"
  #include "../../../general/StringExtensions.h"
-@@ -116,6 +117,7 @@ void DirectStripController::AddOutputs()
+@@ -116,6 +118,7 @@ void DirectStripController::AddOutputs()
  void DirectStripController::Init(Cabinet* cabinet)
  {
     AddOutputs();
@@ -1589,7 +1808,7 @@ index d9a5f85..61b94f7 100644
     InitUpdaterThread();
     Log::Write(StringExtensions::Build("DirectStripController {0} with number {1} initialized and updaterthread started.", GetName(), std::to_string(m_controllerNumber)));
  }
-@@ -190,6 +192,7 @@ bool DirectStripController::IsUpdaterThreadActive() const { return m_updaterThre
+@@ -190,6 +193,7 @@ bool DirectStripController::IsUpdaterThreadActive() const { return m_updaterThre
  
  void DirectStripController::UpdaterThreadDoIt()
  {
@@ -1597,7 +1816,7 @@ index d9a5f85..61b94f7 100644
     if (!m_controller)
     {
        m_controller = new DirectStripControllerApi(m_controllerNumber);
-@@ -198,6 +201,7 @@ void DirectStripController::UpdaterThreadDoIt()
+@@ -198,6 +202,7 @@ void DirectStripController::UpdaterThreadDoIt()
           Log::Warning(StringExtensions::Build("WS2811 Strip Controller Nr. {0} is not present. Will not send updates.", std::to_string(m_controllerNumber)));
           delete m_controller;
           m_controller = nullptr;
@@ -1605,7 +1824,7 @@ index d9a5f85..61b94f7 100644
           m_updaterThreadFinished = true;
           return;
        }
-@@ -214,20 +218,33 @@ void DirectStripController::UpdaterThreadDoIt()
+@@ -214,20 +219,33 @@ void DirectStripController::UpdaterThreadDoIt()
  
     while (m_keepUpdaterThreadAlive)
     {
@@ -1644,7 +1863,7 @@ index d9a5f85..61b94f7 100644
           }
        }
  
-@@ -250,6 +267,7 @@ void DirectStripController::UpdaterThreadDoIt()
+@@ -250,6 +268,7 @@ void DirectStripController::UpdaterThreadDoIt()
        delete m_controller;
        m_controller = nullptr;
     }
@@ -1652,18 +1871,46 @@ index d9a5f85..61b94f7 100644
     m_updaterThreadFinished = true;
  }
  
-@@ -267,7 +285,10 @@ bool DirectStripController::FromXml(const tinyxml2::XMLElement* element)
+@@ -265,29 +284,27 @@ bool DirectStripController::FromXml(const tinyxml2::XMLElement* element)
+    const tinyxml2::XMLElement* controllerNumberElement = element->FirstChildElement("ControllerNumber");
+    if (controllerNumberElement && controllerNumberElement->GetText())
     {
+-      try
+-      {
+-         int controllerNumber = std::stoi(controllerNumberElement->GetText());
+-         SetControllerNumber(controllerNumber);
+-      }
+-      catch (...)
+-      {
+-         return false;
+-      }
++      // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board. A
++      // controller that cannot be read says why (OutputControllerList::Load), as does a setter that refuses the number.
++      int controllerNumber = 0;
++      if (!StringExtensions::TryParseInt(controllerNumberElement->GetText(), controllerNumber))
++         throw std::invalid_argument(StringExtensions::Build("ControllerNumber \"{0}\" is not a whole number", std::string(controllerNumberElement->GetText())));
++      SetControllerNumber(controllerNumber);
+    }
+ 
+    const tinyxml2::XMLElement* numberOfLedsElement = element->FirstChildElement("NumberOfLeds");
+    if (numberOfLedsElement && numberOfLedsElement->GetText())
+    {
++      int numberOfLeds = 0;
        try
        {
--         int controllerNumber = std::stoi(controllerNumberElement->GetText());
-+         // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board.
-+         int controllerNumber = 0;
-+         if (!StringExtensions::TryParseInt(controllerNumberElement->GetText(), controllerNumber))
-+            return false;
-          SetControllerNumber(controllerNumber);
+-         int numberOfLeds = std::stoi(numberOfLedsElement->GetText());
+-         SetNumberOfLeds(numberOfLeds);
++         numberOfLeds = std::stoi(numberOfLedsElement->GetText());
        }
        catch (...)
+       {
+-         return false;
++         throw std::invalid_argument(StringExtensions::Build("NumberOfLeds \"{0}\" is not a number", std::string(numberOfLedsElement->GetText())));
+       }
++      SetNumberOfLeds(numberOfLeds);
+    }
+ 
+    const tinyxml2::XMLElement* packDataElement = element->FirstChildElement("PackData");
 diff --git a/src/cab/out/adressableledstrip/DirectStripController.h b/src/cab/out/adressableledstrip/DirectStripController.h
 index e112579..6ce43dc 100644
 --- a/src/cab/out/adressableledstrip/DirectStripController.h
@@ -1686,7 +1933,7 @@ index e112579..6ce43dc 100644
  }
 \ No newline at end of file
 diff --git a/src/cab/out/adressableledstrip/TeensyStripController.cpp b/src/cab/out/adressableledstrip/TeensyStripController.cpp
-index d3678e4..fe6213e 100644
+index d3678e4..b655101 100644
 --- a/src/cab/out/adressableledstrip/TeensyStripController.cpp
 +++ b/src/cab/out/adressableledstrip/TeensyStripController.cpp
 @@ -213,18 +213,28 @@ bool TeensyStripController::VerifySettings()
@@ -1792,6 +2039,38 @@ index d3678e4..fe6213e 100644
  
     receiveData.resize(1);
     bytesRead = -1;
+@@ -594,7 +598,8 @@ bool TeensyStripController::FromXml(const tinyxml2::XMLElement* element)
+       return false;
+ 
+    bool strict = Config::GetInstance()->IsStrictSetup();
+-   bool loaded = true;
++   // VPE: a controller that cannot be read says why (OutputControllerList::Load): the first setting it refuses.
++   std::string refused;
+    auto loadElement = [&](const char* name, auto setter)
+    {
+       const tinyxml2::XMLElement* elem = element->FirstChildElement(name);
+@@ -606,8 +611,8 @@ bool TeensyStripController::FromXml(const tinyxml2::XMLElement* element)
+          }
+          catch (...)
+          {
+-            if (strict)
+-               loaded = false;
++            if (strict && refused.empty())
++               refused = StringExtensions::Build("{0} \"{1}\" is not a valid value", std::string(name), std::string(elem->GetText()));
+          }
+       }
+    };
+@@ -681,7 +686,9 @@ bool TeensyStripController::FromXml(const tinyxml2::XMLElement* element)
+    loadElement("NumberOfLedsStrip9", [&](const char* text) { SetNumberOfLedsStrip9(toInt(text)); });
+    loadElement("NumberOfLedsStrip10", [&](const char* text) { SetNumberOfLedsStrip10(toInt(text)); });
+ 
+-   return loaded;
++   if (!refused.empty())
++      throw std::invalid_argument(refused);
++   return true;
+ }
+ 
+ tinyxml2::XMLElement* TeensyStripController::ToXml(tinyxml2::XMLDocument& doc) const
 diff --git a/src/cab/out/adressableledstrip/TeensyStripController.h b/src/cab/out/adressableledstrip/TeensyStripController.h
 index e910f68..30a1cae 100644
 --- a/src/cab/out/adressableledstrip/TeensyStripController.h
@@ -1818,16 +2097,36 @@ index e910f68..30a1cae 100644
  private:
     std::string m_comPortName;
 diff --git a/src/cab/out/adressableledstrip/UMXController.cpp b/src/cab/out/adressableledstrip/UMXController.cpp
-index 9cbe817..cb58397 100644
+index 9cbe817..ba141a4 100644
 --- a/src/cab/out/adressableledstrip/UMXController.cpp
 +++ b/src/cab/out/adressableledstrip/UMXController.cpp
-@@ -1,4 +1,5 @@
+@@ -1,4 +1,6 @@
  #include "UMXController.h"
++#include <stdexcept>
 +#include "../OutputGate.h"
  #include "UMXControllerAutoConfigurator.h"
  #include "../../Cabinet.h"
  #include "../OutputControllerList.h"
-@@ -47,9 +48,12 @@ int UMXController::GetNumberOfConfiguredOutputs() { return m_dev ? m_dev->NumOut
+@@ -36,10 +38,14 @@ void UMXController::SetNumber(int value)
+ 
+       m_number = value;
+ 
+-      auto devices = UMXControllerAutoConfigurator::AllDevices();
+-      auto it = std::find_if(devices.begin(), devices.end(), [this](UMXDevice* d) { return d->UnitNo() == m_number; });
+-      if (it != devices.end())
+-         m_dev = *it;
++      // VPE: the cabinet check leaves the device list of a running session alone.
++      if (!OutputControllerList::IsChecking())
++      {
++         auto devices = UMXControllerAutoConfigurator::AllDevices();
++         auto it = std::find_if(devices.begin(), devices.end(), [this](UMXDevice* d) { return d->UnitNo() == m_number; });
++         if (it != devices.end())
++            m_dev = *it;
++      }
+    }
+ }
+ 
+@@ -47,9 +53,12 @@ int UMXController::GetNumberOfConfiguredOutputs() { return m_dev ? m_dev->NumOut
  
  void UMXController::ConnectToController()
  {
@@ -1841,7 +2140,7 @@ index 9cbe817..cb58397 100644
     }
     catch (const std::exception& e)
     {
-@@ -63,7 +67,8 @@ void UMXController::ConnectToController()
+@@ -63,7 +72,8 @@ void UMXController::ConnectToController()
  
  void UMXController::DisconnectFromController()
  {
@@ -1851,7 +2150,7 @@ index 9cbe817..cb58397 100644
     {
        m_dev->SendCommand(UMXDevice::UMXCommand::UMX_AllOff);
        m_disconnectTurnedOff = true;
-@@ -98,7 +103,11 @@ void UMXController::UpdateOutputs(const std::vector<uint8_t>& outputValues)
+@@ -98,7 +108,11 @@ void UMXController::UpdateOutputs(const std::vector<uint8_t>& outputValues)
  
     if (!m_dev)
        throw std::runtime_error(StringExtensions::Build("UMX controller {0} has no device", GetName()));
@@ -1864,7 +2163,7 @@ index 9cbe817..cb58397 100644
     m_lastTime = std::chrono::steady_clock::now();
     m_lastTimeInit = true;
  }
-@@ -122,20 +131,32 @@ void UMXController::UpdateCabinetFromConfig(Cabinet* cabinet)
+@@ -122,20 +136,32 @@ void UMXController::UpdateCabinetFromConfig(Cabinet* cabinet)
        return;
     }
  
@@ -1899,18 +2198,28 @@ index 9cbe817..cb58397 100644
           Log::Warning(StringExtensions::Build("UMX controller {0} could not start its connect test: {1}", GetName(), e.what()));
        }
     }
-@@ -269,7 +290,10 @@ bool UMXController::FromXml(const tinyxml2::XMLElement* element)
+@@ -267,15 +293,12 @@ bool UMXController::FromXml(const tinyxml2::XMLElement* element)
+    const tinyxml2::XMLElement* numberElement = element->FirstChildElement("Number");
+    if (numberElement && numberElement->GetText())
     {
-       try
-       {
+-      try
+-      {
 -         int number = std::stoi(numberElement->GetText());
-+         // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board.
-+         int number = 0;
-+         if (!StringExtensions::TryParseInt(numberElement->GetText(), number))
-+            return false;
-          SetNumber(number);
-       }
-       catch (...)
+-         SetNumber(number);
+-      }
+-      catch (...)
+-      {
+-         return false;
+-      }
++      // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board. A
++      // controller that cannot be read says why (OutputControllerList::Load), as does a setter that refuses the number.
++      int number = 0;
++      if (!StringExtensions::TryParseInt(numberElement->GetText(), number))
++         throw std::invalid_argument(StringExtensions::Build("Number \"{0}\" is not a whole number", std::string(numberElement->GetText())));
++      SetNumber(number);
+    }
+ 
+    return true;
 diff --git a/src/cab/out/adressableledstrip/UMXControllerAutoConfigurator.cpp b/src/cab/out/adressableledstrip/UMXControllerAutoConfigurator.cpp
 index 385851c..c9e4536 100644
 --- a/src/cab/out/adressableledstrip/UMXControllerAutoConfigurator.cpp
@@ -2020,7 +2329,7 @@ index 4475b47..07e2e83 100644
     virtual bool IsLost() const { return false; }
     virtual void Release() { }
 diff --git a/src/cab/out/adressableledstrip/WemosD1StripController.cpp b/src/cab/out/adressableledstrip/WemosD1StripController.cpp
-index cb013c8..c9ffd8a 100644
+index cb013c8..4305acf 100644
 --- a/src/cab/out/adressableledstrip/WemosD1StripController.cpp
 +++ b/src/cab/out/adressableledstrip/WemosD1StripController.cpp
 @@ -1,5 +1,6 @@
@@ -2125,6 +2434,38 @@ index cb013c8..c9ffd8a 100644
     }
  }
  
+@@ -169,7 +191,8 @@ bool WemosD1MPStripController::FromXml(const tinyxml2::XMLElement* element)
+       return false;
+ 
+    bool strict = Config::GetInstance()->IsStrictSetup();
+-   bool loaded = true;
++   // VPE: a controller that cannot be read says why (OutputControllerList::Load): the first setting it refuses.
++   std::string refused;
+    auto loadElement = [&](const char* name, auto setter)
+    {
+       const tinyxml2::XMLElement* elem = element->FirstChildElement(name);
+@@ -181,8 +204,8 @@ bool WemosD1MPStripController::FromXml(const tinyxml2::XMLElement* element)
+          }
+          catch (...)
+          {
+-            if (strict)
+-               loaded = false;
++            if (strict && refused.empty())
++               refused = StringExtensions::Build("{0} \"{1}\" is not a valid value", std::string(name), std::string(elem->GetText()));
+          }
+       }
+    };
+@@ -198,7 +221,9 @@ bool WemosD1MPStripController::FromXml(const tinyxml2::XMLElement* element)
+    loadElement("UseCompression", [&](const char* text) { SetUseCompression(toBool(text)); });
+    loadElement("TestOnConnect", [&](const char* text) { SetTestOnConnect(toBool(text)); });
+ 
+-   return loaded;
++   if (!refused.empty())
++      throw std::invalid_argument(refused);
++   return true;
+ }
+ 
+ tinyxml2::XMLElement* WemosD1MPStripController::ToXml(tinyxml2::XMLDocument& doc) const
 diff --git a/src/cab/out/adressableledstrip/WemosD1StripController.h b/src/cab/out/adressableledstrip/WemosD1StripController.h
 index 4b18a5d..b063812 100644
 --- a/src/cab/out/adressableledstrip/WemosD1StripController.h
@@ -2193,7 +2534,7 @@ index 1bebe23..980636d 100644
     virtual void DisconnectFromController() override;
  
 diff --git a/src/cab/out/dmx/ArtNet.cpp b/src/cab/out/dmx/ArtNet.cpp
-index b7516b8..f1285c0 100644
+index b7516b8..c931e08 100644
 --- a/src/cab/out/dmx/ArtNet.cpp
 +++ b/src/cab/out/dmx/ArtNet.cpp
 @@ -29,7 +29,12 @@ void ArtNet::UpdateOutputs(const std::vector<uint8_t>& outputValues)
@@ -2209,18 +2550,28 @@ index b7516b8..f1285c0 100644
           }
           else
           {
-@@ -109,7 +114,10 @@ bool ArtNet::FromXml(const tinyxml2::XMLElement* element)
+@@ -107,15 +112,12 @@ bool ArtNet::FromXml(const tinyxml2::XMLElement* element)
+    const tinyxml2::XMLElement* universeElement = element->FirstChildElement("Universe");
+    if (universeElement && universeElement->GetText())
     {
-       try
-       {
+-      try
+-      {
 -         int universe = std::stoi(universeElement->GetText());
-+         // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board.
-+         int universe = 0;
-+         if (!StringExtensions::TryParseInt(universeElement->GetText(), universe))
-+            return false;
-          SetUniverse(static_cast<short>(universe));
-       }
-       catch (...)
+-         SetUniverse(static_cast<short>(universe));
+-      }
+-      catch (...)
+-      {
+-         return false;
+-      }
++      // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board. A
++      // controller that cannot be read says why (OutputControllerList::Load).
++      int universe = 0;
++      if (!StringExtensions::TryParseInt(universeElement->GetText(), universe))
++         throw std::invalid_argument(StringExtensions::Build("Universe \"{0}\" is not a whole number", std::string(universeElement->GetText())));
++      SetUniverse(static_cast<short>(universe));
+    }
+ 
+    const tinyxml2::XMLElement* broadcastElement = element->FirstChildElement("BroadcastAddress");
 diff --git a/src/cab/out/dmx/artnetengine/Engine.cpp b/src/cab/out/dmx/artnetengine/Engine.cpp
 index 302baa3..22ce37c 100644
 --- a/src/cab/out/dmx/artnetengine/Engine.cpp
@@ -2243,10 +2594,17 @@ index 302baa3..22ce37c 100644
     {
        try
 diff --git a/src/cab/out/dudescab/DudesCab.cpp b/src/cab/out/dudescab/DudesCab.cpp
-index b9a8fd5..8f6d8de 100644
+index b9a8fd5..cd31d80 100644
 --- a/src/cab/out/dudescab/DudesCab.cpp
 +++ b/src/cab/out/dudescab/DudesCab.cpp
-@@ -25,6 +25,7 @@ namespace DOF
+@@ -1,4 +1,6 @@
+ #include "DudesCab.h"
++#include <stdexcept>
++#include "../OutputControllerList.h"
+ #include "../../Cabinet.h"
+ #include "../../../Log.h"
+ #include "../../../general/StringExtensions.h"
+@@ -25,6 +27,7 @@ namespace DOF
  {
  
  std::vector<DudesCab::Device*> DudesCab::s_devices;
@@ -2254,7 +2612,32 @@ index b9a8fd5..8f6d8de 100644
  bool DudesCab::s_discovered = false;
  
  const DudesCab::Device::Version DudesCab::Device::s_minimalMxVersion(1, 9, 0);
-@@ -109,7 +110,7 @@ void DudesCab::Instrumentation(const std::string& message) { Log::Instrumentatio
+@@ -61,13 +64,18 @@ void DudesCab::SetNumber(int value)
+ 
+       m_number = value;
+ 
+-      auto it = std::find_if(s_devices.begin(), s_devices.end(), [this](Device* d) { return d->UnitNo() == m_number; });
+-
+-      if (it != s_devices.end())
++      // VPE: the cabinet check leaves the device list of a running session alone: it neither reads it nor holds an
++      // iterator into it, which a session that ends could clear meanwhile.
++      if (!OutputControllerList::IsChecking())
+       {
+-         m_dev = *it;
+-         SetNumberOfOutputs(m_dev->NumOutputs());
+-         m_oldOutputValues.assign(GetNumberOfOutputs(), 255);
++         auto it = std::find_if(s_devices.begin(), s_devices.end(), [this](Device* d) { return d->UnitNo() == m_number; });
++
++         if (it != s_devices.end())
++         {
++            m_dev = *it;
++            SetNumberOfOutputs(m_dev->NumOutputs());
++            m_oldOutputValues.assign(GetNumberOfOutputs(), 255);
++         }
+       }
+    }
+ }
+@@ -109,7 +117,7 @@ void DudesCab::Instrumentation(const std::string& message) { Log::Instrumentatio
  
  void DudesCab::UpdateOutputs(const std::vector<uint8_t>& newOutputValues)
  {
@@ -2263,7 +2646,7 @@ index b9a8fd5..8f6d8de 100644
        throw std::runtime_error(StringExtensions::Build("Dude's Cab {0} is not connected", GetName()));
  
     const bool fullTransfer = m_forceFullTransfer || m_cacheInvalid;
-@@ -178,7 +179,11 @@ void DudesCab::UpdateOutputs(const std::vector<uint8_t>& newOutputValues)
+@@ -178,7 +186,11 @@ void DudesCab::UpdateOutputs(const std::vector<uint8_t>& newOutputValues)
  
        Instrumentation(StringExtensions::Build("{0} Dof Values to send to Dude's cab", std::to_string(nbValuesToSend)));
  
@@ -2276,7 +2659,7 @@ index b9a8fd5..8f6d8de 100644
        if (m_dev->LastWriteFailed())
        {
           m_cacheInvalid = true;
-@@ -202,19 +207,23 @@ void DudesCab::UpdateDelay()
+@@ -202,19 +214,23 @@ void DudesCab::UpdateDelay()
  
  void DudesCab::ConnectToController()
  {
@@ -2309,7 +2692,7 @@ index b9a8fd5..8f6d8de 100644
     if (GetNumberOfOutputs() != m_dev->NumOutputs())
        SetNumberOfOutputs(m_dev->NumOutputs());
     m_oldOutputValues.assign(GetNumberOfOutputs(), 0);
-@@ -225,9 +234,12 @@ void DudesCab::DisconnectFromController()
+@@ -225,9 +241,12 @@ void DudesCab::DisconnectFromController()
  {
     if (m_inUseState == InUseState::Running && m_dev)
     {
@@ -2324,7 +2707,7 @@ index b9a8fd5..8f6d8de 100644
     }
  }
  
-@@ -245,14 +257,20 @@ void DudesCab::ClearDevices()
+@@ -245,14 +264,20 @@ void DudesCab::ClearDevices()
  {
     for (Device* device : s_devices)
        delete device;
@@ -2345,7 +2728,7 @@ index b9a8fd5..8f6d8de 100644
  
     std::vector<Device*> dudedevices;
     std::vector<Device*> devices;
-@@ -354,6 +372,7 @@ std::vector<DudesCab::Device*> DudesCab::FindDevices()
+@@ -354,6 +379,7 @@ std::vector<DudesCab::Device*> DudesCab::FindDevices()
                       devices.push_back(newDevice);
                    else if (deviceRid == Device::RIDType::RIDOutputsMx)
                    {
@@ -2353,7 +2736,7 @@ index b9a8fd5..8f6d8de 100644
                       if (newDevice->SupportMx())
                       {
                          UMXDudesCabDevice* dudeUMX = new UMXDudesCabDevice();
-@@ -494,14 +513,14 @@ std::string HidString(const wchar_t* text)
+@@ -494,14 +520,14 @@ std::string HidString(const wchar_t* text)
  
  }
  
@@ -2372,7 +2755,7 @@ index b9a8fd5..8f6d8de 100644
     if (!HasSerial())
        return false;
     const char* candidate = nullptr;
-@@ -527,15 +546,35 @@ bool DudesCab::Device::Reopen()
+@@ -527,15 +553,35 @@ bool DudesCab::Device::Reopen()
        candidate = cur->path;
        break;
     }
@@ -2411,7 +2794,7 @@ index b9a8fd5..8f6d8de 100644
        return false;
     m_lastWriteFailed = false;
     m_needsReopen = false;
-@@ -705,13 +744,25 @@ void DudesCab::Device::SendCommand(HIDReportTypeMx command, const std::vector<ui
+@@ -705,13 +751,25 @@ void DudesCab::Device::SendCommand(HIDReportTypeMx command, const std::vector<ui
        SendCommand(m_deviceRid, static_cast<uint8_t>(command), parameters);
  }
  
@@ -2439,7 +2822,7 @@ index b9a8fd5..8f6d8de 100644
     }
     m_lastWriteFailed = false;
  
-@@ -744,12 +795,15 @@ void DudesCab::Device::SendCommand(RIDType rid, uint8_t command, const std::vect
+@@ -744,12 +802,15 @@ void DudesCab::Device::SendCommand(RIDType rid, uint8_t command, const std::vect
           sendData.insert(sendData.end(), data.begin() + startPos, data.begin() + startPos + toSend);
        }
  
@@ -2455,18 +2838,28 @@ index b9a8fd5..8f6d8de 100644
  }
  
  DudesCab::Device::HIDCommonReportType DudesCab::Device::RemapCommonCommand(HIDCommonReportType command)
-@@ -832,7 +886,10 @@ bool DudesCab::FromXml(const tinyxml2::XMLElement* element)
+@@ -830,15 +891,12 @@ bool DudesCab::FromXml(const tinyxml2::XMLElement* element)
+    const tinyxml2::XMLElement* numberElement = element->FirstChildElement("Number");
+    if (numberElement && numberElement->GetText())
     {
-       try
-       {
+-      try
+-      {
 -         int number = std::stoi(numberElement->GetText());
-+         // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board.
-+         int number = 0;
-+         if (!StringExtensions::TryParseInt(numberElement->GetText(), number))
-+            return false;
-          SetNumber(number);
-       }
-       catch (...)
+-         SetNumber(number);
+-      }
+-      catch (...)
+-      {
+-         return false;
+-      }
++      // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board. A
++      // controller that cannot be read says why (OutputControllerList::Load), as does a setter that refuses the number.
++      int number = 0;
++      if (!StringExtensions::TryParseInt(numberElement->GetText(), number))
++         throw std::invalid_argument(StringExtensions::Build("Number \"{0}\" is not a whole number", std::string(numberElement->GetText())));
++      SetNumber(number);
+    }
+ 
+    const tinyxml2::XMLElement* intervalElement = element->FirstChildElement("MinCommandIntervalMs");
 diff --git a/src/cab/out/dudescab/DudesCab.h b/src/cab/out/dudescab/DudesCab.h
 index a42d974..9b2749c 100644
 --- a/src/cab/out/dudescab/DudesCab.h
@@ -2567,7 +2960,7 @@ index 4a73aec..e24fc86 100644
     bool IsLost() const override { return m_device && m_device->IsLost(); }
     void Release() override;
 diff --git a/src/cab/out/ftdichip/FT245RBitbangController.cpp b/src/cab/out/ftdichip/FT245RBitbangController.cpp
-index 4c0f5f7..adb5973 100644
+index 4c0f5f7..055489b 100644
 --- a/src/cab/out/ftdichip/FT245RBitbangController.cpp
 +++ b/src/cab/out/ftdichip/FT245RBitbangController.cpp
 @@ -7,6 +7,7 @@
@@ -2718,18 +3111,28 @@ index 4c0f5f7..adb5973 100644
  
     if (m_ftdi)
     {
-@@ -460,7 +504,10 @@ bool FT245RBitbangController::FromXml(const tinyxml2::XMLElement* element)
+@@ -458,15 +502,12 @@ bool FT245RBitbangController::FromXml(const tinyxml2::XMLElement* element)
+    const tinyxml2::XMLElement* idElement = element->FirstChildElement("Id");
+    if (idElement && idElement->GetText())
     {
-       try
-       {
+-      try
+-      {
 -         int id = std::stoi(idElement->GetText());
-+         // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board.
-+         int id = 0;
-+         if (!StringExtensions::TryParseInt(idElement->GetText(), id))
-+            return false;
-          SetId(id);
-       }
-       catch (...)
+-         SetId(id);
+-      }
+-      catch (...)
+-      {
+-         return false;
+-      }
++      // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board. A
++      // controller that cannot be read says why (OutputControllerList::Load), as does a setter that refuses the number.
++      int id = 0;
++      if (!StringExtensions::TryParseInt(idElement->GetText(), id))
++         throw std::invalid_argument(StringExtensions::Build("Id \"{0}\" is not a whole number", std::string(idElement->GetText())));
++      SetId(id);
+    }
+ 
+    return true;
 diff --git a/src/cab/out/ftdichip/FT245RBitbangController.h b/src/cab/out/ftdichip/FT245RBitbangController.h
 index b90b458..52afc27 100644
 --- a/src/cab/out/ftdichip/FT245RBitbangController.h
@@ -2751,7 +3154,7 @@ index b90b458..52afc27 100644
     int m_firstTryFailCnt;
  
 diff --git a/src/cab/out/lw/LedWiz.cpp b/src/cab/out/lw/LedWiz.cpp
-index 21cda40..24d0b1c 100644
+index 21cda40..c6c9973 100644
 --- a/src/cab/out/lw/LedWiz.cpp
 +++ b/src/cab/out/lw/LedWiz.cpp
 @@ -1,5 +1,6 @@
@@ -2824,20 +3227,16 @@ index 21cda40..24d0b1c 100644
  
     IOutput* recalculatedOutput = ScheduledSettings::GetInstance().GetNewRecalculatedOutput(output, 1, m_number - 1);
     LedWizOutput recalculatedLedWizOutput(lwo->GetLedWizOutputNumber());
-@@ -409,17 +429,20 @@ bool LedWiz::FromXml(const tinyxml2::XMLElement* element)
+@@ -409,18 +429,16 @@ bool LedWiz::FromXml(const tinyxml2::XMLElement* element)
     if (nameElement && nameElement->GetText())
        SetName(nameElement->GetText());
  
 +   // VPE: the number selects the unit; without one the controller would drive no unit and fail its Init, which fails
-+   // the whole cabinet, so it is not read. The whole text is the number: one that only starts with a number ("2.5")
-+   // selects no unit.
++   // the whole cabinet, so it is not read, and says why (OutputControllerList::Load), as does SetNumber for one out of
++   // range. The whole text is the number: one that only starts with a number ("2.5") selects no unit.
     const tinyxml2::XMLElement* numberElement = element->FirstChildElement("Number");
 -   if (numberElement && numberElement->GetText())
-+   int number = 0;
-+   if (!numberElement || !numberElement->GetText() || !StringExtensions::TryParseInt(numberElement->GetText(), number))
-+      return false;
-+   try
-    {
+-   {
 -      try
 -      {
 -         SetNumber(std::stoi(numberElement->GetText()));
@@ -2846,15 +3245,17 @@ index 21cda40..24d0b1c 100644
 -      {
 -         return false;
 -      }
-+      SetNumber(number);
-+   }
-+   catch (...)
-+   {
-+      return false;
-    }
+-   }
++   if (!numberElement || !numberElement->GetText())
++      throw std::invalid_argument("no Number");
++   int number = 0;
++   if (!StringExtensions::TryParseInt(numberElement->GetText(), number))
++      throw std::invalid_argument(StringExtensions::Build("Number \"{0}\" is not a whole number", std::string(numberElement->GetText())));
++   SetNumber(number);
  
     const tinyxml2::XMLElement* intervalElement = element->FirstChildElement("MinCommandIntervalMs");
-@@ -485,15 +508,59 @@ LedWiz::LedWizUnit::~LedWizUnit()
+    if (intervalElement && intervalElement->GetText())
+@@ -485,15 +503,59 @@ LedWiz::LedWizUnit::~LedWizUnit()
  void LedWiz::LedWizUnit::Init(Cabinet* cabinet, int minCommandIntervalMs)
  {
     m_minCommandIntervalMs = minCommandIntervalMs;
@@ -2915,7 +3316,7 @@ index 21cda40..24d0b1c 100644
  }
  
  void LedWiz::LedWizUnit::UpdateValue(LedWizOutput* ledWizOutput)
-@@ -616,35 +683,67 @@ void LedWiz::LedWizUnit::LedWizUpdaterDoIt()
+@@ -616,35 +678,67 @@ void LedWiz::LedWizUnit::LedWizUpdaterDoIt()
  {
     Log::Write(StringExtensions::Build("Updater thread for LedWiz {0:00} started.", std::to_string(m_number)));
  
@@ -2993,7 +3394,7 @@ index 21cda40..24d0b1c 100644
           failCnt++;
           if (failCnt > MAX_UPDATE_FAIL_COUNT)
           {
-@@ -654,13 +753,14 @@ void LedWiz::LedWizUnit::LedWizUpdaterDoIt()
+@@ -654,13 +748,14 @@ void LedWiz::LedWizUnit::LedWizUpdaterDoIt()
           }
        }
  
@@ -3010,7 +3411,7 @@ index 21cda40..24d0b1c 100644
                 break;
           }
        }
-@@ -668,6 +768,33 @@ void LedWiz::LedWizUnit::LedWizUpdaterDoIt()
+@@ -668,6 +763,33 @@ void LedWiz::LedWizUnit::LedWizUpdaterDoIt()
     }
  
     Log::Write(StringExtensions::Build("Updater thread for LedWiz {0:00} terminated.", std::to_string(m_number)));
@@ -3044,7 +3445,7 @@ index 21cda40..24d0b1c 100644
     m_updaterThreadFinished = true;
  }
  
-@@ -688,15 +815,20 @@ void LedWiz::LedWizUnit::UpdateDelay()
+@@ -688,15 +810,20 @@ void LedWiz::LedWizUnit::UpdateDelay()
     m_lastUpdate = std::chrono::steady_clock::now();
  }
  
@@ -3067,7 +3468,7 @@ index 21cda40..24d0b1c 100644
           CopyNewToCurrent();
           m_updateRequired = false;
        }
-@@ -711,6 +843,7 @@ void LedWiz::LedWizUnit::SendLedWizUpdate()
+@@ -711,6 +838,7 @@ void LedWiz::LedWizUnit::SendLedWizUpdate()
        if (m_currentSwitchUpdateAfterValueUpdateRequired || (m_currentSwitchUpdateBeforeValueUpdateRequired && !m_currentValueUpdateRequired) || pbaTimeout)
           SBA(m_currentAfterValueSwitches.data());
     }
@@ -3075,7 +3476,7 @@ index 21cda40..24d0b1c 100644
  }
  
  void LedWiz::LedWizUnit::ShutdownLighting()
-@@ -742,6 +875,8 @@ void LedWiz::LedWizUnit::WriteUSB(const uint8_t* buf, size_t length)
+@@ -742,6 +870,8 @@ void LedWiz::LedWizUnit::WriteUSB(const uint8_t* buf, size_t length)
        UpdateDelay();
        for (int tries = 0; tries < static_cast<int>(std::size(s_retryWait)); ++tries)
        {
@@ -3461,16 +3862,17 @@ index c71dc9d..01698a1 100644
     bool PacLed64SetLEDStates(int index, int group, uint8_t data);
     bool PacLed64SetLEDFadeTime(int index, uint8_t fadeTime);
 diff --git a/src/cab/out/pac/PacLed64.cpp b/src/cab/out/pac/PacLed64.cpp
-index 71fcd00..9841c6c 100644
+index 71fcd00..bc69ab6 100644
 --- a/src/cab/out/pac/PacLed64.cpp
 +++ b/src/cab/out/pac/PacLed64.cpp
-@@ -1,4 +1,5 @@
+@@ -1,4 +1,6 @@
  #include "PacLed64.h"
++#include <stdexcept>
 +#include "../OutputGate.h"
  #include "PacDriveSingleton.h"
  #include "../../../Log.h"
  #include "../../../general/StringExtensions.h"
-@@ -7,6 +8,7 @@
+@@ -7,6 +9,7 @@
  #include "../../../cab/CabinetOwner.h"
  
  #include <algorithm>
@@ -3478,7 +3880,7 @@ index 71fcd00..9841c6c 100644
  #include <cstring>
  #include <thread>
  #include <condition_variable>
-@@ -17,6 +19,9 @@
+@@ -17,6 +20,9 @@
  namespace DOF
  {
  
@@ -3488,22 +3890,26 @@ index 71fcd00..9841c6c 100644
  std::map<int, PacLed64::PacLed64Unit*> PacLed64::s_pacLed64Units;
  bool PacLed64::s_unitsInitialized = false;
  
-@@ -46,7 +51,13 @@ PacLed64::PacLed64(int id)
+@@ -46,7 +52,17 @@ PacLed64::PacLed64(int id)
     SetId(id);
  }
  
 -PacLed64::~PacLed64() { }
 +PacLed64::~PacLed64()
 +{
-+   // VPE: one that was never finished (its cabinet failed) does not keep the unit in use for the next session.
-+   auto unit = s_pacLed64Units.find(m_id);
-+   if (m_usesUnit && unit != s_pacLed64Units.end())
-+      unit->second->RemoveUser();
++   // VPE: one that was never finished (its cabinet failed) does not keep the unit in use for the next session. One that
++   // never used a unit (read only, as the cabinet check does) leaves the units alone.
++   if (m_usesUnit)
++   {
++      auto unit = s_pacLed64Units.find(m_id);
++      if (unit != s_pacLed64Units.end())
++         unit->second->RemoveUser();
++   }
 +}
  
  void PacLed64::SetId(int value)
  {
-@@ -94,17 +105,36 @@ void PacLed64::Init(Cabinet* cabinet)
+@@ -94,17 +110,36 @@ void PacLed64::Init(Cabinet* cabinet)
     InitializeUnits();
     s_pacLed64Units.at(m_id)->SetFullUpdateThreshold(m_fullUpdateThreshold);
     s_pacLed64Units.at(m_id)->SetMinUpdateInterval(std::chrono::milliseconds(m_minUpdateIntervalMs));
@@ -3544,7 +3950,7 @@ index 71fcd00..9841c6c 100644
     }
     Log::Write(StringExtensions::Build("PacLed64 Id:{0} finished and updater thread stopped.", std::to_string(m_id)));
  }
-@@ -183,9 +213,14 @@ bool PacLed64::FromXml(const tinyxml2::XMLElement* element)
+@@ -183,9 +218,17 @@ bool PacLed64::FromXml(const tinyxml2::XMLElement* element)
     if (name)
        SetName(name);
  
@@ -3552,17 +3958,20 @@ index 71fcd00..9841c6c 100644
 -   if (id != -1)
 -      SetId(id);
 +   // VPE: the Id selects the unit; without one (or with one that is not a number) the controller would drive no unit
-+   // and fail its Init, which fails the whole cabinet, so it is not read. The whole text is the number: one that only
-+   // starts with a number ("0.5", "1old") selects no unit.
++   // and fail its Init, which fails the whole cabinet, so it is not read, and says why (OutputControllerList::Load), as
++   // does SetId for one out of range. The whole text is the number: one that only starts with a number ("0.5", "1old")
++   // selects no unit.
 +   const char* idText = element->Attribute("Id");
++   if (!idText)
++      throw std::invalid_argument("no Id");
 +   int id = -1;
-+   if (!idText || !StringExtensions::TryParseInt(idText, id))
-+      return false;
++   if (!StringExtensions::TryParseInt(idText, id))
++      throw std::invalid_argument(StringExtensions::Build("Id \"{0}\" is not a whole number", std::string(idText)));
 +   SetId(id);
  
     int minInterval = element->IntAttribute("MinUpdateIntervalMs", -1);
     if (minInterval != -1)
-@@ -221,14 +256,18 @@ void PacLed64::PacLed64Unit::Init(Cabinet* cabinet)
+@@ -221,14 +264,18 @@ void PacLed64::PacLed64Unit::Init(Cabinet* cabinet)
  {
     m_index = PacDriveSingleton::GetInstance().PacLed64GetIndexForDeviceId(m_id);
  
@@ -3581,7 +3990,7 @@ index 71fcd00..9841c6c 100644
        Log::Warning(StringExtensions::Build("PacLed64 device {0} not found", std::to_string(m_id)));
     }
  }
-@@ -236,16 +275,30 @@ void PacLed64::PacLed64Unit::Init(Cabinet* cabinet)
+@@ -236,16 +283,30 @@ void PacLed64::PacLed64Unit::Init(Cabinet* cabinet)
  void PacLed64::PacLed64Unit::Finish()
  {
     TerminatePacLed64UpdaterThread();
@@ -3613,7 +4022,7 @@ index 71fcd00..9841c6c 100644
     m_index = -1;
  }
  
-@@ -323,6 +376,7 @@ void PacLed64::PacLed64Unit::TerminatePacLed64UpdaterThread()
+@@ -323,6 +384,7 @@ void PacLed64::PacLed64Unit::TerminatePacLed64UpdaterThread()
  
  void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
  {
@@ -3621,7 +4030,7 @@ index 71fcd00..9841c6c 100644
     try
     {
        ResetFadeTime();
-@@ -330,6 +384,7 @@ void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
+@@ -330,6 +392,7 @@ void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
     catch (const std::exception& e)
     {
        Log::Exception(StringExtensions::Build("Exception occurred while setting fade time for PacLed64 {0} to 0: {1}", std::to_string(m_index), e.what()));
@@ -3629,7 +4038,7 @@ index 71fcd00..9841c6c 100644
        m_updaterThreadFinished = true;
        return;
     }
-@@ -337,16 +392,27 @@ void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
+@@ -337,16 +400,27 @@ void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
     int failCount = 0;
     while (m_keepPacLed64UpdaterAlive)
     {
@@ -3658,7 +4067,7 @@ index 71fcd00..9841c6c 100644
           Log::Exception(StringExtensions::Build("Error occurred when updating PacLed64 {0}: {1}", std::to_string(m_id), e.what()));
           failCount++;
  
-@@ -365,30 +431,78 @@ void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
+@@ -365,30 +439,78 @@ void PacLed64::PacLed64Unit::PacLed64UpdaterDoIt()
        }
        m_triggerUpdate = false;
     }
@@ -3741,7 +4150,7 @@ index 71fcd00..9841c6c 100644
              updatesRequired++;
        }
     }
-@@ -396,41 +510,56 @@ void PacLed64::PacLed64Unit::SendPacLed64Update()
+@@ -396,41 +518,56 @@ void PacLed64::PacLed64Unit::SendPacLed64Update()
     if (m_forceFullUpdate || updatesRequired > m_fullUpdateThreshold)
     {
        EnforceMinUpdateInterval();
@@ -3869,17 +4278,18 @@ index 640daa8..7a6da19 100644
        void ResetFadeTime();
        void EnforceMinUpdateInterval();
 diff --git a/src/cab/out/pac/PacUIO.cpp b/src/cab/out/pac/PacUIO.cpp
-index e35bbf8..d2635df 100644
+index e35bbf8..7e3de7d 100644
 --- a/src/cab/out/pac/PacUIO.cpp
 +++ b/src/cab/out/pac/PacUIO.cpp
-@@ -1,5 +1,6 @@
+@@ -1,5 +1,7 @@
  #include "PacUIO.h"
++#include <stdexcept>
  #include "PacDriveSingleton.h"
 +#include "../OutputGate.h"
  #include "../../Cabinet.h"
  #include "../OutputControllerList.h"
  #include "../Output.h"
-@@ -13,6 +14,9 @@
+@@ -13,6 +15,9 @@
  namespace DOF
  {
  
@@ -3889,7 +4299,7 @@ index e35bbf8..d2635df 100644
  std::map<int, PacUIO::PacUIOUnit*> PacUIO::s_pacUIOUnits;
  bool PacUIO::s_unitsInitialized = false;
  
-@@ -56,14 +60,34 @@ void PacUIO::Init(Cabinet* cabinet)
+@@ -56,14 +61,34 @@ void PacUIO::Init(Cabinet* cabinet)
  {
     AddOutputs();
     InitializeUnits();
@@ -3926,22 +4336,26 @@ index e35bbf8..d2635df 100644
     Log::Write(StringExtensions::Build("PacUIO Id:{0} finished and updater thread stopped.", std::to_string(m_id)));
  }
  
-@@ -112,7 +136,13 @@ PacUIO::PacUIO() { }
+@@ -112,7 +137,17 @@ PacUIO::PacUIO() { }
  
  PacUIO::PacUIO(int id) { SetId(id); }
  
 -PacUIO::~PacUIO() { }
 +PacUIO::~PacUIO()
 +{
-+   // VPE: one that was never finished (its cabinet failed) does not keep the unit in use for the next session.
-+   auto unit = s_pacUIOUnits.find(m_id);
-+   if (m_usesUnit && unit != s_pacUIOUnits.end())
-+      unit->second->RemoveUser();
++   // VPE: one that was never finished (its cabinet failed) does not keep the unit in use for the next session. One that
++   // never used a unit (read only, as the cabinet check does) leaves the units alone.
++   if (m_usesUnit)
++   {
++      auto unit = s_pacUIOUnits.find(m_id);
++      if (unit != s_pacUIOUnits.end())
++         unit->second->RemoveUser();
++   }
 +}
  
  tinyxml2::XMLElement* PacUIO::ToXml(tinyxml2::XMLDocument& doc) const
  {
-@@ -135,9 +165,14 @@ bool PacUIO::FromXml(const tinyxml2::XMLElement* element)
+@@ -135,9 +170,17 @@ bool PacUIO::FromXml(const tinyxml2::XMLElement* element)
     if (name)
        SetName(name);
  
@@ -3949,17 +4363,20 @@ index e35bbf8..d2635df 100644
 -   if (id != -1)
 -      SetId(id);
 +   // VPE: the Id selects the unit; without one (or with one that is not a number) the controller would drive no unit
-+   // and fail its Init, which fails the whole cabinet, so it is not read. The whole text is the number: one that only
-+   // starts with a number ("0.5", "1old") selects no unit.
++   // and fail its Init, which fails the whole cabinet, so it is not read, and says why (OutputControllerList::Load), as
++   // does SetId for one out of range. The whole text is the number: one that only starts with a number ("0.5", "1old")
++   // selects no unit.
 +   const char* idText = element->Attribute("Id");
++   if (!idText)
++      throw std::invalid_argument("no Id");
 +   int id = -1;
-+   if (!idText || !StringExtensions::TryParseInt(idText, id))
-+      return false;
++   if (!StringExtensions::TryParseInt(idText, id))
++      throw std::invalid_argument(StringExtensions::Build("Id \"{0}\" is not a whole number", std::string(idText)));
 +   SetId(id);
  
     return true;
  }
-@@ -162,13 +197,23 @@ void PacUIO::PacUIOUnit::Init(Cabinet* cabinet)
+@@ -162,13 +205,23 @@ void PacUIO::PacUIOUnit::Init(Cabinet* cabinet)
     {
        m_pdSingleton = &PacDriveSingleton::GetInstance();
        m_index = m_pdSingleton->PacUIOGetIndexForDeviceId(m_id);
@@ -3990,7 +4407,7 @@ index e35bbf8..d2635df 100644
     }
     StartPacUIOUpdaterThread();
  }
-@@ -176,7 +221,29 @@ void PacUIO::PacUIOUnit::Init(Cabinet* cabinet)
+@@ -176,7 +229,29 @@ void PacUIO::PacUIOUnit::Init(Cabinet* cabinet)
  void PacUIO::PacUIOUnit::Finish()
  {
     TerminatePacUIOUpdaterThread();
@@ -4021,7 +4438,7 @@ index e35bbf8..d2635df 100644
  }
  
  void PacUIO::PacUIOUnit::UpdateValue(IOutput* output)
-@@ -237,6 +304,7 @@ void PacUIO::PacUIOUnit::TriggerPacUIOUpdaterThread()
+@@ -237,6 +312,7 @@ void PacUIO::PacUIOUnit::TriggerPacUIOUpdaterThread()
  
  void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
  {
@@ -4029,7 +4446,7 @@ index e35bbf8..d2635df 100644
     try
     {
        ResetFadeTime();
-@@ -244,6 +312,7 @@ void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
+@@ -244,6 +320,7 @@ void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
     catch (const std::exception& e)
     {
        Log::Exception(StringExtensions::Build("A exception occurred while setting the fadetime for PacUIO {0} to 0.", std::to_string(m_index)));
@@ -4037,7 +4454,7 @@ index e35bbf8..d2635df 100644
        m_updaterThreadFinished = true;
        return;
     }
-@@ -251,16 +320,27 @@ void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
+@@ -251,16 +328,27 @@ void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
     int failCnt = 0;
     while (m_keepPacUIOUpdaterAlive.load())
     {
@@ -4066,7 +4483,7 @@ index e35bbf8..d2635df 100644
           Log::Exception(StringExtensions::Build("A error occurred when updating PacUIO {0}", std::to_string(m_id)));
           failCnt++;
  
-@@ -279,68 +359,129 @@ void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
+@@ -279,68 +367,129 @@ void PacUIO::PacUIOUnit::PacUIOUpdaterDoIt()
        }
        m_triggerUpdate.store(false);
     }
@@ -4272,10 +4689,16 @@ index 0da2310..2d7cb23 100644
        void InitUnit();
  
 diff --git a/src/cab/out/pinone/PinOne.cpp b/src/cab/out/pinone/PinOne.cpp
-index 4fedb04..de74817 100644
+index 4fedb04..eae9a0b 100644
 --- a/src/cab/out/pinone/PinOne.cpp
 +++ b/src/cab/out/pinone/PinOne.cpp
-@@ -241,18 +241,13 @@ void PinOne::ConnectToController()
+@@ -1,4 +1,5 @@
+ #include "PinOne.h"
++#include <stdexcept>
+ #include "PinOneCommunication.h"
+ #include "PinOneHidCommunication.h"
+ #include "../../Cabinet.h"
+@@ -241,18 +242,13 @@ void PinOne::ConnectToController()
        if (m_pinOneCommunication)
           DisconnectFromController();
  
@@ -4298,18 +4721,28 @@ index 4fedb04..de74817 100644
        }
     }
     catch (const std::exception& e)
-@@ -296,7 +291,10 @@ bool PinOne::FromXml(const tinyxml2::XMLElement* element)
+@@ -294,15 +290,12 @@ bool PinOne::FromXml(const tinyxml2::XMLElement* element)
+    const tinyxml2::XMLElement* numberElement = element->FirstChildElement("Number");
+    if (numberElement && numberElement->GetText())
     {
-       try
-       {
+-      try
+-      {
 -         int number = std::stoi(numberElement->GetText());
-+         // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board.
-+         int number = 0;
-+         if (!StringExtensions::TryParseInt(numberElement->GetText(), number))
-+            return false;
-          SetNumber(number);
-       }
-       catch (...)
+-         SetNumber(number);
+-      }
+-      catch (...)
+-      {
+-         return false;
+-      }
++      // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board. A
++      // controller that cannot be read says why (OutputControllerList::Load), as does a setter that refuses the number.
++      int number = 0;
++      if (!StringExtensions::TryParseInt(numberElement->GetText(), number))
++         throw std::invalid_argument(StringExtensions::Build("Number \"{0}\" is not a whole number", std::string(numberElement->GetText())));
++      SetNumber(number);
+    }
+ 
+    const tinyxml2::XMLElement* intervalElement = element->FirstChildElement("MinCommandIntervalMs");
 diff --git a/src/cab/out/pinone/PinOneAutoConfigurator.cpp b/src/cab/out/pinone/PinOneAutoConfigurator.cpp
 index 912cb2e..1ced542 100644
 --- a/src/cab/out/pinone/PinOneAutoConfigurator.cpp
@@ -4771,10 +5204,38 @@ index c26b815..b4d7c33 100644
        if (actual < 0)
        {
 diff --git a/src/cab/out/ps/Pinscape.cpp b/src/cab/out/ps/Pinscape.cpp
-index f257bbe..ef90abb 100644
+index f257bbe..12fdfb2 100644
 --- a/src/cab/out/ps/Pinscape.cpp
 +++ b/src/cab/out/ps/Pinscape.cpp
-@@ -155,6 +155,11 @@ void Pinscape::UpdateOutputs(const std::vector<uint8_t>& newOutputValues)
+@@ -1,4 +1,6 @@
+ #include "Pinscape.h"
++#include <stdexcept>
++#include "../OutputControllerList.h"
+ 
+ #include <algorithm>
+ #include <cstdint>
+@@ -58,12 +60,16 @@ void Pinscape::SetNumber(int value)
+ 
+       m_number = value;
+ 
+-      for (Device* device : s_devices)
++      // VPE: the cabinet check leaves the device list of a running session alone.
++      if (!OutputControllerList::IsChecking())
+       {
+-         if (device->GetUnitNo() == value)
++         for (Device* device : s_devices)
+          {
+-            m_dev = device;
+-            break;
++            if (device->GetUnitNo() == value)
++            {
++               m_dev = device;
++               break;
++            }
+          }
+       }
+ 
+@@ -155,6 +161,11 @@ void Pinscape::UpdateOutputs(const std::vector<uint8_t>& newOutputValues)
           if (j < static_cast<int>(newOutputValues.size()) && (full || newOutputValues[j] != m_oldOutputValues[j]))
           {
              UpdateDelay();
@@ -4786,29 +5247,40 @@ index f257bbe..ef90abb 100644
  
              uint8_t buf[9] = { 0 };
              buf[0] = 0;
-@@ -274,7 +279,10 @@ bool Pinscape::FromXml(const tinyxml2::XMLElement* element)
+@@ -272,15 +283,12 @@ bool Pinscape::FromXml(const tinyxml2::XMLElement* element)
+    const tinyxml2::XMLElement* numberElement = element->FirstChildElement("Number");
+    if (numberElement && numberElement->GetText())
     {
-       try
-       {
+-      try
+-      {
 -         int number = std::stoi(numberElement->GetText());
-+         // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board.
-+         int number = 0;
-+         if (!StringExtensions::TryParseInt(numberElement->GetText(), number))
-+            return false;
-          SetNumber(number);
-       }
-       catch (...)
+-         SetNumber(number);
+-      }
+-      catch (...)
+-      {
+-         return false;
+-      }
++      // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board. A
++      // controller that cannot be read says why (OutputControllerList::Load), as does a setter that refuses the number.
++      int number = 0;
++      if (!StringExtensions::TryParseInt(numberElement->GetText(), number))
++         throw std::invalid_argument(StringExtensions::Build("Number \"{0}\" is not a whole number", std::string(numberElement->GetText())));
++      SetNumber(number);
+    }
+ 
+    const tinyxml2::XMLElement* intervalElement = element->FirstChildElement("MinCommandIntervalMs");
 diff --git a/src/cab/out/pspico/PinscapePico.cpp b/src/cab/out/pspico/PinscapePico.cpp
-index 8beea61..7ca843f 100644
+index 8beea61..393e109 100644
 --- a/src/cab/out/pspico/PinscapePico.cpp
 +++ b/src/cab/out/pspico/PinscapePico.cpp
-@@ -1,4 +1,5 @@
+@@ -1,4 +1,6 @@
  #include "PinscapePico.h"
++#include <stdexcept>
 +#include "../OutputGate.h"
  
  #include <algorithm>
  #include <chrono>
-@@ -10,6 +11,7 @@
+@@ -10,6 +12,7 @@
  #include <string>
  #include <thread>
  #include <regex>
@@ -4816,7 +5288,7 @@ index 8beea61..7ca843f 100644
  
  #ifdef _WIN32
  #define WIN32_LEAN_AND_MEAN
-@@ -141,7 +143,7 @@ public:
+@@ -141,7 +144,7 @@ public:
     virtual int PacketCount() const = 0;
     virtual int PortCount() const = 0;
     virtual void Add(int port, int value, bool changed) = 0;
@@ -4825,7 +5297,7 @@ index 8beea61..7ca843f 100644
  };
  
  class RandomAccessOutputList
-@@ -190,10 +192,12 @@ public:
+@@ -190,10 +193,12 @@ public:
        }
     }
  
@@ -4839,7 +5311,7 @@ index 8beea61..7ca843f 100644
           uint8_t buf[64] = { 0 };
           buf[0] = psp->m_dev->GetOutputReportId();
           buf[1] = 0x22;
-@@ -208,6 +212,7 @@ public:
+@@ -208,6 +213,7 @@ public:
           if (!psp->m_dev->WriteUSB("SET OUTPUT PORTS", buf, 100))
              throw std::runtime_error("PinscapePico SET OUTPUT PORTS failed");
        }
@@ -4847,7 +5319,7 @@ index 8beea61..7ca843f 100644
     }
  
  private:
-@@ -280,10 +285,12 @@ public:
+@@ -280,10 +286,12 @@ public:
        }
     }
  
@@ -4861,7 +5333,7 @@ index 8beea61..7ca843f 100644
           uint8_t buf[64] = { 0 };
           buf[0] = psp->m_dev->GetOutputReportId();
           buf[1] = 0x21;
-@@ -296,6 +303,7 @@ public:
+@@ -296,6 +304,7 @@ public:
           if (!psp->m_dev->WriteUSB("SET OUTPUT PORT BLOCK", buf, 100))
              throw std::runtime_error("PinscapePico SET OUTPUT PORT BLOCK failed");
        }
@@ -4869,7 +5341,7 @@ index 8beea61..7ca843f 100644
     }
  
  private:
-@@ -336,10 +344,13 @@ void PinscapePico::UpdateOutputs(const std::vector<uint8_t>& newOutputValues)
+@@ -336,10 +345,13 @@ void PinscapePico::UpdateOutputs(const std::vector<uint8_t>& newOutputValues)
     }
  
     m_cacheInvalid = true;
@@ -4885,19 +5357,29 @@ index 8beea61..7ca843f 100644
     m_cacheInvalid = false;
  
     if (firstChangedIndex >= 0)
-@@ -482,7 +493,10 @@ bool PinscapePico::FromXml(const tinyxml2::XMLElement* element)
+@@ -480,15 +492,12 @@ bool PinscapePico::FromXml(const tinyxml2::XMLElement* element)
+    const tinyxml2::XMLElement* numberElement = element->FirstChildElement("Number");
+    if (numberElement && numberElement->GetText())
     {
-       try
-       {
+-      try
+-      {
 -         int number = std::stoi(numberElement->GetText());
-+         // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board.
-+         int number = 0;
-+         if (!StringExtensions::TryParseInt(numberElement->GetText(), number))
-+            return false;
-          SetNumber(number);
-       }
-       catch (...)
-@@ -647,11 +661,17 @@ uint8_t* PinscapePico::Device::ReadUSB(uint32_t timeoutMs)
+-         SetNumber(number);
+-      }
+-      catch (...)
+-      {
+-         return false;
+-      }
++      // VPE: the whole text is the number; one that only starts with a number ("1old", "2.5") selects no board. A
++      // controller that cannot be read says why (OutputControllerList::Load), as does a setter that refuses the number.
++      int number = 0;
++      if (!StringExtensions::TryParseInt(numberElement->GetText(), number))
++         throw std::invalid_argument(StringExtensions::Build("Number \"{0}\" is not a whole number", std::string(numberElement->GetText())));
++      SetNumber(number);
+    }
+ 
+    const tinyxml2::XMLElement* intervalElement = element->FirstChildElement("MinCommandIntervalMs");
+@@ -647,11 +656,17 @@ uint8_t* PinscapePico::Device::ReadUSB(uint32_t timeoutMs)
     return nullptr;
  }
  
@@ -4917,7 +5399,7 @@ index 8beea61..7ca843f 100644
     std::string hexString;
     for (size_t i = 0; i < m_outputReportLength; ++i)
     {
-@@ -666,6 +686,9 @@ bool PinscapePico::Device::WriteUSB(const std::string& desc, uint8_t* buf, uint3
+@@ -666,6 +681,9 @@ bool PinscapePico::Device::WriteUSB(const std::string& desc, uint8_t* buf, uint3
     uint32_t actual = 0;
     for (int tries = 0; tries < 3; ++tries)
     {

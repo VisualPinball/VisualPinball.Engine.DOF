@@ -343,6 +343,33 @@ namespace VisualPinball.Engine.DOF.Test
 		}
 
 		[Test]
+		public void ReportsControllersLibdofSkips()
+		{
+			// libdof skips a controller definition it can't read: the import says which and why, in libdof's
+			// words. A type libdof does not support is reported once, as before.
+			const string cabinet = "<?xml version=\"1.0\"?>\r\n<Cabinet><AutoConfigEnabled>false</AutoConfigEnabled><OutputControllers>"
+				+ "<PacUIO Name=\"PacUIO 1\" />"
+				+ "<LedWiz><Name>LedWiz 1</Name></LedWiz>"
+				+ "<PacLed64 Name=\"PacLed64 1\" Id=\"one\" />"
+				+ "<LedWiz><Name>LedWiz 2</Name><Number>17</Number></LedWiz>"
+				+ "<PacUIO Id=\"0\" />"
+				+ "<ArtNet><Name>ArtNet 1</Name><Universe>1</Universe></ArtNet>"
+				+ "<Custom><Name>Custom 1</Name></Custom>"
+				+ "</OutputControllers></Cabinet>\r\n";
+			var report = Accepted(_importer.Import(Folder("skipped",
+				("GlobalConfig_B2SServer.xml", WindowsGlobalConfig), ("cabinet.xml", cabinet), ("directoutputconfig.ini", MainIni))));
+			var skipped = report.Entries.Where(e => e.Message.Contains("libdof can't read")).Select(e => (e.Severity, e.Topic, e.Message)).ToList();
+			Assert.That(skipped, Is.EqualTo(new[] {
+				(DofReportSeverity.Warning, DofReportTopic.Unsupported, "cabinet.xml: PacUIO 1 is a PacUIO libdof can't read (no Id); this controller definition is skipped."),
+				(DofReportSeverity.Warning, DofReportTopic.Unsupported, "cabinet.xml: LedWiz 1 is a LedWiz libdof can't read (no Number); this controller definition is skipped."),
+				(DofReportSeverity.Warning, DofReportTopic.Unsupported, "cabinet.xml: PacLed64 1 is a PacLed64 libdof can't read (Id \"one\" is not a whole number); this controller definition is skipped."),
+				(DofReportSeverity.Warning, DofReportTopic.Unsupported, "cabinet.xml: LedWiz 2 is a LedWiz libdof can't read (LedWiz Numbers must be between 1-16. The supplied number 17 is out of range); this controller definition is skipped."),
+			}), report.ToString());
+			Assert.That(report.Entries.Count(e => e.Message.Contains("Custom 1")), Is.EqualTo(1), report.ToString());
+			Assert.That(Has(report, DofReportSeverity.Warning, "Custom 1 is a Custom, which libdof does not support; it is skipped."), Is.True, report.ToString());
+		}
+
+		[Test]
 		public void ReportsIniFilesLibdofSkips()
 		{
 			// DOF skips an ini file without colours entirely; one is enough to fail the import, one of two is a warning.

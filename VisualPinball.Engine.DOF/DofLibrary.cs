@@ -5,6 +5,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using VisualPinball.Engine.DOF.Native;
 
 namespace VisualPinball.Engine.DOF
@@ -38,7 +39,33 @@ namespace VisualPinball.Engine.DOF
 	}
 
 	/// <summary>
-	/// Process-wide functions of VpeDof: version checks, the log sink, the ROM catalog and device enumeration.
+	/// An output controller of a cabinet config, and whether a session loads it or skips it, as libdof reads it.
+	/// </summary>
+	public readonly struct DofCabinetController
+	{
+		/// <summary>libdof's controller type, its XML element name (LedWiz, PacUIO, ArtNet, ...).</summary>
+		public string Type { get; }
+		/// <summary>Its name, or empty if it has none.</summary>
+		public string Name { get; }
+		/// <summary>Whether a session loads this definition. One it skips drives nothing.</summary>
+		public bool Loaded { get; }
+		/// <summary>Why a session skips it, in libdof's words ("no Id", ...); empty for one it loads.</summary>
+		public string Reason { get; }
+
+		public DofCabinetController(string type, string name, bool loaded, string reason)
+		{
+			Type = type;
+			Name = name;
+			Loaded = loaded;
+			Reason = reason;
+		}
+
+		public override string ToString() => Loaded ? $"{Type} {Name}: loaded" : $"{Type} {Name}: skipped, {Reason}";
+	}
+
+	/// <summary>
+	/// Process-wide functions of VpeDof: version checks, the log sink, the ROM catalog, the cabinet check and device
+	/// enumeration.
 	/// </summary>
 	public static class DofLibrary
 	{
@@ -142,6 +169,45 @@ namespace VisualPinball.Engine.DOF
 				}
 			}
 			return rows;
+		}
+
+		/// <summary>
+		/// Reads the output controllers of the cabinet config a configuration folder's global config names, as a session
+		/// would, and says which ones it loads and why it skips the others. Opens no device and starts no thread: needs no
+		/// instance and does not affect a running one.
+		/// </summary>
+		/// <param name="basePath">The folder that contains <c>directoutputconfig/</c>.</param>
+		/// <returns>The controllers in file order; none when the global config names no cabinet config.</returns>
+		/// <exception cref="DofException">What fails a session's init: there is no global config or it cannot be read, or
+		/// the cabinet config it names does not exist or is not valid XML.</exception>
+		public static IReadOnlyList<DofCabinetController> CabinetControllers(string basePath)
+		{
+			EnsureCompatible();
+			var nativeBase = Utf8.Encode(DofPaths.ToNative(basePath));
+			var error = new byte[1024];
+			var controllers = new List<DofCabinetController>();
+			var handle = GCHandle.Alloc(controllers);
+			int count;
+			try {
+				count = DofNative.CabinetControllers(nativeBase, ControllerCallback, GCHandle.ToIntPtr(handle), error, error.Length);
+			} finally {
+				handle.Free();
+			}
+			if (count < 0) {
+				var message = Utf8.DecodeBuffer(error);
+				throw new DofException(DofStatus.Error, string.IsNullOrEmpty(message) ? "Reading the DOF cabinet config failed." : message);
+			}
+			return controllers;
+		}
+
+		private static readonly DofNative.ControllerCallback ControllerCallback = OnController;
+
+		[MonoPInvokeCallback(typeof(DofNative.ControllerCallback))]
+		private static void OnController(int loaded, IntPtr type, IntPtr name, IntPtr reason, IntPtr user)
+		{
+			if (user != IntPtr.Zero && GCHandle.FromIntPtr(user).Target is List<DofCabinetController> controllers) {
+				controllers.Add(new DofCabinetController(Utf8.Decode(type) ?? string.Empty, Utf8.Decode(name) ?? string.Empty, loaded != 0, Utf8.Decode(reason) ?? string.Empty));
+			}
 		}
 
 		/// <summary>Lists connected HID and USB devices and serial ports without opening any of them for output.</summary>

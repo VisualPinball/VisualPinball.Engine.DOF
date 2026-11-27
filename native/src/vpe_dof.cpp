@@ -16,6 +16,7 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <typeinfo>
@@ -40,14 +41,18 @@
 #include "cab/toys/ToyList.h"
 #include "cab/toys/lwequivalent/LedWizEquivalent.h"
 #include "general/FileInfo.h"
+#include "general/FileReader.h"
 #include "general/IOConfigurator.h"
 #include "general/Path.h"
 #include "general/PathConfinement.h"
+#include "general/StringExtensions.h"
 #include "globalconfiguration/GlobalConfig.h"
 #include "ledcontrol/loader/LedControlConfig.h"
 #include "ledcontrol/loader/LedControlConfigList.h"
 #include "ledcontrol/loader/TableConfig.h"
 #include "ledcontrol/loader/TableConfigList.h"
+
+#include <tinyxml2/tinyxml2.h>
 
 namespace
 {
@@ -182,6 +187,25 @@ void LIBDOFCALLBACK OnLibdofLog(DOF_LogLevel level, const char* format, va_list 
 }
 
 std::string GlobalConfigPath(const std::string& basePath) { return DOF::Path::Combine(basePath, "directoutputconfig", "GlobalConfig_B2SServer.xml"); }
+
+// The global config of a base path, as a session loads it. Without the file, or if it cannot be read, a default one, or,
+// if `required`, the error that fails a session's init (vpe_dof_init, Pinball::Setup). Confined by the caller.
+DOF::GlobalConfig* LoadGlobalConfig(const std::string& basePath, bool required)
+{
+	std::string path = GlobalConfigPath(basePath);
+	DOF::GlobalConfig* globalConfig = nullptr;
+	bool exists = DOF::FileInfo(path).Exists();
+	if (!exists && required)
+		throw std::runtime_error("the configuration has no " + path);
+	if (exists)
+		globalConfig = DOF::GlobalConfig::GetGlobalConfigFromConfigXmlFile(DOF::FileInfo(path).FullName());
+	if (!globalConfig && required)
+		throw std::runtime_error("the global config " + path + " could not be loaded");
+	if (!globalConfig)
+		globalConfig = new DOF::GlobalConfig();
+	globalConfig->SetGlobalConfigFilename(path);
+	return globalConfig;
+}
 
 }
 
@@ -326,8 +350,8 @@ VPE_DOF_API vpe_dof* VPE_DOF_CALL vpe_dof_create(const char* base_path, int32_t*
 			DOF::Config::GetInstance()->SetBasePath(base_path);
 			DOF::PathConfinement::SetRoot(base_path);
 			// A configuration that cannot be used fails init instead of falling back to defaults or auto-configuring
-			// whatever hardware is connected. An output controller that cannot be read is skipped (the patch), as the
-			// importer, which does not have libdof read cabinets, cannot tell.
+			// whatever hardware is connected. An output controller that cannot be read is skipped (the patch), and the
+			// importer reports it beforehand (vpe_dof_cabinet_controllers).
 			DOF::Config::GetInstance()->SetStrictSetup(true);
 			dof->gate = DOF::OutputGate::BeginSession().shared_from_this();
 			{
@@ -709,12 +733,7 @@ VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_rom_names(const char* base_path, const 
 	{
 		QuietLogFile();
 		DOF::PathConfinement::ThreadRoot confinement(base_path);
-		std::string globalConfigPath = GlobalConfigPath(base_path);
-		if (DOF::FileInfo(globalConfigPath).Exists())
-			globalConfig = DOF::GlobalConfig::GetGlobalConfigFromConfigXmlFile(DOF::FileInfo(globalConfigPath).FullName());
-		if (!globalConfig)
-			globalConfig = new DOF::GlobalConfig();
-		globalConfig->SetGlobalConfigFilename(globalConfigPath);
+		globalConfig = LoadGlobalConfig(base_path, false);
 
 		std::unordered_map<int, DOF::FileInfo> iniFiles = globalConfig->GetIniFilesDictionary(table_file ? table_file : "");
 		configs = new DOF::LedControlConfigList();
@@ -744,6 +763,68 @@ VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_rom_names(const char* base_path, const 
 		delete globalConfig;
 		return -1;
 	}
+}
+
+VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_cabinet_controllers(const char* base_path, vpe_dof_controller_fn callback, void* user, char* error, int32_t error_size)
+{
+	WriteError(error, error_size, "");
+	if (!base_path || !*base_path || !callback)
+	{
+		WriteError(error, error_size, "no base path or callback");
+		return -1;
+	}
+	DOF::GlobalConfig* globalConfig = nullptr;
+	DOF::FileInfo* cabinetFile = nullptr;
+	try
+	{
+		QuietLogFile();
+		// Sessions run in strict setup (vpe_dof_create), which decides how some controllers read their settings.
+		DOF::Config::GetInstance()->SetStrictSetup(true);
+		DOF::PathConfinement::ThreadRoot confinement(base_path);
+		// A global config that is missing or cannot be read fails a session's init, so it fails the check too.
+		globalConfig = LoadGlobalConfig(base_path, true);
+		cabinetFile = globalConfig->GetCabinetConfigFile();
+		int32_t count = 0;
+		// A pattern no file matches fails a session's init (strict setup), as a missing file does. Without a pattern there
+		// are no controllers to read: a session auto-configures, which VPE never asks for.
+		const std::string& pattern = globalConfig->GetCabinetConfigFilePattern().GetPattern();
+		if (!cabinetFile && !DOF::StringExtensions::IsNullOrWhiteSpace(pattern))
+			throw std::runtime_error("the cabinet config " + pattern + " does not exist");
+		if (cabinetFile)
+		{
+			std::string name = cabinetFile->FullName();
+			if (!cabinetFile->Exists())
+				throw std::runtime_error("the cabinet config " + name + " does not exist");
+			// Read as a session reads it (Cabinet::GetCabinetFromConfigXml), and each controller with the loader the session
+			// uses, which neither opens a device nor touches what a running session uses (OutputControllerList::Check).
+			std::string xml = DOF::FileReader::ReadFileToString(name);
+			tinyxml2::XMLDocument doc;
+			if (xml.empty() || doc.Parse(xml.c_str()) != tinyxml2::XML_SUCCESS)
+				throw std::runtime_error("the cabinet config " + name + " is not valid XML" + (xml.empty() ? std::string() : std::string(": ") + doc.ErrorStr()));
+			const tinyxml2::XMLElement* root = doc.FirstChildElement("Cabinet");
+			if (!root)
+				throw std::runtime_error("the cabinet config " + name + " has no Cabinet element");
+			for (const DOF::OutputControllerList::ControllerCheck& check : DOF::OutputControllerList::Check(root->FirstChildElement("OutputControllers")))
+			{
+				callback(check.loaded ? 1 : 0, check.type.c_str(), check.name.c_str(), check.reason.c_str(), user);
+				count++;
+			}
+		}
+		delete cabinetFile;
+		delete globalConfig;
+		return count;
+	}
+	catch (const std::exception& e)
+	{
+		WriteError(error, error_size, e.what());
+	}
+	catch (...)
+	{
+		WriteError(error, error_size, "libdof could not read the cabinet config");
+	}
+	delete cabinetFile;
+	delete globalConfig;
+	return -1;
 }
 
 }
