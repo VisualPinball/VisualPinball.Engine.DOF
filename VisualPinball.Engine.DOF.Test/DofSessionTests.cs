@@ -650,12 +650,13 @@ namespace VisualPinball.Engine.DOF.Test
 		}
 
 		[Test]
-		public void OnlyTheFirstStopOrFaultLatchesDof()
+		public void StopsAndFaultsAfterALatchLeaveDofAlone()
 		{
 			var (session, native) = Create();
 			Wait(session.StartAsync());
 			WaitUntil(() => native.GateOpen, "the gate to open");
-			// Every later fault or emergency stop finds DOF's gate latched and leaves it alone.
+			// Those that race the first latch latch too, as DOF's latch allows; every one after a latch completed finds
+			// DOF's gate latched and leaves it alone.
 			var calls = Enumerable.Range(0, 8).Select(i => Task.Run(() => {
 				for (var j = 0; j < 10; j++) {
 					if ((i + j) % 2 == 0) {
@@ -666,11 +667,13 @@ namespace VisualPinball.Engine.DOF.Test
 				}
 			})).ToArray();
 			Assert.That(Task.WaitAll(calls, Timeout), Is.True);
-			Wait(session.Completion);
-			// The first latch comes from a calling thread, or from the worker if it held the handle then; the worker's
-			// own closings latch as well, so only the calling threads' latches are counted.
 			Assert.That(native.Latches, Is.GreaterThanOrEqualTo(1));
-			Assert.That(native.OutsideLatches, Is.LessThanOrEqualTo(1));
+			Assert.That(native.OutsideLatches, Is.LessThanOrEqualTo(8), "at most one latch per calling thread before one completed");
+			var outside = native.OutsideLatches;
+			session.Fault(UpstreamOverflow);
+			session.EmergencyStop();
+			Assert.That(native.OutsideLatches, Is.EqualTo(outside), "none once one completed");
+			Wait(session.Completion);
 		}
 
 		[Test]
@@ -720,6 +723,105 @@ namespace VisualPinball.Engine.DOF.Test
 			Assert.That(pauseReason, Is.EqualTo("The session is stopping."), "the pause the latch ended");
 			Assert.That(resumeReason, Is.EqualTo("The session is stopping."), "a resume asked while the stop latches");
 			native.UnitWrites = true;
+			Assert.That(Wait(session.Completion).Completed, Is.True);
+		}
+
+		[Test]
+		public void EmergencyStopLatchesWhileTheWorkerOpensTheGate()
+		{
+			// The worker admitted a resume's opening and is inside DOF's call for it: the stop does not wait for it, and
+			// latches DOF's gate itself before that call lands, so the opening applies as a closing and never goes out.
+			var (session, native) = Create();
+			Wait(session.StartAsync());
+			WaitUntil(() => native.GateOpen, "the gate to open");
+			Wait(session.PauseAsync());
+			var entered = new ManualResetEventSlim(false);
+			var release = new ManualResetEventSlim(false);
+			var held = 0;
+			native.OnSetOutputGate = open => {
+				if (open && Thread.CurrentThread.Name == "DOF session" && Interlocked.Exchange(ref held, 1) == 0) {
+					entered.Set();
+					release.Wait(Timeout);
+				}
+			};
+			try {
+				var resume = session.ResumeAsync();
+				Assert.That(entered.Wait(Timeout), Is.True, "the worker opens the gate");
+				Thread stopThread = null;
+				var stop = Task.Run(() => {
+					stopThread = Thread.CurrentThread;
+					session.EmergencyStop();
+				});
+				Assert.That(stop.Wait(Timeout), Is.True, "the stop returns while the worker is inside DOF");
+				Assert.That((native.Latched, native.LatchedBy), Is.EqualTo((true, stopThread)), "the stop latched DOF's gate itself");
+				release.Set();
+				var resumed = Wait(resume);
+				Assert.That((resumed.Open, resumed.Reason), Is.EqualTo((false, "The session is stopping.")));
+				Assert.That(native.GateOpen, Is.False, "the opening applied as a closing");
+				var calls = native.Calls;
+				Assert.That(calls.IndexOf("gate:latched"), Is.LessThan(calls.LastIndexOf("gate:open")), "the latch came before the opening landed");
+			} finally {
+				native.OnSetOutputGate = null;
+				release.Set();
+			}
+			Assert.That(Wait(session.Completion).Completed, Is.True);
+		}
+
+		[Test]
+		public void EmergencyStopLatchesWhileAFaultsLatchIsUnderway()
+		{
+			// A fault's latch has begun but not returned while the worker is about to send a resume's opening: the stop
+			// does not take that latch for done, it latches DOF itself before it returns, and the opening applies as a
+			// closing.
+			var (session, native) = Create();
+			Wait(session.StartAsync());
+			WaitUntil(() => native.GateOpen, "the gate to open");
+			Wait(session.PauseAsync());
+			var opening = new ManualResetEventSlim(false);
+			var releaseOpening = new ManualResetEventSlim(false);
+			var faultLatching = new ManualResetEventSlim(false);
+			var releaseFault = new ManualResetEventSlim(false);
+			var held = 0;
+			Thread faultThread = null;
+			native.OnSetOutputGate = open => {
+				if (open && Thread.CurrentThread.Name == "DOF session" && Interlocked.Exchange(ref held, 1) == 0) {
+					opening.Set();
+					releaseOpening.Wait(Timeout);
+				}
+			};
+			native.OnLatch = () => {
+				if (Thread.CurrentThread == Volatile.Read(ref faultThread)) {
+					faultLatching.Set();
+					releaseFault.Wait(Timeout);
+				}
+			};
+			try {
+				var resume = session.ResumeAsync();
+				Assert.That(opening.Wait(Timeout), Is.True, "the worker sends the opening");
+				var fault = Task.Run(() => {
+					Volatile.Write(ref faultThread, Thread.CurrentThread);
+					session.Fault(UpstreamOverflow);
+				});
+				Assert.That(faultLatching.Wait(Timeout), Is.True, "the fault latches");
+				Thread stopThread = null;
+				var stop = Task.Run(() => {
+					stopThread = Thread.CurrentThread;
+					session.EmergencyStop();
+				});
+				Assert.That(stop.Wait(Timeout), Is.True, "the stop returns while the fault's latch is underway");
+				Assert.That((native.Latched, native.LatchedBy), Is.EqualTo((true, stopThread)), "the stop latched DOF's gate itself");
+				releaseOpening.Set();
+				var resumed = Wait(resume);
+				Assert.That(resumed.Open, Is.False);
+				Assert.That(native.GateOpen, Is.False, "the opening applied as a closing");
+				releaseFault.Set();
+				Assert.That(fault.Wait(Timeout), Is.True);
+			} finally {
+				native.OnSetOutputGate = null;
+				native.OnLatch = null;
+				releaseOpening.Set();
+				releaseFault.Set();
+			}
 			Assert.That(Wait(session.Completion).Completed, Is.True);
 		}
 

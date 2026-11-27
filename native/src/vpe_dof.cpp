@@ -238,7 +238,8 @@ std::string TypeName(const DOF::IToy& toy)
 
 bool IsRunning(vpe_dof* dof) { return dof && dof->state.load(std::memory_order_acquire) == State::Running; }
 
-// Called with dof->lifecycle held. `error`, if given, gets why finishing failed.
+// Called with dof->lifecycle held. `error`, if given, gets why finishing failed, if that text can be made: the instance
+// is finished and the status reported whatever memory is left.
 int32_t FinishLocked(vpe_dof* dof, std::string* error)
 {
 	State state = dof->state.load();
@@ -257,14 +258,18 @@ int32_t FinishLocked(vpe_dof* dof, std::string* error)
 	}
 	catch (const std::exception& e)
 	{
-		if (error)
-			*error = e.what();
 		status = VPE_DOF_ERROR;
+		try
+		{
+			if (error)
+				*error = e.what();
+		}
+		catch (...)
+		{
+		}
 	}
 	catch (...)
 	{
-		if (error)
-			*error = "libdof failed to finish";
 		status = VPE_DOF_ERROR;
 	}
 	try
@@ -393,7 +398,7 @@ VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_init(vpe_dof* dof, const char* table_fi
 			WriteError(error, error_size, "init was already called");
 			return VPE_DOF_INVALID_STATE;
 		}
-		std::string message;
+		std::exception_ptr failure;
 		try
 		{
 			// Without its global config libdof would fall back to defaults and auto-configure the cabinet from whatever
@@ -410,21 +415,39 @@ VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_init(vpe_dof* dof, const char* table_fi
 			dof->state = State::Running;
 			return VPE_DOF_OK;
 		}
-		catch (const std::exception& e)
+		catch (...)
 		{
-			message = e.what();
+			// Kept without making any text: that could fail for lack of memory, and so skip what follows.
+			failure = std::current_exception();
+		}
+		// Init may have started controller threads, or a controller may have taken its connect test, before it failed: stop
+		// what was started first. What could not be turned off then is part of the error, ahead of it (InitFailure).
+		dof->state = State::Running;
+		std::string finishError;
+		bool stopped = FinishLocked(dof, &finishError) == VPE_DOF_OK;
+		try
+		{
+			std::string message = "libdof failed to initialize";
+			try
+			{
+				if (failure)
+					std::rethrow_exception(failure);
+			}
+			catch (const std::exception& e)
+			{
+				message = e.what();
+			}
+			catch (...)
+			{
+			}
+			if (!stopped && finishError.empty())
+				finishError = "libdof failed to finish";
+			WriteError(error, error_size, InitFailure(message, stopped ? std::string() : finishError).c_str());
 		}
 		catch (...)
 		{
-			message = "libdof failed to initialize";
+			WriteError(error, error_size, stopped ? "init failed" : "init failed, and stopping what it started failed too; outputs may still be on");
 		}
-		// Init may have started controller threads, or a controller may have taken its connect test, before it failed: stop
-		// what was started. What could not be turned off then is part of the error, ahead of it (InitFailure).
-		dof->state = State::Running;
-		std::string finishError;
-		if (FinishLocked(dof, &finishError) != VPE_DOF_OK && finishError.empty())
-			finishError = "libdof failed to finish";
-		WriteError(error, error_size, InitFailure(message, finishError).c_str());
 		return VPE_DOF_ERROR;
 	}
 	catch (...)
@@ -484,7 +507,7 @@ VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_finish(vpe_dof* dof, char* error, int32
 		std::string message;
 		int32_t status = FinishLocked(dof, &message);
 		if (status != VPE_DOF_OK)
-			WriteError(error, error_size, message.c_str());
+			WriteError(error, error_size, message.empty() ? "libdof failed to finish" : message.c_str());
 		return status;
 	}
 	catch (...)

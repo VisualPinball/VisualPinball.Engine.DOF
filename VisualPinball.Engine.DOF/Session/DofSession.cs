@@ -218,14 +218,13 @@ namespace VisualPinball.Engine.DOF.Session
 		private readonly LatencyHistogram _latency = new LatencyHistogram();
 		private readonly TaskCompletionSource<DofStartResult> _started = new TaskCompletionSource<DofStartResult>(TaskCreationOptions.RunContinuationsAsynchronously);
 		private readonly TaskCompletionSource<DofStopResult> _completion = new TaskCompletionSource<DofStopResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-		// Serialises the native handle between the worker and EmergencyStop, so the handle is never used after it is freed,
-		// and makes the check of the stop latch and the opening of the gate one step.
-		private readonly object _nativeLock = new object();
 		// Serialises command admission with the worker's shutdown, so no command is queued after the last drain.
 		private readonly object _commandLock = new object();
 
 		private Thread _worker;
-		private IDofNative _native;
+		// Set by the worker once created and cleared once freed. Other threads only latch through it, which an instance
+		// takes at any time, also while the worker calls it or disposes it (it returns -1 then): no lock between them.
+		private volatile IDofNative _native;
 		private int _state = (int)DofSessionState.Created;
 		private volatile bool _admitting = true;
 		private bool _commandsClosed;
@@ -239,9 +238,10 @@ namespace VisualPinball.Engine.DOF.Session
 		// A fault for the worker to apply: from outside (Fault), an overflow or a backlog found during a wait. The first wins.
 		private string _pendingFault;
 		// The gate must latch closed in DOF (a stop or a fault). Set before the latch is tried, so that the worker latches
-		// when the thread that set it found the native handle in use.
+		// when the thread that set it found no instance yet.
 		private int _latchWanted;
-		// DOF's gate was latched by LatchSoon or the worker.
+		// A latch of DOF's gate completed (LatchNow or the worker's final closing): set only once DOF's latch returned, so a
+		// caller that finds it set knows the gate is latched. DOF's latch may run more than once, also at the same time.
 		private int _nativeLatched;
 		private readonly string _overflowReason;
 		private int _snapshotOverdue;
@@ -418,10 +418,11 @@ namespace VisualPinball.Engine.DOF.Session
 		/// Any thread, the simulation thread included: faults the session, as an overflow of the event ring does, for
 		/// an upstream failure such as an overflow of the feed that publishes here. Rejects events from here on, latches
 		/// DOF's gate closed at once (openings DOF has not applied yet apply as closings), and reports
-		/// <paramref name="reason"/> through <see cref="DofSessionDiagnostics.Fault"/> and the log. If the worker is
-		/// using the DOF instance at this moment, it latches the gate as soon as it lets go. The session stays faulted,
-		/// with the gate closed, until it is stopped; stop it as usual (<see cref="StopAsync"/>). Never blocks beyond
-		/// short native locks and allocates nothing: pass a preallocated reason. The first fault's reason is kept.
+		/// <paramref name="reason"/> through <see cref="DofSessionDiagnostics.Fault"/> and the log. It latches while the
+		/// worker uses the DOF instance too; before the instance exists, the worker latches it as it creates it. The
+		/// session stays faulted, with the gate closed, until it is stopped; stop it as usual (<see cref="StopAsync"/>).
+		/// Never blocks beyond short native locks and allocates nothing: pass a preallocated reason. The first fault's
+		/// reason is kept.
 		/// </summary>
 		public void Fault(string reason)
 		{
@@ -431,34 +432,38 @@ namespace VisualPinball.Engine.DOF.Session
 		}
 
 		/// <summary>
-		/// Any thread, never waits: latches DOF's gate closed now if the native handle is free; otherwise the worker,
-		/// which holds it, latches it when it lets go (<see cref="LatchIfWanted"/>).
+		/// Any thread, never waits: latches DOF's gate closed now, also while the worker is inside a call on the instance
+		/// (an opening it is making then applies as a closing), so once this returned nothing of an opening the worker
+		/// admitted before reaches a controller, but at most one write per controller already past its check, followed
+		/// by the closing (<see cref="DofInstance.LatchOutputGate"/>). Before the instance exists, the worker latches it as
+		/// it creates it (<see cref="LatchIfWanted"/>).
 		/// </summary>
 		private void LatchSoon()
 		{
+			// Both full fences, as the worker's store of the instance and its read of the flag are: either this finds the
+			// instance, or the worker finds the flag.
 			Interlocked.Exchange(ref _latchWanted, 1);
-			if (Monitor.TryEnter(_nativeLock)) {
-				try {
-					LatchLocked();
-				} finally {
-					Monitor.Exit(_nativeLock);
-				}
-			}
+			LatchNow();
 			_ring.Wake();
 		}
 
 		/// <summary>
-		/// Latches DOF's gate, the first time only: later stops and faults find it latched and leave DOF alone. Called
-		/// with <see cref="_nativeLock"/> held. Returns the closing's generation, or -1.
+		/// Latches DOF's gate unless a latch completed already: stops and faults after that leave DOF alone, and those
+		/// that come while one runs latch too, so none returns before the gate is latched. Takes no lock: the instance
+		/// latches at any time (<see cref="DofInstance.LatchOutputGate"/>). Returns the closing's generation, or -1.
 		/// </summary>
-		private long LatchLocked()
+		private long LatchNow()
 		{
 			var native = _native;
-			if (native == null || Interlocked.Exchange(ref _nativeLatched, 1) != 0) {
+			if (native == null || Volatile.Read(ref _nativeLatched) != 0) {
 				return -1;
 			}
 			try {
-				return native.LatchOutputGate();
+				var generation = native.LatchOutputGate();
+				if (generation >= 0) {
+					Volatile.Write(ref _nativeLatched, 1);
+				}
+				return generation;
 			} catch (Exception) {
 				// The worker reports native failures; the threads that latch must not throw.
 				return -1;
@@ -468,15 +473,11 @@ namespace VisualPinball.Engine.DOF.Session
 		/// <summary>Worker: latches DOF's gate if a stop or a fault wants it and no one did yet.</summary>
 		private void LatchIfWanted()
 		{
-			// A full fence: a thread that set the flag and found the lock held is seen after the worker let go of it.
+			// A full fence: a thread that set the flag and found no instance yet is seen once the worker stored it.
 			if (Interlocked.CompareExchange(ref _latchWanted, 1, 1) == 0 || Volatile.Read(ref _nativeLatched) != 0) {
 				return;
 			}
-			lock (_nativeLock) {
-				if (Volatile.Read(ref _nativeLatched) == 0) {
-					LatchLocked();
-				}
-			}
+			LatchNow();
 		}
 
 		private void RequestStop()
@@ -603,9 +604,7 @@ namespace VisualPinball.Engine.DOF.Session
 				Fail($"DOF could not be created: {e.Message}");
 				return false;
 			}
-			lock (_nativeLock) {
-				_native = native;
-			}
+			_native = native;
 			// Dark from the start: whatever Init sets up writes zeros until the game runs.
 			native.SetOutputGate(false);
 			// A stop or a fault that came before the instance existed.
@@ -933,27 +932,27 @@ namespace VisualPinball.Engine.DOF.Session
 
 		/// <summary>
 		/// Changes the gate and waits (bounded) for every unit to write it, delivering events meanwhile. An opening is
-		/// refused once a stop or a fault latched, checked under the same lock as the change. Every wait but the latch's
-		/// own ends when a stop or a fault wants the gate latched.
+		/// refused once a stop or a fault latched. One that a latch comes after the check for applies as a closing in DOF,
+		/// whichever thread latched. Every wait but the latch's own ends when a stop or a fault wants the gate latched.
 		/// </summary>
 		private DofGateResult ChangeGate(bool open, bool latch = false)
 		{
 			long generation;
-			lock (_nativeLock) {
-				if (open) {
-					var refusal = OpenRefusal();
-					if (refusal != null) {
-						return DofGateResult.NotChanged(refusal);
-					}
-				}
-				if (latch) {
-					Volatile.Write(ref _nativeLatched, 1);
-					generation = _native.LatchOutputGate();
-				} else {
-					generation = _native.SetOutputGate(open);
+			if (open) {
+				var refusal = OpenRefusal();
+				if (refusal != null) {
+					return DofGateResult.NotChanged(refusal);
 				}
 			}
-			// A stop or a fault that found the handle in use while this changed the gate.
+			if (latch) {
+				generation = _native.LatchOutputGate();
+				if (generation >= 0) {
+					Volatile.Write(ref _nativeLatched, 1);
+				}
+			} else {
+				generation = _native.SetOutputGate(open);
+			}
+			// A stop or a fault that found no instance yet.
 			LatchIfWanted();
 			if (generation < 0) {
 				return open ? DofGateResult.NotChanged("DOF did not take the change.") : new DofGateResult(false, false, default, Array.Empty<string>());
@@ -990,10 +989,7 @@ namespace VisualPinball.Engine.DOF.Session
 
 		private string Cleanup(string error)
 		{
-			IDofNative native;
-			lock (_nativeLock) {
-				native = _native;
-			}
+			var native = _native;
 			if (native == null) {
 				return error;
 			}
@@ -1007,14 +1003,13 @@ namespace VisualPinball.Engine.DOF.Session
 			if (watch.Elapsed > _options.FinishTimeout) {
 				Log(DofLogLevel.Warning, $"Finishing DOF took {watch.Elapsed.TotalSeconds:0.0} s; a controller was slow to stop.");
 			}
-			lock (_nativeLock) {
-				try {
-					native.Dispose();
-				} catch (Exception e) {
-					error = error ?? $"Freeing DOF failed: {e.Message}";
-				}
-				_native = null;
+			// A latch from another thread may still reach the instance while it is freed: it then returns -1.
+			try {
+				native.Dispose();
+			} catch (Exception e) {
+				error = error ?? $"Freeing DOF failed: {e.Message}";
 			}
+			_native = null;
 			return error;
 		}
 
