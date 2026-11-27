@@ -21,9 +21,7 @@ namespace VisualPinball.Engine.DOF.Configuration
 	/// Settings of an imported global config that are not file patterns are kept. The cabinet file and the shapes file
 	/// are the imported ones the original patterns name. No table XML config is loaded: the list of table config
 	/// patterns is empty, and a game session passes libdof no table file, which also covers revisions imported with a
-	/// pattern. libdof reads a table config's effects but not the effects it assigns to the table elements,
-	/// so loading one would leave the table's effects without a trigger and, without <c>AddLedControlConfig</c>, drop
-	/// the ini rows as well. Logging goes to the host: no log file is configured.
+	/// pattern. The player does not load table configs yet. Logging goes to the host: no log file is configured.
 	/// </remarks>
 	public static class DofGlobalConfig
 	{

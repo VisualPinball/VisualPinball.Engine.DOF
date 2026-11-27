@@ -614,8 +614,7 @@ namespace VisualPinball.Engine.DOF.Session
 			}
 			try {
 				// No table file: libdof then looks up no table XML config, whatever the revision's global config names.
-				// It reads a table config's effects but not the effects it assigns to the table elements, so a loaded one
-				// leaves the table's effects without a trigger and can drop the ini rows (AddLedControlConfig).
+				// The player does not load table configs yet.
 				native.Init(null, _options.RomName);
 			} catch (Exception e) {
 				Fail($"DOF could not start: {e.Message}");
