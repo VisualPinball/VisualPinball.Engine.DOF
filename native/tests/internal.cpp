@@ -50,9 +50,16 @@
 #include "table/Table.h"
 #include "table/TableElementData.h"
 
+#ifdef __HIDAPI__
+#include "cab/out/dudescab/DudesCab.h"
+#include "cab/out/ps/Pinscape.h"
+#include "cab/out/pspico/PinscapePico.h"
+#endif
+
 #include <tinyxml2/tinyxml2.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <tlhelp32.h>
 #endif
 
 using namespace DOF;
@@ -1254,8 +1261,8 @@ void TableFolderNamesComeFromTheFilename()
 	std::filesystem::remove_all(tables, ec);
 }
 
-// A controller libdof cannot read is skipped in strict setup too, as a toy is, and the others load: VPE activates
-// cabinets without libdof reading them, so setup must not refuse one as a whole for it.
+// A controller libdof cannot read is skipped in strict setup too, as a toy is, and the others load: VPE's import only
+// warns about such a controller and activates the cabinet, so setup must not refuse one as a whole for it.
 void UnreadableControllerIsSkipped()
 {
 	bool strict = Config::GetInstance()->IsStrictSetup();
@@ -1284,6 +1291,236 @@ void UnreadableControllerIsSkipped()
 	}
 	CHECK(!threw, "setup does not refuse the cabinet");
 	CHECK(controllers.size() == 1 && controllers.front()->GetName() == "valid", "the readable controller loads");
+	Config::GetInstance()->SetStrictSetup(strict);
+}
+
+// The threads of this process, or -1 where they are not counted.
+int ThreadCount()
+{
+#ifdef _WIN32
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snapshot == INVALID_HANDLE_VALUE)
+		return -1;
+	int count = 0;
+	THREADENTRY32 entry;
+	entry.dwSize = sizeof(entry);
+	for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry))
+	{
+		if (entry.th32OwnerProcessID == GetCurrentProcessId())
+			count++;
+	}
+	CloseHandle(snapshot);
+	return count;
+#elif defined(__linux__)
+	std::error_code error;
+	int count = 0;
+	for (auto it = std::filesystem::directory_iterator("/proc/self/task", error); !error && it != std::filesystem::directory_iterator(); it.increment(error))
+		count++;
+	return error ? -1 : count;
+#else
+	return -1;
+#endif
+}
+
+// The cabinet check reads every controller element with the loader a session uses: what it loads, and for what it
+// skips the reason, which names the setting.
+void CabinetCheckReportsWhatASessionSkips()
+{
+	bool strict = Config::GetInstance()->IsStrictSetup();
+	Config::GetInstance()->SetStrictSetup(true);
+	tinyxml2::XMLDocument doc;
+	doc.Parse("<OutputControllers>"
+			  "<ArtNet><Name>art</Name><Universe>1</Universe></ArtNet>"
+			  "<LedWiz><Name>ledwiz</Name><Number>2</Number></LedWiz>"
+			  "<PacUIO Name=\"uio\" Id=\"0\" />"
+			  "<PacLed64 Name=\"led64\" Id=\"1\" />"
+			  "<PacDrive Name=\"drive\" />"
+			  "<Pinscape><Name>pinscape</Name><Number>1</Number></Pinscape>"
+			  "<PacUIO Name=\"uio without id\" />"
+			  "<LedWiz><Name>ledwiz without number</Name></LedWiz>"
+			  "<LedWiz><Name>ledwiz word</Name><Number>one</Number></LedWiz>"
+			  "<PacLed64 Name=\"led64 out of range\" Id=\"5\" />"
+			  "<TeensyStripController><Name>teensy</Name><ComPortBaudRate>fast</ComPortBaudRate></TeensyStripController>"
+			  "<NoSuchController><Name>unknown</Name></NoSuchController>"
+			  "<PacUIO Id=\"x\" />"
+			  "</OutputControllers>");
+	struct Expected
+	{
+		const char* type;
+		const char* name;
+		bool loaded;
+		const char* reason;
+	};
+	const Expected expected[] = {
+		{ "ArtNet", "art", true, "" },
+		{ "LedWiz", "ledwiz", true, "" },
+		{ "PacUIO", "uio", true, "" },
+		{ "PacLed64", "led64", true, "" },
+		{ "PacDrive", "drive", true, "" },
+		{ "Pinscape", "pinscape", true, "" },
+		{ "PacUIO", "uio without id", false, "no Id" },
+		{ "LedWiz", "ledwiz without number", false, "no Number" },
+		{ "LedWiz", "ledwiz word", false, "Number \"one\" is not a whole number" },
+		{ "PacLed64", "led64 out of range", false, "PacLed64 Ids must be between 1-4. The supplied Id 5 is out of range." },
+		{ "TeensyStripController", "teensy", false, "ComPortBaudRate \"fast\" is not a valid value" },
+		{ "NoSuchController", "unknown", false, "libdof has no output controller of this type" },
+		{ "PacUIO", "", false, "Id \"x\" is not a whole number" },
+	};
+	std::vector<OutputControllerList::ControllerCheck> checks = OutputControllerList::Check(doc.RootElement());
+	CHECK(checks.size() == sizeof(expected) / sizeof(expected[0]), "every controller element is reported");
+	for (size_t i = 0; i < checks.size() && i < sizeof(expected) / sizeof(expected[0]); i++)
+	{
+		const OutputControllerList::ControllerCheck& check = checks[i];
+		const Expected& want = expected[i];
+		bool same = check.type == want.type && check.name == want.name && check.loaded == want.loaded && check.reason == want.reason;
+		if (!same)
+			std::fprintf(stderr, "  controller %zu: %s|%s|%d|%s\n", i, check.type.c_str(), check.name.c_str(), check.loaded ? 1 : 0, check.reason.c_str());
+		CHECK(same, "the check reports the controller as expected");
+	}
+	CHECK(!OutputControllerList::IsChecking(), "the check is over once it returned");
+
+	// A session loads exactly what the check reports as loaded.
+	OutputControllerList controllers;
+	controllers.FromXml(doc.RootElement());
+	std::vector<std::string> loaded;
+	for (IOutputController* controller : controllers)
+		loaded.push_back(controller->GetName());
+	std::vector<std::string> reported;
+	for (const OutputControllerList::ControllerCheck& check : checks)
+	{
+		if (check.loaded)
+			reported.push_back(check.name);
+	}
+	CHECK(loaded == reported, "a session loads what the check reports as loaded");
+	Config::GetInstance()->SetStrictSetup(strict);
+}
+
+// The cabinet check opens no device: no controller registers with the output gate, which one does as it opens its
+// device in Init, and no thread starts.
+void CabinetCheckOpensNoDevice()
+{
+	bool strict = Config::GetInstance()->IsStrictSetup();
+	Config::GetInstance()->SetStrictSetup(true);
+	OutputGate& gate = OutputGate::BeginSession();
+	tinyxml2::XMLDocument doc;
+	doc.Parse("<OutputControllers>"
+			  "<ArtNet><Name>art</Name><Universe>1</Universe><BroadcastAddress>127.0.0.1</BroadcastAddress></ArtNet>"
+			  "<LedWiz><Name>ledwiz</Name><Number>1</Number></LedWiz>"
+			  "<PacUIO Name=\"uio\" Id=\"0\" /><PacLed64 Name=\"led64\" Id=\"1\" /><PacDrive Name=\"drive\" />"
+			  "<Pinscape><Name>pinscape</Name><Number>1</Number></Pinscape>"
+			  "<PinscapePico><Name>pico</Name><Number>1</Number></PinscapePico>"
+			  "<DudesCab><Name>dudes</Name><Number>1</Number></DudesCab>"
+			  "<UMXController><Name>umx</Name><Number>1</Number></UMXController>"
+			  "<FT245RBitbangController Name=\"ftdi\"><Id>0</Id></FT245RBitbangController>"
+			  "<TeensyStripController><Name>teensy</Name><ComPortName>COM250</ComPortName><NumberOfLedsStrip1>10</NumberOfLedsStrip1></TeensyStripController>"
+			  "<WemosD1MPStripController><Name>wemos</Name><ComPortName>COM251</ComPortName><TestOnConnect>true</TestOnConnect></WemosD1MPStripController>"
+			  "<PinControl><Name>pincontrol</Name><ComPort>COM252</ComPort></PinControl>"
+			  "<PinOne><Name>pinone</Name><Number>1</Number><ComPort>COM253</ComPort></PinOne>"
+			  "<NullOutputController Name=\"null\" />"
+			  "</OutputControllers>");
+	int threads = ThreadCount();
+	std::vector<OutputControllerList::ControllerCheck> checks = OutputControllerList::Check(doc.RootElement());
+	int after = ThreadCount();
+	size_t loaded = 0;
+	for (const OutputControllerList::ControllerCheck& check : checks)
+	{
+		if (check.loaded)
+			loaded++;
+		else
+			std::fprintf(stderr, "  skipped %s %s: %s\n", check.type.c_str(), check.name.c_str(), check.reason.c_str());
+	}
+	CHECK(loaded == 15, "a valid controller of each type loads");
+	if (threads >= 0)
+		CHECK(after <= threads, "the check starts no thread");
+	int64_t closing = Change(gate, false);
+	OutputGate::Counts counts;
+	gate.GetState(closing, counts);
+	CHECK(counts.confirmed == 0 && counts.pending == 0 && counts.failed == 0 && counts.untouched == 0, "no controller registered with the gate");
+	Config::GetInstance()->SetStrictSetup(strict);
+}
+
+// Controllers that build outputs as their settings are read, and how many a session's read builds: a session's read of
+// a PinscapePico asks the device list for the number (128 without a device), and a read of any of them asks the gate as
+// it builds them (IOutput::GetOutput).
+const char* const OutputBuildingControllers = "<OutputControllers>"
+											  "<PinOne><Name>pinone</Name><Number>1</Number></PinOne>"
+											  "<TeensyStripController><Name>teensy</Name><NumberOfLedsStrip1>10</NumberOfLedsStrip1></TeensyStripController>"
+											  "<WemosD1MPStripController><Name>wemos</Name><NumberOfLedsStrip2>4</NumberOfLedsStrip2></WemosD1MPStripController>"
+											  "<PinscapePico><Name>pico</Name><Number>1</Number><NumberOfOutputs>32</NumberOfOutputs></PinscapePico>"
+											  "<DudesCab><Name>dudes</Name><Number>1</Number><NumberOfOutputs>16</NumberOfOutputs></DudesCab>"
+											  "</OutputControllers>";
+
+// The cabinet check builds no outputs: it reads no device list for their number and never asks a session's gate, which
+// a session that begins can free meanwhile. A session's read of the same elements builds them.
+void CabinetCheckBuildsNoOutputs()
+{
+	bool strict = Config::GetInstance()->IsStrictSetup();
+	Config::GetInstance()->SetStrictSetup(true);
+	tinyxml2::XMLDocument doc;
+	doc.Parse(OutputBuildingControllers);
+	const size_t sessionOutputs[] = { 63, 30, 12, 128, 16 };
+	size_t i = 0;
+	for (const tinyxml2::XMLElement* element = doc.RootElement()->FirstChildElement(); element; element = element->NextSiblingElement(), i++)
+	{
+		std::string name;
+		std::string reason;
+		IOutputController* session = OutputControllerList::Load(element, name, reason);
+		size_t built = session && session->GetOutputs() ? session->GetOutputs()->size() : 0;
+		if (i < sizeof(sessionOutputs) / sizeof(sessionOutputs[0]) && built != sessionOutputs[i])
+			std::fprintf(stderr, "  %s %s: a session's read built %zu outputs (%s)\n", element->Name(), name.c_str(), built, reason.c_str());
+		CHECK(session && i < sizeof(sessionOutputs) / sizeof(sessionOutputs[0]) && built == sessionOutputs[i], "a session's read builds the outputs");
+		delete session;
+
+		IOutputController* checked = nullptr;
+		{
+			OutputControllerList::CheckScope scope;
+			checked = OutputControllerList::Load(element, name, reason);
+		}
+		CHECK(checked != nullptr, "the check loads the controller a session loads");
+		CHECK(checked && (!checked->GetOutputs() || checked->GetOutputs()->empty()), "the check builds no outputs");
+		delete checked;
+	}
+	CHECK(i == sizeof(sessionOutputs) / sizeof(sessionOutputs[0]), "every controller was read");
+	Config::GetInstance()->SetStrictSetup(strict);
+}
+
+// Checks on one thread while sessions begin and the device lists are cleared, as a session's setup and teardown do,
+// on another. Bounded; a check that read the gate or a device list a session frees would crash or report differently.
+void CabinetCheckRunsBesideSessions()
+{
+	bool strict = Config::GetInstance()->IsStrictSetup();
+	Config::GetInstance()->SetStrictSetup(true);
+	tinyxml2::XMLDocument doc;
+	doc.Parse(OutputBuildingControllers);
+	std::atomic<bool> stop { false };
+	std::atomic<int> checks { 0 };
+	std::atomic<int> wrong { 0 };
+	std::thread checker([&]() {
+		while (!stop.load())
+		{
+			std::vector<OutputControllerList::ControllerCheck> result = OutputControllerList::Check(doc.RootElement());
+			if (result.size() != 5 || !std::all_of(result.begin(), result.end(), [](const OutputControllerList::ControllerCheck& c) { return c.loaded; }))
+				wrong++;
+			checks++;
+		}
+	});
+	// Sessions go on until enough checks ran beside them, however the threads are scheduled.
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+	int sessions = 0;
+	while ((sessions < 300 || checks.load() < 50) && std::chrono::steady_clock::now() < deadline)
+	{
+		OutputGate::BeginSession();
+#ifdef __HIDAPI__
+		DudesCab::ClearDevices();
+		PinscapePico::ClearDevices();
+		Pinscape::ClearDevices();
+#endif
+		sessions++;
+	}
+	stop = true;
+	checker.join();
+	CHECK(checks.load() >= 50, "the checks ran beside the sessions");
+	CHECK(wrong.load() == 0, "every check reports what a session loads");
 	Config::GetInstance()->SetStrictSetup(strict);
 }
 
@@ -1490,6 +1727,10 @@ int main()
 	RootSpellingsAreOneFolder();
 	TableFolderNamesComeFromTheFilename();
 	UnreadableControllerIsSkipped();
+	CabinetCheckReportsWhatASessionSkips();
+	CabinetCheckOpensNoDevice();
+	CabinetCheckBuildsNoOutputs();
+	CabinetCheckRunsBesideSessions();
 	EndedSessionsAreFreed();
 	if (failures)
 	{

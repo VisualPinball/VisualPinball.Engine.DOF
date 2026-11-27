@@ -36,7 +36,7 @@ extern "C" {
 #endif
 
 /// Version of this ABI. Bumped on every incompatible change; the managed binding refuses a library with another one.
-#define VPE_DOF_ABI_VERSION 4
+#define VPE_DOF_ABI_VERSION 5
 
 enum vpe_dof_status
 {
@@ -61,6 +61,9 @@ typedef struct vpe_dof vpe_dof;
 typedef void (VPE_DOF_CALL *vpe_dof_log_fn)(int32_t level, const char* message, void* user);
 /// Receives one string of a list.
 typedef void (VPE_DOF_CALL *vpe_dof_string_fn)(const char* value, void* user);
+/// Receives one output controller of a cabinet config (vpe_dof_cabinet_controllers). The strings are only valid during
+/// the call.
+typedef void (VPE_DOF_CALL *vpe_dof_controller_fn)(int32_t loaded, const char* type, const char* name, const char* reason, void* user);
 
 VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_abi_version(void);
 /// libdof's version, such as "0.5.4".
@@ -154,6 +157,17 @@ VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_describe(vpe_dof* dof, vpe_dof_string_f
 /// where device is the N of directoutputconfigN.ini. Needs no instance and can run next to one. Returns the number of
 /// rows or -1 on error.
 VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_rom_names(const char* base_path, const char* table_file, vpe_dof_string_fn callback, void* user);
+
+/// Reads the output controllers of the cabinet config the global config under `base_path` names, as a session would,
+/// and reports each controller element through `callback`, each field as it is: loaded is 1 if a session loads it and 0
+/// if it skips it, type is the element name, name its name (may be empty) and reason, for a skipped one, why (no Id;
+/// Number "one" is not a whole number; libdof has no output controller of this type; ...).
+/// It opens no device, starts no thread, builds no outputs, registers nothing with the output gate and leaves alone the
+/// device lists a running instance uses: it needs no instance and can run next to one. Like a session, it reads no file
+/// outside `base_path`. Returns the number of controllers (0 when the global config names no cabinet config) or -1, with
+/// a message in `error`, for what fails a session's init: no global config, one that cannot be read, or a cabinet config
+/// it names that does not exist or is not valid XML.
+VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_cabinet_controllers(const char* base_path, vpe_dof_controller_fn callback, void* user, char* error, int32_t error_size);
 
 /// Lists connected devices without opening them for output, one line per device:
 /// "hid|<vid>|<pid>|<usage page>|<usage>|<interface>|<release>|<manufacturer>|<product>|<serial>|<path>",

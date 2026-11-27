@@ -216,7 +216,7 @@ namespace VisualPinball.Engine.DOF.Test
 		[Test]
 		public void ACabinetWithAControllerLibdofCannotReadStartsTheOthers()
 		{
-			// The import accepts the cabinet without libdof reading it, so setup must not refuse it as a whole.
+			// The import only warns about the controller and accepts the cabinet, so setup must not refuse it as a whole.
 			const int universe = 305;
 			using var lease = Import(_dir, universe, "vpetest,S1",
 				"<ArtNet><Name>ArtNet 2</Name><Universe>unset</Universe><BroadcastAddress>127.0.0.1</BroadcastAddress></ArtNet>");

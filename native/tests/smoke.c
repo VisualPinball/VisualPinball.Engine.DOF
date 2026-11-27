@@ -51,6 +51,31 @@ static void VPE_DOF_CALL OnLine(const char* value, void* user)
 	printf("  %s: %s\n", (const char*)user, value);
 }
 
+// The fixture's cabinet has one controller, which a session loads.
+static void VPE_DOF_CALL OnController(int32_t loaded, const char* type, const char* name, const char* reason, void* user)
+{
+	printf("  controller: %d %s \"%s\" %s\n", loaded, type, name, reason);
+	if (loaded == 1 && strcmp(type, "ArtNet") == 0 && strcmp(name, "ArtNet0") == 0 && reason[0] == 0)
+		(*(int*)user)++;
+}
+
+static void VPE_DOF_CALL CountController(int32_t loaded, const char* type, const char* name, const char* reason, void* user)
+{
+	(void)loaded;
+	(void)type;
+	(void)name;
+	(void)reason;
+	(*(int*)user)++;
+}
+
+static void CheckCabinet(const char* basePath, const char* what)
+{
+	char error[512] = { 0 };
+	int loaded = 0;
+	int32_t count = vpe_dof_cabinet_controllers(basePath, OnController, &loaded, error, (int32_t)sizeof(error));
+	CHECK(count == 1 && loaded == 1, error[0] ? error : what);
+}
+
 static void RunSession(const char* basePath, const char* table, const char* rom)
 {
 	int32_t status = -1;
@@ -77,6 +102,7 @@ static void RunSession(const char* basePath, const char* table, const char* rom)
 	CHECK(vpe_dof_init(dof, table, rom, error, (int32_t)sizeof(error)) == VPE_DOF_INVALID_STATE, "second init is refused");
 
 	vpe_dof_describe(dof, OnLine, "describe");
+	CheckCabinet(basePath, "the cabinet check runs next to an instance");
 
 	int64_t open = vpe_dof_set_output_gate(dof, 1);
 	CHECK(open > closed, "gate opens after init");
@@ -132,6 +158,17 @@ int main(int argc, char** argv)
 	vpe_dof_set_log(OnLog, NULL, VPE_DOF_LOG_INFO);
 
 	printf("rom rows: %d\n", vpe_dof_rom_names(basePath, table, OnLine, "rom"));
+	CheckCabinet(basePath, "the cabinet check reads the cabinet");
+	char error[512] = { 0 };
+	int reported = 0;
+	CHECK(vpe_dof_cabinet_controllers(NULL, CountController, &reported, error, (int32_t)sizeof(error)) == -1 && error[0], "the cabinet check needs a base path");
+	// A folder without a global config fails a session's init, and so the check.
+	char noGlobalConfig[1024];
+	snprintf(noGlobalConfig, sizeof(noGlobalConfig), "%s/directoutputconfig", basePath);
+	error[0] = 0;
+	CHECK(vpe_dof_cabinet_controllers(noGlobalConfig, CountController, &reported, error, (int32_t)sizeof(error)) == -1 && strstr(error, "has no") != NULL,
+		"the cabinet check needs a global config");
+	CHECK(reported == 0, "a cabinet check that fails reports no controller");
 	vpe_dof_enumerate_devices(OnLine, "device");
 
 	int checkCanary = CanaryIntact(basePath);
