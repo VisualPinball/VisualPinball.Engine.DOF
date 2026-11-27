@@ -5,6 +5,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using VisualPinball.Engine.DOF.Native;
 
 namespace VisualPinball.Engine.DOF
@@ -114,22 +115,35 @@ namespace VisualPinball.Engine.DOF
 	/// a time; <see cref="Create"/> throws <see cref="DofStatus.Busy"/> while another one is alive.
 	/// </summary>
 	/// <remarks>
-	/// Calls may come from any thread, but <see cref="Dispose"/> must not run concurrently with another call on the same
-	/// instance: the owner serialises them (the session worker does). <see cref="Finish"/> blocks until libdof's threads
-	/// stopped, which can take as long as the slowest device; call it from a thread that can wait.
+	/// Calls may come from any thread, <see cref="Dispose"/> included. Each call into libdof is admitted first and counted
+	/// until it returned; Dispose stops admitting calls, waits for the admitted ones to return, and then destroys the
+	/// instance on its own thread, so a call never runs libdof's shutdown. It returns once the instance is destroyed, so a
+	/// new instance can be created then; a second Dispose waits for that too. A call that is not admitted any more does
+	/// what that member does on a disposed instance. Dispose from inside a call (a log line it writes on the calling
+	/// thread), which would wait for itself, is not supported. <see cref="Finish"/> blocks until libdof's threads stopped,
+	/// which can take as long as the slowest device; call it from a thread that can wait.
 	/// </remarks>
 	public sealed class DofInstance : IDisposable
 	{
 		private const int ErrorSize = 1024;
 
-		private IntPtr _handle;
+		private const int Alive = 0;
+		private const int Disposing = 1;
+		private const int Destroyed = 2;
+
+		private readonly IntPtr _dof;
+		// The calls admitted into libdof (Enter) that have not returned yet.
+		private int _calls;
+		private int _state = Alive;
+		// Dispose waits on it for the admitted calls to return, and a second Dispose for the destruction.
+		private readonly object _disposeLock = new object();
 
 		/// <summary>The folder that contains <c>directoutputconfig/</c>; libdof reads no file outside it.</summary>
 		public string BasePath { get; }
 
-		private DofInstance(IntPtr handle, string basePath)
+		private DofInstance(IntPtr dof, string basePath)
 		{
-			_handle = handle;
+			_dof = dof;
 			BasePath = basePath;
 		}
 
@@ -158,8 +172,14 @@ namespace VisualPinball.Engine.DOF
 		public void Init(string tableFile, string romName)
 		{
 			var error = new byte[ErrorSize];
-			var status = DofNative.Init(Handle, Utf8.Encode(tableFile == null ? string.Empty : DofPaths.ToNative(tableFile)),
-				Utf8.Encode(romName ?? string.Empty), error, error.Length);
+			EnterOrThrow();
+			int status;
+			try {
+				status = DofNative.Init(_dof, Utf8.Encode(tableFile == null ? string.Empty : DofPaths.ToNative(tableFile)),
+					Utf8.Encode(romName ?? string.Empty), error, error.Length);
+			} finally {
+				Leave();
+			}
 			DofException.ThrowIfFailed(status, "Initialising DOF", Utf8.DecodeBuffer(error));
 		}
 
@@ -169,9 +189,13 @@ namespace VisualPinball.Engine.DOF
 		/// <param name="type">'S' solenoid, 'L' lamp, 'G' GI string, 'W' switch, 'N' mech, 'D' display, 'E' event.</param>
 		public void Data(char type, int number, int value)
 		{
-			var handle = _handle;
-			if (handle != IntPtr.Zero) {
-				DofNative.Data(handle, (byte)type, number, value);
+			if (!Enter()) {
+				return;
+			}
+			try {
+				DofNative.Data(_dof, (byte)type, number, value);
+			} finally {
+				Leave();
 			}
 		}
 
@@ -184,9 +208,13 @@ namespace VisualPinball.Engine.DOF
 			if (string.IsNullOrEmpty(name)) {
 				return;
 			}
-			var handle = _handle;
-			if (handle != IntPtr.Zero) {
-				DofNative.DataNamed(handle, Utf8.Encode(NativeName(name)), value);
+			if (!Enter()) {
+				return;
+			}
+			try {
+				DofNative.DataNamed(_dof, Utf8.Encode(NativeName(name)), value);
+			} finally {
+				Leave();
 			}
 		}
 
@@ -200,8 +228,14 @@ namespace VisualPinball.Engine.DOF
 		public int PendingInput
 		{
 			get {
-				var handle = _handle;
-				return handle == IntPtr.Zero ? 0 : DofNative.PendingInput(handle);
+				if (!Enter()) {
+					return 0;
+				}
+				try {
+					return DofNative.PendingInput(_dof);
+				} finally {
+					Leave();
+				}
 			}
 		}
 
@@ -209,7 +243,13 @@ namespace VisualPinball.Engine.DOF
 		public void Finish()
 		{
 			var error = new byte[ErrorSize];
-			var status = DofNative.Finish(Handle, error, error.Length);
+			EnterOrThrow();
+			int status;
+			try {
+				status = DofNative.Finish(_dof, error, error.Length);
+			} finally {
+				Leave();
+			}
 			DofException.ThrowIfFailed(status, "Finishing DOF", Utf8.DecodeBuffer(error));
 		}
 
@@ -228,8 +268,14 @@ namespace VisualPinball.Engine.DOF
 		/// </returns>
 		public long SetOutputGate(bool open)
 		{
-			var handle = _handle;
-			return handle == IntPtr.Zero ? -1 : DofNative.SetOutputGate(handle, open ? 1 : 0);
+			if (!Enter()) {
+				return -1;
+			}
+			try {
+				return DofNative.SetOutputGate(_dof, open ? 1 : 0);
+			} finally {
+				Leave();
+			}
 		}
 
 		/// <summary>
@@ -240,7 +286,17 @@ namespace VisualPinball.Engine.DOF
 		/// light its whole strip. Call before <see cref="Init"/> to cover the controllers it connects. Every new
 		/// instance allows them.
 		/// </summary>
-		public void SetConnectTests(bool allowed) => DofException.ThrowIfFailed(DofNative.SetConnectTests(Handle, allowed ? 1 : 0), "Setting DOF's connect tests");
+		public void SetConnectTests(bool allowed)
+		{
+			EnterOrThrow();
+			int status;
+			try {
+				status = DofNative.SetConnectTests(_dof, allowed ? 1 : 0);
+			} finally {
+				Leave();
+			}
+			DofException.ThrowIfFailed(status, "Setting DOF's connect tests");
+		}
 
 		/// <summary>
 		/// Any thread, in any state until disposed: closes the output gate at once and latches it closed for the rest of
@@ -254,28 +310,45 @@ namespace VisualPinball.Engine.DOF
 		/// write to the device (each report, packet, command or retry), and then sends the closing to every output. A
 		/// write that was already past that check when the latch came can still reach the device after the latch returned:
 		/// at most that one write per controller, followed by the closing. Nothing else of the opening goes out. Takes no
-		/// lock and never allocates, so the simulation thread or a fault handler may call it. Once it returned, the gate
+		/// lock and never allocates, so the simulation thread or a fault handler may call it (the last call to return while
+		/// a Dispose waits for the calls takes its lock to wake it). Once it returned, the gate
 		/// reports closed, also to an opening DOF's main thread is applying at that moment. It never reaches a later
 		/// instance's gate.
 		/// </summary>
 		/// <returns>The closing's generation, or -1 after <see cref="Dispose"/>.</returns>
 		public long LatchOutputGate()
 		{
-			var handle = _handle;
-			return handle == IntPtr.Zero ? -1 : DofNative.LatchOutputGate(handle);
+			if (!Enter()) {
+				return -1;
+			}
+			try {
+				return DofNative.LatchOutputGate(_dof);
+			} finally {
+				Leave();
+			}
 		}
 
 		public DofGateState GetGateState(long generation)
 		{
-			var status = DofNative.GateState(Handle, generation, out var written, out var pending, out var failed, out var untouched);
+			EnterOrThrow();
+			int status, written, pending, failed, untouched;
+			try {
+				status = DofNative.GateState(_dof, generation, out written, out pending, out failed, out untouched);
+			} finally {
+				Leave();
+			}
 			return new DofGateState(status == 1, written, pending, failed, status == 2, untouched);
 		}
 
 		/// <summary>The names of the controller units that have not written <paramref name="generation"/> yet, or failed.</summary>
 		public IReadOnlyList<string> GetGatePending(long generation)
 		{
-			var handle = Handle;
-			return StringCollector.Collect(user => DofNative.GatePending(handle, generation, StringCollector.Callback, user), out _);
+			EnterOrThrow();
+			try {
+				return StringCollector.Collect(user => DofNative.GatePending(_dof, generation, StringCollector.Callback, user), out _);
+			} finally {
+				Leave();
+			}
 		}
 
 		/// <summary>
@@ -286,13 +359,27 @@ namespace VisualPinball.Engine.DOF
 		/// <see cref="DofStatus.InvalidArgument"/> if the device or port does not exist or the port names a toy instead of
 		/// a controller output; <see cref="DofStatus.InvalidState"/> before init or after finish.
 		/// </returns>
-		public DofStatus TestOutput(int device, int port, int value) => (DofStatus)DofNative.TestOutput(Handle, device, port, value);
+		public DofStatus TestOutput(int device, int port, int value)
+		{
+			EnterOrThrow();
+			try {
+				return (DofStatus)DofNative.TestOutput(_dof, device, port, value);
+			} finally {
+				Leave();
+			}
+		}
 
 		/// <summary>The output controllers and toys, after <see cref="Init"/>.</summary>
 		public DofCabinetDescription Describe()
 		{
-			var handle = Handle;
-			var lines = StringCollector.Collect(user => DofNative.Describe(handle, StringCollector.Callback, user), out var status);
+			IReadOnlyList<string> lines;
+			int status;
+			EnterOrThrow();
+			try {
+				lines = StringCollector.Collect(user => DofNative.Describe(_dof, StringCollector.Callback, user), out status);
+			} finally {
+				Leave();
+			}
 			DofException.ThrowIfFailed(status, "Describing the DOF cabinet");
 			var controllers = new List<DofController>();
 			var toys = new List<DofToy>();
@@ -307,24 +394,69 @@ namespace VisualPinball.Engine.DOF
 			return new DofCabinetDescription(controllers, toys);
 		}
 
-		/// <summary>Frees the instance, finishing it first if needed, so a new one can be created.</summary>
+		/// <summary>
+		/// Frees the instance, finishing it first if needed, so a new one can be created. Stops admitting calls, waits for
+		/// the admitted ones to return (a running <see cref="Finish"/> too), destroys the instance on this thread and
+		/// returns. A Dispose while another one runs returns once that one destroyed the instance.
+		/// </summary>
 		public void Dispose()
 		{
-			var handle = _handle;
-			_handle = IntPtr.Zero;
-			if (handle != IntPtr.Zero) {
-				DofNative.Destroy(handle);
+			if (Interlocked.CompareExchange(ref _state, Disposing, Alive) != Alive) {
+				lock (_disposeLock) {
+					while (Volatile.Read(ref _state) != Destroyed) {
+						Monitor.Wait(_disposeLock);
+					}
+				}
+				return;
+			}
+			lock (_disposeLock) {
+				while (Volatile.Read(ref _calls) != 0) {
+					Monitor.Wait(_disposeLock);
+				}
+			}
+			try {
+				DofNative.Destroy(_dof);
+			} finally {
+				lock (_disposeLock) {
+					Volatile.Write(ref _state, Destroyed);
+					Monitor.PulseAll(_disposeLock);
+				}
 			}
 		}
 
-		private IntPtr Handle
+		/// <summary>
+		/// Admits a call into libdof, or returns false once Dispose started. No allocation, no lock: an interlocked count
+		/// that Dispose drains before it destroys the instance.
+		/// </summary>
+		private bool Enter()
 		{
-			get {
-				var handle = _handle;
-				if (handle == IntPtr.Zero) {
-					throw new ObjectDisposedException(nameof(DofInstance));
+			// Once disposing, callers that keep calling do not touch the count, so they never hold the drain up.
+			if (Volatile.Read(ref _state) != Alive) {
+				return false;
+			}
+			Interlocked.Increment(ref _calls);
+			// Checked again after the count, both full fences: either Dispose sees this call, or this call sees Dispose.
+			if (Volatile.Read(ref _state) != Alive) {
+				Leave();
+				return false;
+			}
+			return true;
+		}
+
+		private void EnterOrThrow()
+		{
+			if (!Enter()) {
+				throw new ObjectDisposedException(nameof(DofInstance));
+			}
+		}
+
+		/// <summary>Ends an admitted call; the last one to return while Dispose waits wakes it.</summary>
+		private void Leave()
+		{
+			if (Interlocked.Decrement(ref _calls) == 0 && Volatile.Read(ref _state) == Disposing) {
+				lock (_disposeLock) {
+					Monitor.PulseAll(_disposeLock);
 				}
-				return handle;
 			}
 		}
 	}

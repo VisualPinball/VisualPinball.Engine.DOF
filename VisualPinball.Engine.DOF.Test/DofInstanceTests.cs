@@ -377,6 +377,137 @@ namespace VisualPinball.Engine.DOF.Test
 		}
 
 		[Test]
+		public void DisposeWaitsForTheCallsInFlight()
+		{
+			var unit = Unit("ArtNetA");
+			using var config = StandardConfig(unit);
+			for (var round = 0; round < 5; round++) {
+				var dof = DofInstance.Create(config.Root);
+				// Init is held in libdof at its first log line on its own thread, while callers keep calling the members that
+				// return at once and two threads dispose the instance. libdof's shutdown says goodbye on the thread that runs it.
+				var initThread = 0;
+				var held = 0;
+				using var inside = new ManualResetEventSlim();
+				using var release = new ManualResetEventSlim();
+				using var disposing = new ManualResetEventSlim();
+				var shutdownThreads = new ConcurrentQueue<int>();
+				DofLibrary.SetLog((level, message) => {
+					_log.Enqueue($"[{level}] {message}");
+					var thread = Environment.CurrentManagedThreadId;
+					if (message.Contains("Bye and thanks for using!")) {
+						shutdownThreads.Enqueue(thread);
+					}
+					if (thread == Volatile.Read(ref initThread) && Interlocked.Exchange(ref held, 1) == 0) {
+						inside.Set();
+						release.Wait(30000);
+					}
+				}, DofLogLevel.Debug);
+				var stop = 0;
+				var unexpected = new ConcurrentQueue<Exception>();
+				var callerThreads = new ConcurrentDictionary<int, bool>();
+				var callers = Enumerable.Range(0, 4).Select(index => new Thread(() => {
+					callerThreads[Environment.CurrentManagedThreadId] = true;
+					while (Volatile.Read(ref stop) == 0) {
+						try {
+							switch (index) {
+								case 0:
+									dof.Data('S', 1, 1);
+									dof.Data('S', 1, 0);
+									break;
+								case 1:
+									dof.DataNamed("vpe_named", 1);
+									_ = dof.PendingInput;
+									break;
+								case 2:
+									dof.SetOutputGate(true);
+									break;
+								default:
+									if (dof.LatchOutputGate() == -1) {
+										disposing.Set();
+									}
+									break;
+							}
+						} catch (Exception e) {
+							// These members do not throw, disposed or not.
+							unexpected.Enqueue(e);
+						}
+					}
+				}) { IsBackground = true }).ToList();
+				var init = new Thread(() => {
+					Volatile.Write(ref initThread, Environment.CurrentManagedThreadId);
+					callerThreads[Environment.CurrentManagedThreadId] = true;
+					try {
+						dof.Init(config.TableFile, "vpetest");
+					} catch (Exception e) {
+						unexpected.Enqueue(e);
+					}
+				}) { IsBackground = true };
+				var disposerThreads = new ConcurrentDictionary<int, bool>();
+				var disposers = Enumerable.Range(0, 2).Select(_ => new Thread(() => {
+					disposerThreads[Environment.CurrentManagedThreadId] = true;
+					dof.Dispose();
+				}) { IsBackground = true }).ToList();
+				try {
+					callers.ForEach(t => t.Start());
+					init.Start();
+					Assert.That(inside.Wait(10000), Is.True, "init is held in libdof");
+					disposers.ForEach(t => t.Start());
+					Assert.That(disposing.Wait(10000), Is.True, "the callers see the dispose");
+					Assert.That(disposers.Any(t => t.Join(0)), Is.False, "no disposer returns while a call is in flight");
+					release.Set();
+					Assert.That(init.Join(30000), Is.True, "init returned");
+					Assert.That(disposers.All(t => t.Join(30000)), Is.True, "both disposers returned");
+				} finally {
+					release.Set();
+					Volatile.Write(ref stop, 1);
+					Assert.That(callers.All(t => t.Join(10000)), Is.True, "the callers ended");
+					DofLibrary.SetLog((level, message) => _log.Enqueue($"[{level}] {message}"), DofLogLevel.Debug);
+				}
+				Assert.That(unexpected, Is.Empty, string.Join("\n", unexpected));
+				Assert.That(shutdownThreads.Count, Is.EqualTo(1), "libdof shut down once");
+				Assert.That(shutdownThreads.All(disposerThreads.ContainsKey), Is.True, "on a disposing thread");
+				Assert.That(shutdownThreads.Any(callerThreads.ContainsKey), Is.False, "never on a caller's");
+
+				// Each member does what it does on a disposed instance.
+				Assert.That(dof.SetOutputGate(true), Is.EqualTo(-1), "no gate after dispose");
+				Assert.That(dof.LatchOutputGate(), Is.EqualTo(-1), "no latch after dispose");
+				Assert.That(dof.PendingInput, Is.Zero, "no input after dispose");
+				dof.Data('S', 1, 1);
+				dof.DataNamed("vpe_named", 1);
+				Assert.Throws<ObjectDisposedException>(() => dof.GetGateState(1));
+				Assert.Throws<ObjectDisposedException>(() => dof.Finish());
+				dof.Dispose();
+				// The instance is gone once Dispose returned: the next one can be created.
+				using (DofInstance.Create(config.Root)) {
+				}
+			}
+		}
+
+		[Test]
+		public void HotPathDoesNotAllocate()
+		{
+			var unit = Unit("ArtNetA");
+			using var config = StandardConfig(unit);
+			using var dof = Start(config);
+			long Measure()
+			{
+				var before = GC.GetAllocatedBytesForCurrentThread();
+				for (var i = 0; i < 1000; i++) {
+					dof.Data('S', 1, i & 1);
+					dof.SetOutputGate(true);
+				}
+				_ = dof.PendingInput;
+				dof.LatchOutputGate();
+				return GC.GetAllocatedBytesForCurrentThread() - before;
+			}
+			Measure();
+			Assert.That(Measure(), Is.Zero, "the handle is held for each call without allocating");
+			dof.Finish();
+			dof.Dispose();
+			Assert.That(Measure(), Is.Zero, "nor once disposed");
+		}
+
+		[Test]
 		public void FailedInitLeavesTheProcessUsable()
 		{
 			using var empty = new TestConfig();
@@ -763,11 +894,8 @@ namespace VisualPinball.Engine.DOF.Test
 				Assert.That((state.Applied, state.Superseded, state.Written, state.Failed), Is.EqualTo((true, false, 1, 0)), state.ToString());
 			} finally {
 				release.Set();
-				// Finish ends before the instance is disposed, also when an assertion above failed.
-				try {
-					finish?.Wait(TimeSpan.FromSeconds(30));
-				} catch (AggregateException) {
-				}
+				// The hook is taken off before the events go: SetLog returns once no line is in it. Disposing the instance
+				// waits for a finish still running, also when an assertion above failed.
 				DofLibrary.SetLog((level, message) => _log.Enqueue($"[{level}] {message}"), DofLogLevel.Debug);
 			}
 		}
