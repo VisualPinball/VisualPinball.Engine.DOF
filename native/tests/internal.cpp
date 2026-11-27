@@ -1690,8 +1690,24 @@ void ScheduleAppliesToTheOutputsItLists()
 
 }
 
+// Ends the run with a failure if it is not over in time: a test that deadlocks, such as a thread that never returns to its
+// join, fails the build and CI promptly instead of hanging them.
+void StartWatchdog(int seconds)
+{
+	std::thread([seconds]() {
+		std::this_thread::sleep_for(std::chrono::seconds(seconds));
+		std::fprintf(stderr, "FAIL: the internal tests did not end within %d s, a test is hung\n", seconds);
+		std::fflush(stderr);
+		std::fflush(stdout);
+		std::_Exit(3);
+	}).detach();
+}
+
 int main()
 {
+	// VPE_DOF_INTERNAL_TIMEOUT: seconds, 120 by default.
+	const char* timeout = std::getenv("VPE_DOF_INTERNAL_TIMEOUT");
+	StartWatchdog(timeout && std::atoi(timeout) > 0 ? std::atoi(timeout) : 120);
 	EffectsThatNeverStartedAreNotFinished();
 	MatrixEffectWhoseToyFailsIsFinished();
 	UntouchedUnitsAreCountedApart();

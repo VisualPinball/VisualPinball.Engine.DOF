@@ -114,14 +114,15 @@ namespace VisualPinball.Engine.DOF.Test
 		/// <summary>Whether the thread is blocked: in a wait, a sleep, a join or on a lock.</summary>
 		private static bool Blocked(Thread thread) => (thread.ThreadState & System.Threading.ThreadState.WaitSleepJoin) != 0;
 
-		/// <summary>Waits until a thread that set <paramref name="entering"/> right before a call is blocked inside it.</summary>
-		private static bool WaitBlockedInside(Thread thread, ManualResetEventSlim entering, int timeoutMs = 10000)
+		/// <summary>
+		/// Waits until a thread that raised its flag (<paramref name="entered"/>) right before a call is blocked inside it. The
+		/// flag is a plain write, which never blocks, so once it is up a blocked thread is blocked in the call. A thread that
+		/// waits by polling (Dispose sleeps between its looks at the calls) is caught in one of its sleeps.
+		/// </summary>
+		private static bool WaitBlockedInside(Thread thread, Func<bool> entered, int timeoutMs = 10000)
 		{
 			var watch = Stopwatch.StartNew();
-			if (!entering.Wait(timeoutMs)) {
-				return false;
-			}
-			while (!Blocked(thread)) {
+			while (!entered() || !Blocked(thread)) {
 				if (watch.ElapsedMilliseconds > timeoutMs) {
 					return false;
 				}
@@ -278,9 +279,11 @@ namespace VisualPinball.Engine.DOF.Test
 			// off is the closing's, and every frame after that one must stay off while the gate is closed.
 			var closing = ExpectIndex(unit.Universe, f => f.Take(8).All(v => v == 0), "all off after closing", shown + 1);
 
-			// Effects keep running while closed, but nothing reaches the outputs.
+			// Effects keep running while closed, but nothing reaches the outputs. The frame waited for comes after DOF's main
+			// thread applied the changes, so the window below covers what they would light.
 			dof.Data('S', 2, 1);
 			dof.Data('S', 3, 1);
+			WaitForInput(dof);
 			ExpectFrameAfter(unit.Universe, closing + 1, "a frame while closed, after the effects changed");
 			// Every frame received before the opening is requested was sent while closed.
 			var baseline = _capture.Mark(unit.Universe);
@@ -319,7 +322,9 @@ namespace VisualPinball.Engine.DOF.Test
 				Assert.That(later, Is.GreaterThan(latched));
 				Assert.That(WaitSettled(dof, later).Written, Is.EqualTo(1), "a later opening confirms the closed state");
 				dof.Data('S', 2, 1);
-				// The session started closed, so every frame it ever sent is all off unless something opened it.
+				// After DOF's main thread applied the change, so the frames below cover what it would light. The session
+				// started closed, so every frame it ever sent is all off unless something opened it.
+				WaitForInput(dof);
 				ExpectFrameAfter(unit.Universe, mark, "a frame after the effect changed");
 				var after = FramesBetween(unit.Universe, mark);
 				Assert.That(after.All(f => f.Take(8).All(v => v == 0)), Is.True, "nothing opens a latched gate");
@@ -514,10 +519,10 @@ namespace VisualPinball.Engine.DOF.Test
 					}
 				}) { IsBackground = true };
 				var disposerThreads = new ConcurrentDictionary<int, bool>();
-				var entering = Enumerable.Range(0, 2).Select(_ => new ManualResetEventSlim()).ToList();
+				var entered = new int[2];
 				var disposers = Enumerable.Range(0, 2).Select(index => new Thread(() => {
 					disposerThreads[Environment.CurrentManagedThreadId] = true;
-					entering[index].Set();
+					Volatile.Write(ref entered[index], 1);
 					dof.Dispose();
 				}) { IsBackground = true }).ToList();
 				DofLibrary.SetLog((level, message) => {
@@ -541,23 +546,20 @@ namespace VisualPinball.Engine.DOF.Test
 					// Both disposers are inside Dispose, blocked there (one waits for the calls, the other for the first),
 					// while the call is still held.
 					for (var i = 0; i < disposers.Count; i++) {
-						Assert.That(WaitBlockedInside(disposers[i], entering[i]), Is.True, $"disposer {i} is blocked in Dispose");
+						var index = i;
+						Assert.That(WaitBlockedInside(disposers[i], () => Volatile.Read(ref entered[index]) != 0), Is.True, $"disposer {i} is blocked in Dispose");
 					}
 					Assert.That(disposers.Any(t => !t.IsAlive), Is.False, "no disposer returns while a call is in flight");
 					release.Set();
 					Assert.That(init.Join(30000), Is.True, "init returned");
 					Assert.That(disposers.All(t => t.Join(30000)), Is.True, "both disposers returned");
 				} finally {
-					try {
-						release.Set();
-						Volatile.Write(ref stop, 1);
-						ended = Joined(init, 30000) & callers.All(t => Joined(t, 10000));
-						// The instance never outlives the test, also when an assertion above failed: a Dispose after the
-						// disposers' returns at once, one while they still run waits for them.
-						BoundedCleanup(dof);
-					} finally {
-						entering.ForEach(e => e.Dispose());
-					}
+					release.Set();
+					Volatile.Write(ref stop, 1);
+					ended = Joined(init, 30000) & callers.All(t => Joined(t, 10000));
+					// The instance never outlives the test, also when an assertion above failed: a Dispose after the
+					// disposers' returns at once, one while they still run waits for them.
+					BoundedCleanup(dof);
 				}
 				Assert.That(ended, Is.True, "init and the callers ended");
 				Assert.That(unexpected, Is.Empty, string.Join("\n", unexpected));
@@ -694,7 +696,7 @@ namespace VisualPinball.Engine.DOF.Test
 			var held = 0;
 			using var inside = new ManualResetEventSlim();
 			using var release = new ManualResetEventSlim();
-			using var entering = new ManualResetEventSlim();
+			var entered = 0;
 			var shutdownThreads = new ConcurrentQueue<int>();
 			Exception initError = null;
 			Exception disposeError = null;
@@ -716,7 +718,7 @@ namespace VisualPinball.Engine.DOF.Test
 			}) { IsBackground = true };
 			var disposer = new Thread(() => {
 				disposerThread = Environment.CurrentManagedThreadId;
-				entering.Set();
+				Volatile.Write(ref entered, 1);
 				try {
 					dof.Dispose();
 				} catch (Exception e) {
@@ -742,11 +744,12 @@ namespace VisualPinball.Engine.DOF.Test
 				init.Start();
 				Assert.That(inside.Wait(10000), Is.True, "init is held in libdof");
 				disposer.Start();
-				Assert.That(WaitBlockedInside(disposer, entering), Is.True, "the disposer waits for init");
+				Assert.That(WaitBlockedInside(disposer, () => Volatile.Read(ref entered) != 0), Is.True, "the disposer waits for init");
 				for (var i = 0; i < 2; i++) {
 					disposer.Interrupt();
 					Assert.That(disposer.Join(200), Is.False, $"the disposer still waits for init after interrupt {i + 1}");
-					Assert.That(Blocked(disposer), Is.True, $"and is blocked again after interrupt {i + 1}");
+					// It polls the calls with a sleep, so it is caught in its next one.
+					Assert.That(WaitBlockedInside(disposer, () => true), Is.True, $"and is blocked again after interrupt {i + 1}");
 				}
 				init.Interrupt();
 				release.Set();
@@ -911,29 +914,29 @@ namespace VisualPinball.Engine.DOF.Test
 			Measure();
 			Assert.That(Measure(), Is.Zero, "the handle is held for each call without allocating");
 
-			// The last call to return while a Dispose waits signals it, also with an interrupt pending on its thread.
+			// The last call to return while a Dispose waits only takes itself off the count, which the Dispose polls: it
+			// signals nothing and does not allocate, also with an interrupt pending on its thread, which it leaves for the
+			// thread's next wait.
 			const BindingFlags Private = BindingFlags.NonPublic | BindingFlags.Instance;
 			var calls = typeof(DofInstance).GetField("_calls", Private);
 			var state = typeof(DofInstance).GetField("_state", Private);
-			var drained = (ManualResetEvent)typeof(DofInstance).GetField("_drained", Private).GetValue(dof);
 			var release = (Action)Delegate.CreateDelegate(typeof(Action), dof, typeof(DofInstance).GetMethod("Release", Private));
-			long Signal()
+			long Release()
 			{
 				calls.SetValue(dof, 1);
-				drained.Reset();
 				var before = GC.GetAllocatedBytesForCurrentThread();
 				release();
 				return GC.GetAllocatedBytesForCurrentThread() - before;
 			}
 			state.SetValue(dof, 1);
 			try {
-				Signal();
-				Assert.That(drained.WaitOne(0), Is.True, "the last call signalled the Dispose");
+				Assert.That(Release(), Is.Zero, "the last call does not allocate");
+				Assert.That(calls.GetValue(dof), Is.Zero, "and is off the count");
 				Thread.CurrentThread.Interrupt();
-				var signalled = Signal();
+				var released = Release();
 				Assert.That(() => Thread.Sleep(1000), Throws.InstanceOf<ThreadInterruptedException>(), "the interrupt is left for the next wait");
-				Assert.That(drained.WaitOne(0), Is.True, "and the Dispose signalled");
-				Assert.That(signalled, Is.Zero, "the signal does not allocate");
+				Assert.That(released, Is.Zero, "nor with an interrupt pending");
+				Assert.That(calls.GetValue(dof), Is.Zero, "which takes it off the count too");
 			} finally {
 				try {
 					Thread.Sleep(0);
@@ -942,7 +945,6 @@ namespace VisualPinball.Engine.DOF.Test
 				}
 				state.SetValue(dof, 0);
 				calls.SetValue(dof, 0);
-				drained.Reset();
 			}
 			dof.Finish();
 			dof.Dispose();
@@ -1276,7 +1278,7 @@ namespace VisualPinball.Engine.DOF.Test
 			var unit = Unit("ArtNetA");
 			using var config = new TestConfig().GlobalConfig().Cabinet(8, unit).Ini(1, "vpetest,S1");
 			using var dof = Start(config);
-			// Used while open, so finish has to send its final frame.
+			// Used while open.
 			dof.Data('S', 1, 1);
 			var shown = ExpectIndex(unit.Universe, f => f[0] == 255, "S1 on");
 			// Past the minimum effect duration (60 ms), which would hold S1 on for a moment after it goes off.
@@ -1298,9 +1300,11 @@ namespace VisualPinball.Engine.DOF.Test
 			Assert.That(open, Is.GreaterThanOrEqualTo(0), "the opening was accepted");
 			var opening = dof.GetGateState(open);
 			Assert.That((opening.Applied, opening.Superseded), Is.EqualTo((true, false)), "finish applied the opening: " + opening);
-			// Finish returned: what it sent is all there once the capture caught up.
+			// Finish returned: what was sent is all there once the capture caught up. Finish's own write is not told apart
+			// from a refresh here, which sends the same frame; that it went out is what Finish returning says, since Finish
+			// fails when a controller in use sent neither its final update nor its disconnect blackout.
 			var after = FramesBetween(unit.Universe, closing + 1, _capture.Mark(unit.Universe));
-			Assert.That(after, Is.Not.Empty, "finish sends a final frame");
+			Assert.That(after, Is.Not.Empty, "frames came after the closing");
 			Assert.That(after.All(f => f[0] == 0), Is.True, "S1 was off before the gate opened: " + string.Join(",", after.Select(f => f[0])));
 		}
 

@@ -141,11 +141,8 @@ namespace VisualPinball.Engine.DOF
 		// The calls admitted into libdof (Enter) that have not returned yet.
 		private int _calls;
 		private int _state = Alive;
-		// Set by the call that brings the count to 0 once Dispose started; the Dispose that destroys the instance waits on it.
-		// Kernel events, not a monitor, so neither the last call nor the waits need a lock. Never disposed: a late waiter
-		// may still hold one, so they are left to finalization.
-		private readonly ManualResetEvent _drained = new ManualResetEvent(false);
-		// Set once the instance is destroyed; a second Dispose waits on it.
+		// Set once the instance is destroyed; a second Dispose waits on it. Never disposed: a late waiter may still hold it,
+		// so it is left to finalization. The calls never touch it.
 		private readonly ManualResetEvent _destroyed = new ManualResetEvent(false);
 		// The managed thread that runs the destruction, once a Dispose won.
 		private int _destroyingThread;
@@ -325,8 +322,8 @@ namespace VisualPinball.Engine.DOF
 		/// write to the device (each report, packet, command or retry), and then sends the closing to every output. A
 		/// write that was already past that check when the latch came can still reach the device after the latch returned:
 		/// at most that one write per controller, followed by the closing. Nothing else of the opening goes out. Takes no
-		/// lock and does not allocate, so the simulation thread or a fault handler may call it (the last call to return while
-		/// a Dispose waits for the calls signals an event to wake it). Once it returned, the gate
+		/// lock, never waits and does not allocate, so the simulation thread or a fault handler may call it, also while a
+		/// Dispose waits for the calls. Once it returned, the gate
 		/// reports closed, also to an opening DOF's main thread is applying at that moment. It never reaches a later
 		/// instance's gate.
 		/// </summary>
@@ -451,14 +448,15 @@ namespace VisualPinball.Engine.DOF
 				return;
 			}
 			Volatile.Write(ref _destroyingThread, thread);
-			// The count is read after the state became Disposing, so a call that brought it to 0 before that, and did not
-			// signal, is seen here. Once a call brought it to 0 while disposing, every admitted call returned: what the
-			// count still shows are calls that are being turned away, which take it off again at once. The instance is
-			// destroyed whatever interrupts this thread meanwhile: only then is the interrupt raised.
+			// The count is read after the state became Disposing, so every call admitted before that is counted, and no call
+			// is admitted after it: what the count shows are the admitted calls and the ones being turned away, which take
+			// themselves off again at once. Polled, so the calls never signal anything: a call that returns takes no lock and
+			// never waits, and Dispose is rare enough that a millisecond's delay costs nothing. The instance is destroyed
+			// whatever interrupts this thread meanwhile: only then is the interrupt raised.
 			var interrupted = false;
 			while (Volatile.Read(ref _calls) != 0) {
 				try {
-					_drained.WaitOne();
+					Thread.Sleep(1);
 				} catch (ThreadInterruptedException) {
 					interrupted = true;
 				}
@@ -509,14 +507,9 @@ namespace VisualPinball.Engine.DOF
 		}
 
 		/// <summary>
-		/// Takes a call off the count; the last one while Dispose waits wakes it by setting an event, which neither waits
-		/// nor takes a lock, so a call that returns never blocks or throws here.
+		/// Takes a call off the count, which a Dispose that waits for the calls polls: no signal, no lock, no wait, so a call
+		/// that returns never blocks or throws here.
 		/// </summary>
-		private void Release()
-		{
-			if (Interlocked.Decrement(ref _calls) == 0 && Volatile.Read(ref _state) == Disposing) {
-				_drained.Set();
-			}
-		}
+		private void Release() => Interlocked.Decrement(ref _calls);
 	}
 }
