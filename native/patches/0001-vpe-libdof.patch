@@ -903,10 +903,10 @@ index 0d7a194..45b44d2 100644
        controllerElement = controllerElement->NextSiblingElement();
 diff --git a/src/cab/out/OutputGate.cpp b/src/cab/out/OutputGate.cpp
 new file mode 100644
-index 0000000..e4adec1
+index 0000000..d5d7bbc
 --- /dev/null
 +++ b/src/cab/out/OutputGate.cpp
-@@ -0,0 +1,385 @@
+@@ -0,0 +1,386 @@
 +#include "OutputGate.h"
 +
 +#include <cstdint>
@@ -1215,9 +1215,10 @@ index 0000000..e4adec1
 +      return UnitState::Confirmed;
 +   if (unit.m_failed.load(std::memory_order_acquire) >= generation)
 +      return UnitState::Failed;
-+   // A unit still held at the closing it registered under (Unit::Observe) that failed it delivers no later change before
-+   // that closing got through: it fails them, as a unit that failed them itself does.
-+   if (unit.HeldClosed() && generation > unit.m_closedAtRegistration && unit.m_failed.load(std::memory_order_acquire) >= unit.m_closedAtRegistration)
++   // A unit still held at the closing it registered under (Unit::Observe) that failed it delivers no later opening before
++   // that closing got through: it fails them, as a unit that failed them itself does. A later closing is not held: the
++   // unit writes it, and it stays pending until that write got through or failed.
++   if (open && unit.HeldClosed() && generation > unit.m_closedAtRegistration && unit.m_failed.load(std::memory_order_acquire) >= unit.m_closedAtRegistration)
 +      return UnitState::Failed;
 +   if (known && open && unit.m_untouched.load(std::memory_order_acquire) >= generation)
 +      return UnitState::Untouched;

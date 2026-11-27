@@ -756,9 +756,10 @@ void SessionThatStartsClosedStartsDark()
 	// The updater is held in its first connect, before it observes the gate, until the opening is published.
 	std::atomic<bool> opened { false };
 	std::atomic<bool> held { false };
+	std::atomic<bool> heldUntilOpened { false };
 	controller.onFirstConnect = [&]() {
 		held = true;
-		WaitFor([&opened]() { return opened.load(); });
+		heldUntilOpened = WaitFor([&opened]() { return opened.load(); });
 	};
 	controller.Init(nullptr);
 	CHECK(WaitFor([&held]() { return held.load(); }), "the updater is held in its first connect");
@@ -775,6 +776,7 @@ void SessionThatStartsClosedStartsDark()
 	CHECK(WaitFor([&]() { return gate.GetState(open, counts) == OutputGate::Status::Applied && counts.pending == 0; }) && counts.untouched == 1, "the opening after it leaves the unit alone");
 	CHECK(!controller.HasWritten("test"), "no connect test went out before the closing was written");
 	controller.Finish();
+	CHECK(heldUntilOpened, "the updater first observed the gate once the opening was published");
 }
 
 // A session that starts closed sends no connect test, also not on a reconnect once the gate opened: the test was used
@@ -807,7 +809,8 @@ void FailedStartupBlackoutIsSentAgain()
 	controller.SetName("scripted");
 	controller.failWrites = true;
 	std::atomic<bool> opened { false };
-	controller.onFirstConnect = [&opened]() { WaitFor([&opened]() { return opened.load(); }); };
+	std::atomic<bool> heldUntilOpened { false };
+	controller.onFirstConnect = [&]() { heldUntilOpened = WaitFor([&opened]() { return opened.load(); }); };
 	controller.Init(nullptr);
 	int64_t open = Change(gate, true);
 	opened = true;
@@ -822,6 +825,49 @@ void FailedStartupBlackoutIsSentAgain()
 	CHECK(controller.HasWritten("0=0") && controller.HasWritten("1=0"), "to every output");
 	CHECK(WaitFor([&]() { return gate.GetState(open, counts) == OutputGate::Status::Applied && counts.untouched == 1; }), "then the opening leaves the unit alone");
 	controller.Finish();
+	CHECK(heldUntilOpened, "the updater first observed the gate once the opening was published");
+}
+
+// A closing after a failed startup blackout is the unit's to write, not a change it fails for the blackout it still owes:
+// it stays pending until the unit tried it, fails when that write fails, and is confirmed once it gets through.
+void ClosingAfterAFailedStartupBlackoutIsTried()
+{
+	OutputGate& gate = OutputGate::BeginSession();
+	int64_t closed = Change(gate, false);
+	ScriptedController controller;
+	controller.SetName("scripted");
+	controller.failWrites = true;
+	// The updater is held in the disconnect after the failed startup blackout, before it observes the gate again.
+	std::atomic<bool> holdOnce { true };
+	std::atomic<bool> held { false };
+	std::atomic<bool> released { false };
+	std::atomic<bool> heldUntilReleased { true };
+	controller.onDisconnect = [&]() {
+		if (!holdOnce.exchange(false))
+			return;
+		held = true;
+		heldUntilReleased = WaitFor([&released]() { return released.load(); });
+	};
+	controller.Init(nullptr);
+	OutputGate::Counts counts;
+	CHECK(WaitFor([&held]() { return held.load(); }), "the updater is held after its startup blackout failed");
+	gate.GetState(closed, counts);
+	CHECK(counts.failed == 1, "the startup blackout failed");
+	int64_t latched = gate.Latch();
+	CHECK(gate.GetState(latched, counts) == OutputGate::Status::Applied && counts.pending == 1 && counts.failed == 0, "the latch is pending before the unit tried it");
+	released = true;
+	CHECK(WaitFor([&]() { return controller.connects.load() >= 3 && gate.GetState(latched, counts) == OutputGate::Status::Applied && counts.failed == 1; }), "it fails when its own write fails");
+	controller.failWrites = false;
+	CHECK(WaitFor([&]() {
+		gate.GetState(latched, counts);
+		return counts.confirmed == 1;
+	}),
+		  "it is confirmed once the device is back");
+	gate.GetState(closed, counts);
+	CHECK(counts.confirmed == 1, "with the startup blackout");
+	CHECK(controller.HasWritten("0=0") && controller.HasWritten("1=0"), "to every output");
+	controller.Finish();
+	CHECK(heldUntilReleased, "the updater was held until the latch was classified");
 }
 
 // A connect test is checked again at its write: a latch between the decision and the write (one in the log line)
@@ -1431,6 +1477,7 @@ int main()
 	SessionThatStartsClosedTestsOnNoReconnect();
 	LatchBeforeTheConnectTestSkipsIt();
 	FailedStartupBlackoutIsSentAgain();
+	ClosingAfterAFailedStartupBlackoutIsTried();
 	BlackoutConfirmsWhereItIsSent();
 	PermanentFailureOutranksAnAck();
 	CleanFinishKeepsTheSettledResult();
