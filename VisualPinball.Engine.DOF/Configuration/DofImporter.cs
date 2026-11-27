@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Text;
 using System.Xml.Linq;
 
 namespace VisualPinball.Engine.DOF.Configuration
@@ -97,6 +98,12 @@ namespace VisualPinball.Engine.DOF.Configuration
 				report.Error($"\"{source}\" does not exist.");
 				return report;
 			}
+			var name = Path.GetFileName(source.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+			// A drive's root has no name of its own: keep the whole path.
+			if (name.Length == 0) {
+				name = source;
+			}
+			report.Origin = Directory.Exists(source) ? $"the folder {name}" : name;
 			var staging = _store.CreateStaging();
 			try {
 				var input = Path.Combine(staging, "in");
@@ -155,6 +162,7 @@ namespace VisualPinball.Engine.DOF.Configuration
 				report.Error("No DOF configuration is imported.");
 				return report;
 			}
+			report.Origin = "new serial ports";
 			var staging = _store.CreateStaging();
 			try {
 				var config = Read(active);
@@ -1007,6 +1015,9 @@ namespace VisualPinball.Engine.DOF.Configuration
 				}
 				AnalyseRomMatching(rows, report);
 				File.WriteAllText(Path.Combine(revision.BasePath, DofRevision.ReportFile), report.Format(revision.Id));
+				if (!string.IsNullOrEmpty(report.Origin)) {
+					File.WriteAllText(Path.Combine(revision.BasePath, DofRevision.OriginFile), report.Origin, new UTF8Encoding(false));
+				}
 				_store.Activate(revision);
 				published = true;
 				report.Revision = revision.Id;

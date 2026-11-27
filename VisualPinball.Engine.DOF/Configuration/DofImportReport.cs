@@ -76,6 +76,9 @@ namespace VisualPinball.Engine.DOF.Configuration
 
 		public bool HasErrors => RejectionReason != null;
 
+		/// <summary>What the import is made from, such as the zip's name; written with the revision.</summary>
+		internal string Origin { get; set; }
+
 		internal void Info(DofReportTopic topic, string message) => _entries.Add(new DofReportEntry(DofReportSeverity.Info, topic, message));
 		internal void Warning(DofReportTopic topic, string message) => _entries.Add(new DofReportEntry(DofReportSeverity.Warning, topic, message));
 		internal void Error(string message) => _entries.Add(new DofReportEntry(DofReportSeverity.Error, DofReportTopic.General, message));

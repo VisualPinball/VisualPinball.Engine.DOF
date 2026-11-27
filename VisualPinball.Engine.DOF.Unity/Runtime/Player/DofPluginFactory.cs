@@ -6,6 +6,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -26,7 +27,7 @@ namespace VisualPinball.Engine.DOF.Player
 	/// The DOF plugin: imports DOF configurations, runs DOF for each game and publishes the cabinet triggers, and
 	/// describes the settings the Player renders.
 	/// </summary>
-	internal sealed class DofPluginFactory : IPlayerPluginFactory, IPluginSettingsProvider, IPluginSystemDefaults
+	internal sealed class DofPluginFactory : IPlayerPluginFactory, IPluginSettingsProvider, IPluginSettingsInfoProvider, IPluginSystemDefaults
 	{
 		internal const string Id = "org.visualpinball.dof";
 		private const string PinMameId = "org.visualpinball.pinmame";
@@ -54,6 +55,8 @@ namespace VisualPinball.Engine.DOF.Player
 
 		private readonly object _catalogLock = new object();
 		private DofCatalog _catalog;
+		private readonly object _detectionLock = new object();
+		private (IReadOnlyList<DofDetectedDevice> Devices, DateTime When)? _detection;
 		private volatile DofConfigStore _store;
 		private volatile PluginOutputLeases _leases;
 
@@ -180,16 +183,23 @@ namespace VisualPinball.Engine.DOF.Player
 		#region Schema
 
 		private static PluginSettingsSchema BuildSchema() => new PluginSettingsSchema(1,
-			new PluginSettingsGroup("Configuration", "Download your configuration from the DOF Config Tool with your browser and import the zip here. VPE never contacts the Config Tool. Imports apply from the next game.",
-				new PluginField("Status", "Status", SettingKind.Status),
-				new PluginField("ImportZip", "Config Tool zip or file", SettingKind.File) { Default = "", FullWidth = true,
-					Description = "A directoutputconfig.zip from the Config Tool, or a single file such as Cabinet.xml. It replaces the files it contains and keeps the rest, such as your cabinet file." },
-				new PluginField("ImportZipAction", "Import", SettingKind.Action) { Provider = "import-zip" },
-				new PluginField("ImportFolder", "Configuration folder", SettingKind.Folder) { Default = "", FullWidth = true,
-					Description = "A complete DOF configuration, such as the Config folder of an existing DirectOutput installation. It replaces the whole configuration." },
-				new PluginField("ImportFolderAction", "Import folder", SettingKind.Action) { Provider = "import-folder" },
-				new PluginField("ShowImport", "Show configuration", SettingKind.Action) { Provider = "show-import" },
-				new PluginField("Rollback", "Undo last import", SettingKind.Action) { Provider = "rollback" }),
+			new PluginSettingsGroup("Configuration", "Imports apply from the next game. VPE never contacts the DOF Config Tool.",
+				new PluginField("ActiveConfig", "Active configuration", SettingKind.Info) { Provider = "configuration" },
+				new PluginField("ShowImport", "Show details", SettingKind.Action) { Provider = "show-import", AttachTo = "ActiveConfig" },
+				new PluginField("Rollback", "Undo last import", SettingKind.Action) { Provider = "rollback", AttachTo = "ActiveConfig" }),
+			new PluginSettingsGroup("Import from the Config Tool", "Download your directoutputconfig.zip from the DOF Config Tool with your browser. Importing it replaces the files it contains and keeps the rest, such as your cabinet file.",
+				new PluginField("ImportZip", "Zip or file", SettingKind.File) { Default = "", FullWidth = true,
+					Description = "A directoutputconfig.zip, or a single file such as Cabinet.xml." },
+				new PluginField("ImportZipAction", "Import", SettingKind.Action) { Provider = "import-zip", AttachTo = "ImportZip" }),
+			new PluginSettingsGroup("Import an existing installation", "A complete DOF configuration, such as the Config folder of DirectOutput. Importing it replaces the whole configuration; the folder is copied, never changed.",
+				new PluginField("ImportFolder", "Configuration folder", SettingKind.Folder) { Default = "", FullWidth = true },
+				new PluginField("ImportFolderAction", "Import", SettingKind.Action) { Provider = "import-folder", AttachTo = "ImportFolder" }),
+			new PluginSettingsGroup("Hardware", "The connected boards DOF knows, found without opening them. A test turns one output on for a moment, outside a game; All off turns every output off, such as one a game that crashed left on.",
+				new PluginField("Devices", "Connected boards", SettingKind.Info) { Provider = "devices" },
+				new PluginField("Detect", "Detect again", SettingKind.Action) { Provider = "detect", AttachTo = "Devices" },
+				new PluginField("AllOff", "All off", SettingKind.Action) { Provider = "all-off", AttachTo = "Devices" },
+				new PluginField("TestPort", "Test an output", SettingKind.Choice) { Default = "", Provider = "test-ports", FullWidth = true },
+				new PluginField("PulsePort", "Test", SettingKind.Action) { Provider = "pulse-port", AttachTo = "TestPort" }),
 			new PluginSettingsGroup("Serial ports", "Changes the port of a controller in your cabinet file, for when the board got another port on this computer.",
 				new PluginField("SerialOverrides", "Ports", SettingKind.Collection) { Default = new JArray(), FullWidth = true,
 					Description = "The controller's name in the cabinet file, and the port to use. Applied to the active configuration and to every import.",
@@ -197,13 +207,7 @@ namespace VisualPinball.Engine.DOF.Player
 						new PluginField("Controller", "Controller", SettingKind.Text) { Default = "" },
 						new PluginField("Port", "Port", SettingKind.Text) { Default = "" },
 					} },
-				new PluginField("ApplySerialOverrides", "Apply ports", SettingKind.Action) { Provider = "apply-serial-overrides" }),
-			new PluginSettingsGroup("Hardware", "Detection lists connected boards DOF knows, without opening them. A test turns one output on for a moment, outside a game; All off turns every output off.",
-				new PluginField("Detect", "Detect devices", SettingKind.Action) { Provider = "detect" },
-				new PluginField("TestPort", "Output", SettingKind.Choice) { Default = "", Provider = "test-ports", FullWidth = true },
-				new PluginField("PulsePort", "Test output", SettingKind.Action) { Provider = "pulse-port" },
-				new PluginField("AllOff", "All off", SettingKind.Action) { Provider = "all-off",
-					Description = "Turns every output of the cabinet off, such as one a game that crashed left on." }),
+				new PluginField("ApplySerialOverrides", "Apply ports", SettingKind.Action) { Provider = "apply-serial-overrides", AttachTo = "SerialOverrides" }),
 			new PluginSettingsGroup("This game", "Which configuration rows the game uses.",
 				new PluginField("Rom", "Game name", SettingKind.Choice) { Default = DofGameSetup.Auto, Scope = ConfigurationScope.GameOnly, Provider = "roms", FullWidth = true,
 					Description = "Automatic uses the ROM the game plays, or the name the table sets for DOF. A table mapping for the table's name is offered here." }));
@@ -303,6 +307,101 @@ namespace VisualPinball.Engine.DOF.Player
 
 		#endregion
 
+		#region Information
+
+		public Task<PluginInfo> DescribeAsync(string provider, PluginChoiceRequest request, CancellationToken cancellation)
+			=> Task.Run(() => Describe(provider, cancellation), cancellation);
+
+		private PluginInfo Describe(string provider, CancellationToken cancellation)
+		{
+			cancellation.ThrowIfCancellationRequested();
+			switch (provider) {
+				case "configuration": return DescribeConfiguration();
+				case "devices": return DescribeDevices();
+				default: return new PluginInfo("");
+			}
+		}
+
+		private PluginInfo DescribeConfiguration()
+		{
+			var revision = Store.Active;
+			if (revision == null) {
+				return new PluginInfo("No configuration imported", PluginInfoTone.Problem, new[] {
+					Line("Next", "Import the zip you downloaded from the DOF Config Tool, or an existing DirectOutput folder, below."),
+				});
+			}
+			var catalog = CatalogOf(revision);
+			var warnings = revision.CountWarnings();
+			var origin = revision.ReadOrigin();
+			var games = catalog.Rows.Select(r => r.Rom).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+			var lines = new List<KeyValuePair<string, string>> {
+				Line("Imported", When(revision) + (origin != null ? ", from " + origin : "")),
+				Line("Games", games == 1 ? "1 game" : $"{games} games"),
+				Line("Devices", catalog.Devices.Count == 0 ? "No ini files" : string.Join(", ", catalog.Devices.Select(d => $"{d.Number} ({d.FileName})"))),
+				Line("Cabinet", DescribeCabinet(catalog)),
+			};
+			if (catalog.TableConfigs.Count > 0) {
+				lines.Add(Line("Table configs", $"{catalog.TableConfigs.Count}, kept but not loaded"));
+			}
+			var previous = Store.Previous;
+			lines.Add(Line("Undo", previous != null ? "Goes back to the configuration of " + When(previous) : "Nothing to undo"));
+			return warnings == 0
+				? new PluginInfo("Active, without warnings", PluginInfoTone.Good, lines)
+				: new PluginInfo(warnings == 1 ? "Active, with 1 warning. Show details lists it." : $"Active, with {warnings} warnings. Show details lists them.", PluginInfoTone.Warning, lines);
+		}
+
+		private PluginInfo DescribeDevices()
+		{
+			IReadOnlyList<DofDetectedDevice> devices;
+			DateTime when;
+			try {
+				(devices, when) = Detection(false);
+			} catch (Exception e) when (e is DllNotFoundException || e is EntryPointNotFoundException || e is DofException) {
+				return new PluginInfo("The native DOF library could not be loaded: " + e.Message, PluginInfoTone.Problem);
+			}
+			var lines = new List<KeyValuePair<string, string>>();
+			foreach (var device in devices) {
+				var what = (device.Device > 0 ? $"Device {device.Device}" : $"Devices {device.DeviceRange}") + ": " + device.Info;
+				lines.Add(Line(device.Type, device.Notes.Count == 0 ? what : what + ". " + string.Join(" ", device.Notes)));
+			}
+			lines.Add(Line("Checked", when.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture)));
+			return devices.Count == 0
+				? new PluginInfo("No board DOF knows is connected", PluginInfoTone.Neutral, lines)
+				: new PluginInfo(devices.Count == 1 ? "1 board connected" : $"{devices.Count} boards connected", PluginInfoTone.Good, lines);
+		}
+
+		/// <summary>The boards last detected; detects them the first time, and again when asked to.</summary>
+		private (IReadOnlyList<DofDetectedDevice> Devices, DateTime When) Detection(bool again)
+		{
+			lock (_detectionLock) {
+				if (again || _detection == null) {
+					_detection = (DofDetection.Detect(DofLibrary.EnumerateDevices()), DateTime.UtcNow);
+				}
+				return _detection.Value;
+			}
+		}
+
+		private static string DescribeCabinet(DofCatalog catalog)
+		{
+			if (!catalog.HasCabinet) {
+				return "No cabinet file: DOF sets up the boards it finds itself";
+			}
+			var controllers = string.Join(", ", catalog.Controllers.Select(c => c.SerialPort != null ? $"{c.Name} on {c.SerialPort}" : c.Name));
+			if (catalog.Controllers.Count == 0) {
+				return catalog.AutoConfig
+					? "A cabinet file without controllers: DOF sets up the boards it finds"
+					: "A cabinet file without controllers, and automatic setup is off: DOF drives no board";
+			}
+			return catalog.AutoConfig ? controllers + ", and the boards DOF finds itself" : controllers;
+		}
+
+		private static string When(DofRevision revision)
+			=> revision.CreatedUtc?.ToLocalTime().ToString("d MMM yyyy, HH:mm", CultureInfo.InvariantCulture) ?? revision.Id;
+
+		private static KeyValuePair<string, string> Line(string label, string value) => new KeyValuePair<string, string>(label, value);
+
+		#endregion
+
 		#region Actions
 
 		public Task<PluginActionResult> RunActionAsync(string action, PluginChoiceRequest request, CancellationToken cancellation)
@@ -359,7 +458,7 @@ namespace VisualPinball.Engine.DOF.Player
 			}
 			message.Append(warnings.Count == 1 ? " 1 warning: " : $" {warnings.Count} warnings, the first: ").Append(warnings[0].Message);
 			if (warnings.Count > 1) {
-				message.Append(" Show configuration lists them all.");
+				message.Append(" Show details lists them all.");
 			}
 		}
 
@@ -369,17 +468,14 @@ namespace VisualPinball.Engine.DOF.Player
 			if (revision == null) {
 				return new PluginActionResult(false, "No DOF configuration is imported.");
 			}
+			// The Active configuration block already sums it up: the details are the controllers' types and the import report.
 			var catalog = CatalogOf(revision);
 			var text = new StringBuilder();
-			text.Append($"Revision {revision.Id}: ");
-			text.Append(catalog.Devices.Count == 1 ? "1 ini device" : $"{catalog.Devices.Count} ini devices");
-			text.Append($", {catalog.Rows.Select(r => r.Rom).Distinct(StringComparer.OrdinalIgnoreCase).Count()} games");
-			text.Append(catalog.Controllers.Count == 0 ? ", no cabinet file (DOF configures connected boards itself)" : ", controllers " + string.Join(", ", catalog.Controllers.Select(c => c.SerialPort != null ? $"{c.Name} ({c.Type}, {c.SerialPort})" : $"{c.Name} ({c.Type})")));
-			text.Append(catalog.TableConfigs.Count == 0 ? "." : $", {catalog.TableConfigs.Count} table configs (stored only, not loaded).");
-			var report = revision.ReadReport();
-			if (!string.IsNullOrWhiteSpace(report)) {
-				text.Append("\n").Append(report.Trim());
+			if (catalog.Controllers.Count > 0) {
+				text.Append("Controllers: ").Append(string.Join(", ", catalog.Controllers.Select(c => c.SerialPort != null ? $"{c.Name} ({c.Type}, {c.SerialPort})" : $"{c.Name} ({c.Type})"))).Append(".\n");
 			}
+			var report = revision.ReadReport();
+			text.Append(string.IsNullOrWhiteSpace(report) ? $"Revision {revision.Id} has no import report." : report.Trim());
 			return new PluginActionResult(true, text.ToString());
 		}
 
@@ -418,21 +514,12 @@ namespace VisualPinball.Engine.DOF.Player
 			return overrides;
 		}
 
-		private static PluginActionResult Detect()
+		// The list itself is the Connected boards information, which the page shows again after the action.
+		private PluginActionResult Detect()
 		{
-			var detected = DofDetection.Detect(DofLibrary.EnumerateDevices());
-			if (detected.Count == 0) {
-				return new PluginActionResult(true, "No board DOF knows is connected.");
-			}
-			var text = new StringBuilder(detected.Count == 1 ? "1 board:" : $"{detected.Count} boards:");
-			foreach (var device in detected) {
-				text.Append("\n").Append(device);
-				foreach (var note in device.Notes) {
-					text.Append("\n  ").Append(note);
-				}
-			}
-			Logger.Info("[DOF] Detected " + text);
-			return new PluginActionResult(true, text.ToString());
+			var (detected, _) = Detection(true);
+			Logger.Info("[DOF] Detected " + (detected.Count == 0 ? "no boards." : string.Join("; ", detected.Select(d => d.ToString()))));
+			return new PluginActionResult(true, detected.Count == 0 ? "No board DOF knows is connected." : detected.Count == 1 ? "Found 1 board." : $"Found {detected.Count} boards.");
 		}
 
 		private PluginActionResult PulsePort(string id, CancellationToken cancellation)

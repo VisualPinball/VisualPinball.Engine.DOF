@@ -115,12 +115,16 @@ namespace VisualPinball.Engine.DOF.Test
 			Assert.That(Has(report, DofReportSeverity.Info, "libdof reads 3 table rows for 2 devices"), Is.True, report.ToString());
 			Assert.That(Has(report, DofReportSeverity.Info, "Skipped readme.txt"), Is.True);
 			Assert.That(revision.ReadReport(), Does.Contain("libdof reads"));
+			Assert.That(revision.ReadOrigin(), Is.EqualTo("config.zip"));
+			Assert.That(revision.CreatedUtc, Is.EqualTo(DateTime.UtcNow).Within(TimeSpan.FromMinutes(1)));
+			Assert.That(revision.CountWarnings(), Is.EqualTo(report.Entries.Count(e => e.Severity == DofReportSeverity.Warning)));
 
 			var catalog = DofCatalog.Load(revision);
 			Assert.That(catalog.Rows, Is.EqualTo(new[] { new DofRomRow(1, "afm"), new DofRomRow(1, "t2"), new DofRomRow(51, "afm") }));
 			Assert.That(catalog.Devices[0].Ports, Is.EqualTo(new[] { "Flipper Left", "Knocker" }));
 			Assert.That(catalog.TableMappings, Is.EqualTo(new[] { new KeyValuePair<string, string>("Attack From Mars", "afm") }));
 			Assert.That(catalog.Match("afm_113b").Select(r => r.Device), Is.EqualTo(new[] { 1, 51 }));
+			Assert.That(catalog.HasCabinet, Is.False); Assert.That(catalog.AutoConfig, Is.True);
 
 			// Without a cabinet the generated global config leaves the cabinet empty, so DOF configures itself.
 			var global = XDocument.Load(revision.GlobalConfigFile).Root;
@@ -152,6 +156,10 @@ namespace VisualPinball.Engine.DOF.Test
 			// Each controller's own element: ComPort for PinControl (and PinOne), ComPortName for the strip controllers.
 			Assert.That(DofCatalog.Load(revision).SerialPorts, Is.EqualTo(new[] { "COM3", "COM5" }));
 			Assert.That(revision.ReadSerialPorts(), Is.EqualTo(new[] { "COM3", "COM5" }));
+			Assert.That(revision.ReadOrigin(), Is.EqualTo("the folder DirectOutput"));
+			Assert.That(revision.CountWarnings(), Is.EqualTo(report.Entries.Count(e => e.Severity == DofReportSeverity.Warning)).And.GreaterThan(0));
+			var cabinet = DofCatalog.Load(revision);
+			Assert.That(cabinet.HasCabinet, Is.True); Assert.That(cabinet.AutoConfig, Is.False, "the cabinet turns AutoConfigEnabled off");
 
 			// The serial port gets this computer's name in a new revision; the import itself is unchanged.
 			var overridden = Accepted(_importer.ApplySerialOverrides(new Dictionary<string, string> { ["PinControl 1"] = "/dev/ttyACM0", ["Teensy 1"] = "/dev/ttyACM1" }));
