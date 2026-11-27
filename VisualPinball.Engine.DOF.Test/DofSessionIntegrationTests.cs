@@ -250,6 +250,11 @@ namespace VisualPinball.Engine.DOF.Test
 			const int universe = 308;
 			var dir = Path.Combine(_dir, "real");
 			Directory.CreateDirectory(dir);
+			try {
+				DofPaths.ToNative(dir);
+			} catch (DofException) {
+				Assert.Ignore("The temporary folder has a non-ASCII name and this volume no short (8.3) names, so libdof cannot open it on Windows.");
+			}
 			var imported = Path.Combine(_dir, "imported through");
 			var reopened = Path.Combine(_dir, "reopened through");
 			Junction(imported, dir);
@@ -304,7 +309,8 @@ namespace VisualPinball.Engine.DOF.Test
 			var link = Path.Combine(_dir, "link");
 			Junction(link, dir);
 			try {
-				var basePath = Path.Combine(link, Path.GetRelativePath(dir, lease.Revision.BasePath));
+				// The temporary folder may have a non-ASCII name too: its 8.3 spelling, still through the junction.
+				var basePath = Path.Combine(DofPaths.ToNative(link), Path.GetRelativePath(dir, lease.Revision.BasePath));
 				Assert.That(DofPaths.IsAscii(basePath), Is.True);
 				var session = new DofSession(new DofSessionOptions {
 					BasePath = basePath,
