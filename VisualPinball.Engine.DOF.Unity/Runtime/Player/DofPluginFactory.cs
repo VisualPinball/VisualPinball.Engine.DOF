@@ -328,7 +328,7 @@ namespace VisualPinball.Engine.DOF.Player
 			if (revision == null) {
 				return new PluginInfo("No configuration imported", PluginInfoTone.Problem, new[] {
 					Line("Next", "Import the zip you downloaded from the DOF Config Tool, or an existing DirectOutput folder, below."),
-				});
+				}, new[] { "ShowImport", "Rollback" });
 			}
 			var catalog = CatalogOf(revision);
 			var warnings = revision.CountWarnings();
@@ -344,20 +344,26 @@ namespace VisualPinball.Engine.DOF.Player
 				lines.Add(Line("Table configs", $"{catalog.TableConfigs.Count}, kept but not loaded"));
 			}
 			var previous = Store.Previous;
-			lines.Add(Line("Undo", previous != null ? "Goes back to the configuration of " + When(previous) : "Nothing to undo"));
+			if (previous != null) {
+				lines.Add(Line("Undo", "Goes back to the configuration of " + When(previous)));
+			}
+			// without an earlier configuration, Undo has nothing to go back to
+			var unavailable = previous == null ? new[] { "Rollback" } : Array.Empty<string>();
 			return warnings == 0
-				? new PluginInfo("Active, without warnings", PluginInfoTone.Good, lines)
-				: new PluginInfo(warnings == 1 ? "Active, with 1 warning. Show details lists it." : $"Active, with {warnings} warnings. Show details lists them.", PluginInfoTone.Warning, lines);
+				? new PluginInfo("Active, without warnings", PluginInfoTone.Good, lines, unavailable)
+				: new PluginInfo(warnings == 1 ? "Active, with 1 warning. Show details lists it." : $"Active, with {warnings} warnings. Show details lists them.", PluginInfoTone.Warning, lines, unavailable);
 		}
 
 		private PluginInfo DescribeDevices()
 		{
+			// All off drives the outputs of the active configuration, so there is nothing to turn off without one
+			var unavailable = Store.Active == null ? new[] { "AllOff" } : Array.Empty<string>();
 			IReadOnlyList<DofDetectedDevice> devices;
 			DateTime when;
 			try {
 				(devices, when) = Detection(false);
 			} catch (Exception e) when (e is DllNotFoundException || e is EntryPointNotFoundException || e is DofException) {
-				return new PluginInfo("The native DOF library could not be loaded: " + e.Message, PluginInfoTone.Problem);
+				return new PluginInfo("The native DOF library could not be loaded: " + e.Message, PluginInfoTone.Problem, null, unavailable);
 			}
 			var lines = new List<KeyValuePair<string, string>>();
 			foreach (var device in devices) {
@@ -366,8 +372,8 @@ namespace VisualPinball.Engine.DOF.Player
 			}
 			lines.Add(Line("Checked", when.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture)));
 			return devices.Count == 0
-				? new PluginInfo("No board DOF knows is connected", PluginInfoTone.Neutral, lines)
-				: new PluginInfo(devices.Count == 1 ? "1 board connected" : $"{devices.Count} boards connected", PluginInfoTone.Good, lines);
+				? new PluginInfo("No board DOF knows is connected", PluginInfoTone.Neutral, lines, unavailable)
+				: new PluginInfo(devices.Count == 1 ? "1 board connected" : $"{devices.Count} boards connected", PluginInfoTone.Good, lines, unavailable);
 		}
 
 		/// <summary>The boards last detected; detects them the first time, and again when asked to.</summary>
