@@ -27,7 +27,7 @@ namespace VisualPinball.Engine.DOF.Player
 	/// The DOF plugin: imports DOF configurations, runs DOF for each game and publishes the cabinet triggers, and
 	/// describes the settings the Player renders.
 	/// </summary>
-	internal sealed class DofPluginFactory : IPlayerPluginFactory, IPluginSettingsProvider, IPluginSettingsInfoProvider, IPluginSystemDefaults
+	internal sealed class DofPluginFactory : IPlayerPluginFactory, IPluginSettingsProvider, IPluginSettingsInfoProvider, IPluginOutputMapProvider, IPluginSystemDefaults
 	{
 		internal const string Id = "org.visualpinball.dof";
 		private const string PinMameId = "org.visualpinball.pinmame";
@@ -194,12 +194,11 @@ namespace VisualPinball.Engine.DOF.Player
 			new PluginSettingsGroup("Import an existing installation", "A complete DOF configuration, such as the Config folder of DirectOutput. Importing it replaces the whole configuration; the folder is copied, never changed.",
 				new PluginField("ImportFolder", "Configuration folder", SettingKind.Folder) { Default = "", FullWidth = true },
 				new PluginField("ImportFolderAction", "Import", SettingKind.Action) { Provider = "import-folder", AttachTo = "ImportFolder" }),
-			new PluginSettingsGroup("Hardware", "The connected boards DOF knows, found without opening them. A test turns one output on for a moment, outside a game; All off turns every output off, such as one a game that crashed left on.",
+			new PluginSettingsGroup("Hardware", "The connected boards DOF knows, found without opening them, and what the configuration wires to their outputs. Testing an output turns it on for a moment, outside a game; All off turns every output off, such as one a game that crashed left on.",
 				new PluginField("Devices", "Connected boards", SettingKind.Info) { Provider = "devices" },
 				new PluginField("Detect", "Detect again", SettingKind.Action) { Provider = "detect", AttachTo = "Devices" },
 				new PluginField("AllOff", "All off", SettingKind.Action) { Provider = "all-off", AttachTo = "Devices" },
-				new PluginField("TestPort", "Test an output", SettingKind.Choice) { Default = "", Provider = "test-ports", FullWidth = true },
-				new PluginField("PulsePort", "Test", SettingKind.Action) { Provider = "pulse-port", AttachTo = "TestPort" }),
+				new PluginField("Outputs", "Outputs", SettingKind.Outputs) { Provider = "outputs", FullWidth = true }),
 			new PluginSettingsGroup("Serial ports", "Changes the port of a controller in your cabinet file, for when the board got another port on this computer.",
 				new PluginField("SerialOverrides", "Ports", SettingKind.Collection) { Default = new JArray(), FullWidth = true,
 					Description = "The controller's name in the cabinet file, and the port to use. Applied to the active configuration and to every import.",
@@ -268,25 +267,6 @@ namespace VisualPinball.Engine.DOF.Player
 						EmptyMessage = "Import a DOF configuration first.",
 						MissingSelectionMessage = "The configuration has no rows for this name any more.",
 					};
-				}
-				case "test-ports": {
-					if (catalog != null) {
-						foreach (var device in catalog.Devices) {
-							string toy = null;
-							for (var i = 0; i < device.Ports.Count; i++) {
-								var name = device.Ports[i]?.Trim();
-								var label = string.IsNullOrEmpty(name)
-									? toy != null ? $"{toy}, next port" : "(unnamed)"
-									: name;
-								if (!string.IsNullOrEmpty(name)) {
-									toy = name;
-								}
-								choices.Add(new PluginChoice(DofPortTest.Id(device.Number, i + 1), $"Device {device.Number}, port {i + 1}: {label}", device.FileName));
-							}
-						}
-					}
-					// Not complete: a saved output that a new import dropped must not block saving the other settings.
-					return new PluginChoiceCatalog(id, choices, isComplete: false) { EmptyMessage = "Import a DOF configuration with ini files first." };
 				}
 				default:
 					return new PluginChoiceCatalog("empty", Array.Empty<PluginChoice>());
@@ -414,6 +394,85 @@ namespace VisualPinball.Engine.DOF.Player
 
 		#endregion
 
+		#region Outputs
+
+		/// <summary>The outputs of a LedWiz, which ini devices 1 to 16 stand for; the Config Tool's header ends at the last one in use.</summary>
+		private const int LedWizOutputs = 32;
+
+		/// <summary>Why the outputs can't be tested before a game ran: the player shares its device reservations then (<see cref="DofPortTest.NoLeases"/>).</summary>
+		internal const string NoTestsYet = "Start a game once to test the outputs.";
+
+		public Task<PluginOutputMap> DescribeOutputsAsync(string provider, PluginChoiceRequest request, CancellationToken cancellation)
+			=> Task.Run(() => DescribeOutputs(provider, cancellation), cancellation);
+
+		private PluginOutputMap DescribeOutputs(string provider, CancellationToken cancellation)
+		{
+			cancellation.ThrowIfCancellationRequested();
+			if (provider != "outputs") {
+				return new PluginOutputMap(Array.Empty<PluginOutputBoard>());
+			}
+			// leased while it is read: an import may activate another one meanwhile, and a prune would delete this one
+			using var lease = Store.AcquireForReading();
+			var revision = lease?.Revision;
+			if (revision == null) {
+				return new PluginOutputMap(Array.Empty<PluginOutputBoard>(), "Import a DOF configuration to see what it assigns to the outputs.");
+			}
+			var catalog = CatalogOf(revision);
+			// A connected board of a device's number is that device only without a cabinet file, when DOF sets up the boards it
+			// finds: a cabinet's controllers or toys, such as Art-Net or a LedWiz equivalent, can take the number instead.
+			IReadOnlyList<DofDetectedDevice> detected = Array.Empty<DofDetectedDevice>();
+			if (!catalog.HasCabinet) {
+				try {
+					(detected, _) = Detection(false);
+				} catch (Exception e) when (e is DllNotFoundException || e is EntryPointNotFoundException || e is DofException) {
+					detected = Array.Empty<DofDetectedDevice>();
+				}
+			}
+			var boards = catalog.Devices.Select(device => Board(device, detected)).ToList();
+			return new PluginOutputMap(boards, "The configuration has no ini files, so it assigns nothing to the outputs.", _leases == null ? NoTestsYet : "");
+		}
+
+		/// <summary>
+		/// The outputs of an ini device: what its header names on each port, and the three ports of each RGB toy as its red,
+		/// green and blue, all named after the toy. Named after a board of its number when one is detected.
+		/// </summary>
+		internal static PluginOutputBoard Board(DofCatalogDevice device, IReadOnlyList<DofDetectedDevice> detected)
+		{
+			var count = device.Number >= 1 && device.Number <= 16 ? System.Math.Max(device.PortCount, LedWizOutputs) : device.PortCount;
+			var rgb = new HashSet<int>(device.RgbPorts);
+			var outputs = new List<PluginOutput>(count);
+			for (var port = 1; port <= count; port++) {
+				var name = port <= device.Ports.Count ? device.Ports[port - 1]?.Trim() ?? "" : "";
+				if (rgb.Contains(port) && port + 2 <= count) {
+					outputs.Add(new PluginOutput(DofPortTest.Id(device.Number, port), port, name, PluginOutputChannel.Red));
+					outputs.Add(new PluginOutput(DofPortTest.Id(device.Number, port + 1), port + 1, name, PluginOutputChannel.Green));
+					outputs.Add(new PluginOutput(DofPortTest.Id(device.Number, port + 2), port + 2, name, PluginOutputChannel.Blue));
+					port += 2;
+				} else {
+					outputs.Add(new PluginOutput(DofPortTest.Id(device.Number, port), port, name));
+				}
+			}
+			var board = detected.FirstOrDefault(d => d.Device == device.Number);
+			return board != null
+				? new PluginOutputBoard($"{board.Type} {device.Number}", $"Device {device.Number} · {device.FileName}", outputs)
+				: new PluginOutputBoard($"Device {device.Number}", device.FileName, outputs);
+		}
+
+		public Task<PluginActionResult> TestOutputAsync(string provider, string output, PluginChoiceRequest request, CancellationToken cancellation)
+			=> Task.Run(() => {
+				if (provider != "outputs") {
+					return new PluginActionResult(false, "Unknown DOF outputs.");
+				}
+				try {
+					return PulsePort(output, cancellation);
+				} catch (DofException e) {
+					Logger.Warn(e, "[DOF] Testing output " + output + " failed.");
+					return new PluginActionResult(false, e.Message);
+				}
+			}, cancellation);
+
+		#endregion
+
 		#region Actions
 
 		public Task<PluginActionResult> RunActionAsync(string action, PluginChoiceRequest request, CancellationToken cancellation)
@@ -432,7 +491,6 @@ namespace VisualPinball.Engine.DOF.Player
 							: new PluginActionResult(false, "There is no previous configuration.");
 					case "apply-serial-overrides": return ApplySerialOverrides(request.Settings);
 					case "detect": return Detect();
-					case "pulse-port": return PulsePort(request.Settings.String("TestPort"), cancellation);
 					case "all-off": return AllOff(cancellation);
 					default: return new PluginActionResult(false, "Unknown DOF action.");
 				}
@@ -538,7 +596,7 @@ namespace VisualPinball.Engine.DOF.Player
 		private PluginActionResult PulsePort(string id, CancellationToken cancellation)
 		{
 			if (!DofPortTest.TryParse(id, out var device, out var port)) {
-				return new PluginActionResult(false, "Choose an output first.");
+				return new PluginActionResult(false, "Unknown output " + id + ".");
 			}
 			var (success, message) = DofPortTest.Pulse(Store, _leases, Id, device, port, PulseDuration, ConfirmTimeout, TestNativeFactory, cancellation);
 			return new PluginActionResult(success, message);

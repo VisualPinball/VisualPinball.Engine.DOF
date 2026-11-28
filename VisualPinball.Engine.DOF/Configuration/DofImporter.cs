@@ -9,6 +9,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Xml.Linq;
 
 namespace VisualPinball.Engine.DOF.Configuration
@@ -348,9 +349,38 @@ namespace VisualPinball.Engine.DOF.Configuration
 			}
 		}
 
+		// the root object's first member, as the tool writes it: a "type" deeper in another file is not its
+		private static readonly Regex CabinetExportType = new Regex("^\\uFEFF?\\s*\\{\\s*\"type\"\\s*:\\s*\"cabinet\"", RegexOptions.CultureInvariant);
+
+		/// <summary>
+		/// Whether the file is the cabinet the DOF Config Tool exports as JSON (its toy assignments and settings). The tool
+		/// builds the ini files from that on its server, so the export holds no effects DOF could run.
+		/// </summary>
+		internal static bool IsConfigToolCabinetExport(string path)
+		{
+			if (!path.EndsWith(".json", StringComparison.OrdinalIgnoreCase)) {
+				return false;
+			}
+			try {
+				// the type comes first in the tool's export; the start of the file is enough
+				var start = new char[256];
+				using (var reader = new StreamReader(path)) {
+					var read = reader.ReadBlock(start, 0, start.Length);
+					return CabinetExportType.IsMatch(new string(start, 0, read));
+				}
+			} catch (Exception e) when (e is IOException || e is UnauthorizedAccessException) {
+				return false;
+			}
+		}
+
 		private void StageFile(string path, string input, DofImportReport report)
 		{
 			var name = Path.GetFileName(path);
+			if (IsConfigToolCabinetExport(path)) {
+				report.Error($"{name} is the DOF Config Tool's cabinet export: your cabinet's settings in the Config Tool, not a configuration DOF runs. "
+					+ "In the Config Tool, generate your configuration and download its zip, then import that.");
+				return;
+			}
 			if (!Wanted(name)) {
 				report.Error($"{name} is not a DOF configuration file (ini, XML, zip or image).");
 				return;

@@ -257,11 +257,15 @@ namespace VisualPinball.Engine.DOF.Unity.Tests
 			host.Factory.TestNativeFactory = _ => native;
 			host.Factory.PulseDuration = TimeSpan.FromMilliseconds(20);
 			host.Import(333, "vpetest,S1", "COM10", "\"Rom\",\"Flasher\"");
-			var catalog = host.Factory.DiscoverAsync("test-ports", new PluginChoiceRequest(null, new PluginSettingsSnapshot(1), "windows"), CancellationToken.None).Result;
-			Assert.That(catalog.Choices.Select(c => c.Label), Is.EqualTo(new[] { "Device 1, port 1: Flasher" }));
+			var map = host.Factory.DescribeOutputsAsync("outputs", new PluginChoiceRequest(null, new PluginSettingsSnapshot(1), "windows"), CancellationToken.None).Result;
+			var board = map.Boards.Single();
+			Assert.That(board.Detail, Does.EndWith("directoutputconfig.ini"));
+			Assert.That(board.Outputs.Count, Is.EqualTo(32), "device 1 stands for a LedWiz");
+			Assert.That((board.Outputs[0].Id, board.Outputs[0].Number, board.Outputs[0].Label), Is.EqualTo(("1:1", 1, "Flasher")));
+			Assert.That(board.Outputs.Skip(1).All(output => output.Label.Length == 0), Is.True, "the header names nothing else");
+			Assert.That(map.TestUnavailableReason, Is.Empty);
 
-			var settings = new PluginSettingsSnapshot(1, new Newtonsoft.Json.Linq.JObject { ["TestPort"] = "1:1" });
-			var result = host.Factory.RunActionAsync("pulse-port", new PluginChoiceRequest(null, settings, "windows"), CancellationToken.None).Result;
+			var result = Pulse(host);
 			Assert.That(result.Success, Is.True, result.Message);
 			Assert.That(native.Calls, Is.EqualTo(new[] { "gate:closed", "connect-tests:off", "init", "gate:closed", "confirmed", "1:1=255", "gate:open", "gate:closed", "1:1=0", "finish", "dispose" }),
 				"DOF starts dark without connect tests, every unit confirms it, and only the tested port is let through");
@@ -270,10 +274,24 @@ namespace VisualPinball.Engine.DOF.Unity.Tests
 			AssertDofIsFree("released after the test");
 
 			using (host.Leases.Acquire("serial:COM10", "org.visualpinball.dmd")) {
-				result = host.Factory.RunActionAsync("pulse-port", new PluginChoiceRequest(null, settings, "windows"), CancellationToken.None).Result;
+				result = Pulse(host);
 				Assert.That(result.Success, Is.False);
 				Assert.That(result.Message, Does.Contain("org.visualpinball.dmd"));
 			}
+		}
+
+		[Test]
+		public void TheOutputMapShowsRgbToysAsTheirChannels()
+		{
+			var host = Host();
+			host.Import(349, "vpetest,S1,0,E2 White", null, "\"Rom\",\"Knocker\",\"\",\"Flasher\"");
+			var map = host.Factory.DescribeOutputsAsync("outputs", new PluginChoiceRequest(null, new PluginSettingsSnapshot(1), "windows"), CancellationToken.None).Result;
+			var outputs = map.Boards.Single().Outputs;
+			Assert.That(outputs.Take(5).Select(o => (o.Number, o.Label, o.Channel)), Is.EqualTo(new[] {
+				(1, "Knocker", PluginOutputChannel.None), (2, "", PluginOutputChannel.None),
+				(3, "Flasher", PluginOutputChannel.Red), (4, "Flasher", PluginOutputChannel.Green), (5, "Flasher", PluginOutputChannel.Blue),
+			}));
+			Assert.That(outputs.Select(o => o.Number), Is.EqualTo(Enumerable.Range(1, 32)));
 		}
 
 		[Test]
@@ -301,11 +319,11 @@ namespace VisualPinball.Engine.DOF.Unity.Tests
 			}
 		}
 
-		private static PluginActionResult RunAction(DofTestHost host, string action, string port = "1:1", CancellationToken cancellation = default)
-		{
-			var settings = new PluginSettingsSnapshot(1, new Newtonsoft.Json.Linq.JObject { ["TestPort"] = port });
-			return host.Factory.RunActionAsync(action, new PluginChoiceRequest(null, settings, "windows"), cancellation).Result;
-		}
+		private static PluginActionResult RunAction(DofTestHost host, string action, CancellationToken cancellation = default)
+			=> host.Factory.RunActionAsync(action, new PluginChoiceRequest(null, new PluginSettingsSnapshot(1), "windows"), cancellation).Result;
+
+		private static PluginActionResult Pulse(DofTestHost host, string output = "1:1", CancellationToken cancellation = default)
+			=> host.Factory.TestOutputAsync("outputs", output, new PluginChoiceRequest(null, new PluginSettingsSnapshot(1), "windows"), cancellation).Result;
 
 		[Test]
 		public void OpensTheGateOnlyOnceEveryControllerConfirmedItIsDark()
@@ -316,7 +334,7 @@ namespace VisualPinball.Engine.DOF.Unity.Tests
 			host.Factory.TestNativeFactory = _ => native;
 			host.Factory.PulseDuration = TimeSpan.FromMilliseconds(20);
 			host.Import(338, "vpetest,S1");
-			var result = RunAction(host, "pulse-port");
+			var result = Pulse(host);
 			Assert.That(result.Success, Is.True, result.Message);
 			var calls = native.Calls;
 			Assert.That(calls.IndexOf("confirmed"), Is.InRange(calls.IndexOf("init"), calls.IndexOf("1:1=255")));
@@ -331,7 +349,7 @@ namespace VisualPinball.Engine.DOF.Unity.Tests
 			host.Factory.TestNativeFactory = _ => native;
 			host.Factory.ConfirmTimeout = TimeSpan.FromMilliseconds(100);
 			host.Import(339, "vpetest,S1");
-			var result = RunAction(host, "pulse-port");
+			var result = Pulse(host);
 			Assert.That(result.Success, Is.False);
 			Assert.That(result.Message, Does.Contain("Wemos 1 and UMX 1").And.Contain("nothing was turned on"));
 			Assert.That(native.Calls, Has.No.Member("gate:open").And.No.Member("1:1=255"), "the gate never opens");
@@ -398,7 +416,7 @@ namespace VisualPinball.Engine.DOF.Unity.Tests
 			host.Factory.TestNativeFactory = _ => unplugged;
 			host.Factory.PulseDuration = TimeSpan.FromMilliseconds(20);
 			host.Import(348, "vpetest,S1");
-			var result = RunAction(host, "pulse-port");
+			var result = Pulse(host);
 			Assert.That(result.Success, Is.False);
 			Assert.That(result.Message, Is.EqualTo("No controller can send the pulse: PacUIO failed, so nothing was turned on."));
 			Assert.That(unplugged.Calls, Has.No.Member("gate:open"));
@@ -406,7 +424,7 @@ namespace VisualPinball.Engine.DOF.Unity.Tests
 			// The units confirmed the dark state but failed to write the opening.
 			var failing = new RecordingTestNative { SendsOpening = false };
 			host.Factory.TestNativeFactory = _ => failing;
-			result = RunAction(host, "pulse-port");
+			result = Pulse(host);
 			Assert.That(result.Success, Is.False);
 			Assert.That(result.Message, Does.StartWith("Requested a pulse of ").And.EndWith(" on output 1 of device 1, but no controller confirmed writing it."));
 
@@ -414,7 +432,7 @@ namespace VisualPinball.Engine.DOF.Unity.Tests
 			// was written and names the failed board, without claiming the port got the pulse.
 			var mixed = new RecordingTestNative { Units = new[] { "ArtNet 1" }, FailedUnits = new[] { "PacUIO" } };
 			host.Factory.TestNativeFactory = _ => mixed;
-			result = RunAction(host, "pulse-port");
+			result = Pulse(host);
 			Assert.That(result.Success, Is.True, result.Message);
 			Assert.That(result.Message, Does.StartWith("Requested a pulse of ")
 				.And.EndWith(" on output 1 of device 1: 1 controller acknowledged the gate opening. Delivery to the selected port is unconfirmed. PacUIO failed and took no part."));
@@ -431,10 +449,7 @@ namespace VisualPinball.Engine.DOF.Unity.Tests
 			host.Import(345, "vpetest,S1");
 			using (var cancellation = new CancellationTokenSource()) {
 				var watch = System.Diagnostics.Stopwatch.StartNew();
-				var action = Task.Run(() => {
-					var settings = new PluginSettingsSnapshot(1, new Newtonsoft.Json.Linq.JObject { ["TestPort"] = "1:1" });
-					return host.Factory.RunActionAsync("pulse-port", new PluginChoiceRequest(null, settings, "windows"), cancellation.Token).Result;
-				});
+				var action = Task.Run(() => Pulse(host, "1:1", cancellation.Token));
 				while (!native.Calls.Contains("gate:open") && watch.Elapsed < TimeSpan.FromSeconds(5)) {
 					Thread.Sleep(5);
 				}
@@ -456,9 +471,10 @@ namespace VisualPinball.Engine.DOF.Unity.Tests
 			host.Import(336, "vpetest,S1", "COM11");
 			// The settings of a player that has not created the plugin yet: no game ran, so it has no device leases.
 			var settingsOnly = new DofPluginFactory(host.Factory.Store.Root) { TestNativeFactory = _ => native, PulseDuration = TimeSpan.FromMilliseconds(20) };
-			var settings = new PluginSettingsSnapshot(1, new Newtonsoft.Json.Linq.JObject { ["TestPort"] = "1:1" });
-			var pulse = settingsOnly.RunActionAsync("pulse-port", new PluginChoiceRequest(null, settings, "windows"), CancellationToken.None).Result;
-			var allOff = settingsOnly.RunActionAsync("all-off", new PluginChoiceRequest(null, settings, "windows"), CancellationToken.None).Result;
+			var request = new PluginChoiceRequest(null, new PluginSettingsSnapshot(1), "windows");
+			var pulse = settingsOnly.TestOutputAsync("outputs", "1:1", request, CancellationToken.None).Result;
+			var allOff = settingsOnly.RunActionAsync("all-off", request, CancellationToken.None).Result;
+			Assert.That(settingsOnly.DescribeOutputsAsync("outputs", request, CancellationToken.None).Result.TestUnavailableReason, Is.EqualTo(DofPluginFactory.NoTestsYet));
 			Assert.That((pulse.Success, pulse.Message), Is.EqualTo((false, DofPortTest.NoLeases)));
 			Assert.That((allOff.Success, allOff.Message), Is.EqualTo((false, DofPortTest.NoLeases)));
 			Assert.That(native.Calls, Is.Empty, "no device is opened without a reservation");

@@ -285,6 +285,70 @@ namespace VisualPinball.Engine.DOF.Test
 		}
 
 		[Test]
+		public void RgbToysTakeThreePortsAsLibdofCountsThem()
+		{
+			// Ports 1-2 single, 3 unassigned, 4-6 an RGB flasher whose name is on its first port, 7 single, and an RGB toy on
+			// 8-10 that the header ends before naming its other ports. One row writes the flasher as a colour (one column),
+			// another as three plain columns, a third through a variable. "shifted" has a colour in the slingshot's column:
+			// that shifts its own columns, not the cabinet's ports.
+			var head = "[version]\r\nversion=5467\r\n\r\n[Colors DOF]\r\nRed=#FF0000FF\r\nYellow=#FFFF00FF\r\n\r\n[Variables DOF]\r\nflash=E110 Yellow\r\n\r\n[Config DOF]\r\n";
+			var ini = head
+				+ "#\"Rom\",\"Slingshot\",\"Coin\",\"\",\"Flasher\",\"\",\"\",\"Knocker\",\"Beacon\",\r\n"
+				+ "colour,E1,E2,0,E3 Red w400/E4 #00FF00,S5,E9 #ff00ff00 f200\r\n"
+				+ "plain,E1,E2,0,0,0,0,S5\r\n"
+				+ "variable,E1,0,0,@flash@,0\r\n"
+				+ "shifted,S11 Red 50 AH100,E2,0,0,0,0,0\r\n";
+			Accepted(_importer.Import(Zip("config.zip", ("directoutputconfig.ini", ini))));
+			var device = DofCatalog.Load(_store.Active).Devices.Single();
+			Assert.That(device.RgbPorts, Is.EqualTo(new[] { 4, 8 }));
+			Assert.That(device.PortCount, Is.EqualTo(10), "the beacon's blue port, past the header's 8");
+
+			// Without a header, every row's colours count, and the ports as far as a row reaches.
+			Accepted(_importer.Import(Zip("plain.zip", ("directoutputconfig.ini", head + "colour,E1,E2,0,E3 Red,S5\r\n"))));
+			device = DofCatalog.Load(_store.Active).Devices.Single();
+			Assert.That(device.RgbPorts, Is.EqualTo(new[] { 4 }));
+			Assert.That(device.PortCount, Is.EqualTo(7));
+		}
+
+		[Test]
+		public void RgbPortsFollowHowLibdofReadsTheRows()
+		{
+			Ports("rom,(max(S1,S2)>0) Red,E3", new[] { 1 }, 4, "the comma of a condition does not end its column");
+			Ports("[Variables DOF]\r\n@flash@=E1 Red\r\n[Config DOF]\r\nrom,@flash@,S2", new[] { 1 }, 4, "a variable defined with its @s");
+			Ports("[TableVariables]\r\nrom,flash=E1 Red/dim={S1 I24/S2}\r\n[Config DOF]\r\nrom,@flash@,@dim@,S3\r\nother,@flash@", new[] { 1 }, 5, "a ROM's own variables");
+			Ports("[Colors DOF]\r\nWhite=#FFFFFFFF\r\n[Config DOF]\r\nrom,S1 Orange,S2 White", new[] { 1, 4 }, 6, "any word is a colour to libdof");
+			Ports("rom,OFF White,S2", new int[0], 2, "a setting fixed off is dropped");
+			Ports("rom,S1 Red 1 2 3,S2 APCRED", new int[0], 2, "a setting libdof cannot parse is dropped, and a plasma's second colour is not the toy's");
+			Ports("#\"Rom\",\"Knocker\"\r\nrom,S1,S2", new int[0], 2, "a row reaching past the header");
+			Ports("#\"Rom\",\"Knocker\"\r\nrom,S1,S2 Red,S3", new[] { 2 }, 5, "an RGB toy past the header");
+			Ports("[Variables DOF]\r\nflashcolour=S1 Red\r\nflash=@flashcolour@\r\n[Config DOF]\r\nrom,@flash@,S2", new[] { 1 }, 4, "a variable that uses another");
+			Ports("[Config outs]\r\nold,S1 Red,S2\r\n[Config DOF]\r\nrom,S1,S2", new int[0], 2, "only the [Config DOF] section where there is one");
+			Ports("rom,S1,S2\r\nROM,S1 Red,S2", new int[0], 2, "the first row of a ROM");
+		}
+
+		private void Ports(string config, int[] rgb, int extent, string because)
+		{
+			var path = Path.Combine(_dir, "directoutputconfig30.ini");
+			File.WriteAllText(path, config.Contains("[Config DOF]") ? config : "[Config DOF]\r\n" + config);
+			var ini = DofIniFile.Load(path);
+			Assert.That(ini.RgbPorts, Is.EqualTo(rgb), because);
+			Assert.That(ini.PortExtent, Is.EqualTo(extent), because);
+		}
+
+		[Test]
+		public void TheConfigToolsCabinetExportIsNamedAsSuch()
+		{
+			var export = Path.Combine(_dir, "My Cabinet.json");
+			File.WriteAllText(export, "{\"type\":\"cabinet\",\"name\":\"My Cabinet\",\"variables\":{\"pwm\":true},\"devices\":[{\"name\":\"Ledwiz 1\",\"outputs\":32}]}");
+			Rejected(_importer.Import(export), "download its zip");
+			var other = Path.Combine(_dir, "other.json");
+			File.WriteAllText(other, "{\"type\":\"table\"}");
+			Rejected(_importer.Import(other), "not a DOF configuration file");
+			File.WriteAllText(other, "{\"type\":\"table\",\"settings\":{\"type\":\"cabinet\"}}");
+			Rejected(_importer.Import(other), "not a DOF configuration file");
+		}
+
+		[Test]
 		public void RejectedImportKeepsTheActiveConfiguration()
 		{
 			Accepted(_importer.Import(Zip("good.zip", ("directoutputconfig.ini", MainIni))));

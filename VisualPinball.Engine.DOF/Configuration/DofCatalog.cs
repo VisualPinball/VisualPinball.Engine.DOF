@@ -20,13 +20,20 @@ namespace VisualPinball.Engine.DOF.Configuration
 		public IReadOnlyList<string> Ports { get; }
 		/// <summary>The ROM names of its rows, in file order.</summary>
 		public IReadOnlyList<string> Roms { get; }
+		/// <summary>The ports (from 1) where an RGB toy starts, which takes it and the next two; see <see cref="DofIniFile.RgbPorts"/>.</summary>
+		public IReadOnlyList<int> RgbPorts { get; }
+		/// <summary>How many ports the file uses: the header's, or as far as a row reaches when that is further.</summary>
+		public int PortCount { get; }
 
-		internal DofCatalogDevice(int number, string fileName, IReadOnlyList<string> ports, IReadOnlyList<string> roms)
+		internal DofCatalogDevice(int number, string fileName, IReadOnlyList<string> ports, IReadOnlyList<string> roms,
+			IReadOnlyList<int> rgbPorts = null, int portExtent = 0)
 		{
 			Number = number;
 			FileName = fileName;
 			Ports = ports;
 			Roms = roms;
+			RgbPorts = rgbPorts ?? Array.Empty<int>();
+			PortCount = Math.Max(ports.Count, portExtent);
 		}
 	}
 
@@ -149,7 +156,7 @@ namespace VisualPinball.Engine.DOF.Configuration
 			var inis = current.Count > 0 ? current : legacy;
 			var rows = new List<DofRomRow>();
 			foreach (var ini in inis.OrderBy(i => i.Device)) {
-				devices.Add(new DofCatalogDevice(ini.Device, ini.Name, ini.PortNames, ini.Roms));
+				devices.Add(new DofCatalogDevice(ini.Device, ini.Name, ini.PortNames, ini.Roms, ini.RgbPorts, ini.PortExtent));
 				rows.AddRange(ini.Roms.Select(r => new DofRomRow(ini.Device, r)));
 			}
 			// libdof lists the ini files in directory order, which differs between file systems; a stable sort by device
