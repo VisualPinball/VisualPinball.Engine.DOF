@@ -233,7 +233,9 @@ namespace VisualPinball.Engine.DOF.Player
 		private PluginChoiceCatalog Discover(string provider, PluginChoiceRequest request, CancellationToken cancellation)
 		{
 			cancellation.ThrowIfCancellationRequested();
-			var revision = Store.Active;
+			// leased while it is read: an import may activate another one meanwhile, and a prune would delete this one
+			using var lease = Store.AcquireForReading();
+			var revision = lease?.Revision;
 			var catalog = revision != null ? CatalogOf(revision) : null;
 			var id = revision?.Id ?? "none";
 			var choices = new List<PluginChoice>();
@@ -324,7 +326,9 @@ namespace VisualPinball.Engine.DOF.Player
 
 		private PluginInfo DescribeConfiguration()
 		{
-			var revision = Store.Active;
+			// leased while it is read: an import may activate another one meanwhile, and a prune would delete this one
+			using var lease = Store.AcquireForReading();
+			var revision = lease?.Revision;
 			if (revision == null) {
 				return new PluginInfo("No configuration imported", PluginInfoTone.Problem, new[] {
 					Line("Next", "Import the zip you downloaded from the DOF Config Tool, or an existing DirectOutput folder, below."),
@@ -338,7 +342,7 @@ namespace VisualPinball.Engine.DOF.Player
 				Line("Imported", When(revision) + (origin != null ? ", from " + origin : "")),
 				Line("Games", games == 1 ? "1 game" : $"{games} games"),
 				Line("Devices", catalog.Devices.Count == 0 ? "No ini files" : string.Join(", ", catalog.Devices.Select(d => $"{d.Number} ({d.FileName})"))),
-				Line("Cabinet", DescribeCabinet(catalog)),
+				Line("Cabinet", DescribeCabinet(revision, catalog)),
 			};
 			if (catalog.TableConfigs.Count > 0) {
 				lines.Add(Line("Table configs", $"{catalog.TableConfigs.Count}, kept but not loaded"));
@@ -387,18 +391,20 @@ namespace VisualPinball.Engine.DOF.Player
 			}
 		}
 
-		private static string DescribeCabinet(DofCatalog catalog)
+		private static string DescribeCabinet(DofRevision revision, DofCatalog catalog)
 		{
 			if (!catalog.HasCabinet) {
 				return "No cabinet file: DOF sets up the boards it finds itself";
 			}
+			// as a game reads it: the cabinet file the global config names, its root and AutoConfigEnabled as libdof finds them
+			var autoConfig = DofGameSetup.AutoConfigEnabled(revision);
 			var controllers = string.Join(", ", catalog.Controllers.Select(c => c.SerialPort != null ? $"{c.Name} on {c.SerialPort}" : c.Name));
 			if (catalog.Controllers.Count == 0) {
-				return catalog.AutoConfig
+				return autoConfig
 					? "A cabinet file without controllers: DOF sets up the boards it finds"
 					: "A cabinet file without controllers, and automatic setup is off: DOF drives no board";
 			}
-			return catalog.AutoConfig ? controllers + ", and the boards DOF finds itself" : controllers;
+			return autoConfig ? controllers + ", and the boards DOF finds itself" : controllers;
 		}
 
 		private static string When(DofRevision revision)
@@ -470,7 +476,8 @@ namespace VisualPinball.Engine.DOF.Player
 
 		private PluginActionResult ShowImport()
 		{
-			var revision = Store.Active;
+			using var lease = Store.AcquireForReading();
+			var revision = lease?.Revision;
 			if (revision == null) {
 				return new PluginActionResult(false, "No DOF configuration is imported.");
 			}

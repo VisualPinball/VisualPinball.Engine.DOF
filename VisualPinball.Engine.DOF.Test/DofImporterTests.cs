@@ -124,7 +124,7 @@ namespace VisualPinball.Engine.DOF.Test
 			Assert.That(catalog.Devices[0].Ports, Is.EqualTo(new[] { "Flipper Left", "Knocker" }));
 			Assert.That(catalog.TableMappings, Is.EqualTo(new[] { new KeyValuePair<string, string>("Attack From Mars", "afm") }));
 			Assert.That(catalog.Match("afm_113b").Select(r => r.Device), Is.EqualTo(new[] { 1, 51 }));
-			Assert.That(catalog.HasCabinet, Is.False); Assert.That(catalog.AutoConfig, Is.True);
+			Assert.That(catalog.HasCabinet, Is.False);
 
 			// Without a cabinet the generated global config leaves the cabinet empty, so DOF configures itself.
 			var global = XDocument.Load(revision.GlobalConfigFile).Root;
@@ -158,8 +158,7 @@ namespace VisualPinball.Engine.DOF.Test
 			Assert.That(revision.ReadSerialPorts(), Is.EqualTo(new[] { "COM3", "COM5" }));
 			Assert.That(revision.ReadOrigin(), Is.EqualTo("the folder DirectOutput"));
 			Assert.That(revision.CountWarnings(), Is.EqualTo(report.Entries.Count(e => e.Severity == DofReportSeverity.Warning)).And.GreaterThan(0));
-			var cabinet = DofCatalog.Load(revision);
-			Assert.That(cabinet.HasCabinet, Is.True); Assert.That(cabinet.AutoConfig, Is.False, "the cabinet turns AutoConfigEnabled off");
+			Assert.That(DofCatalog.Load(revision).HasCabinet, Is.True);
 
 			// The serial port gets this computer's name in a new revision; the import itself is unchanged.
 			var overridden = Accepted(_importer.ApplySerialOverrides(new Dictionary<string, string> { ["PinControl 1"] = "/dev/ttyACM0", ["Teensy 1"] = "/dev/ttyACM1" }));
@@ -206,6 +205,19 @@ namespace VisualPinball.Engine.DOF.Test
 			Assert.That(DofCatalog.Load(_store.Active).SerialPorts, Is.EqualTo(new[] { "COM3", "/dev/ttyACM1" }));
 			var teensy = XDocument.Load(Path.Combine(_store.Active.ConfigDir, "cabinet.xml")).Root.Descendants().Single(e => e.Name.LocalName == "TeensyStripController");
 			Assert.That(teensy.Elements().Count(e => e.Name.LocalName == "ComPortName"), Is.EqualTo(1));
+		}
+
+		[Test]
+		public void APrefixedCabinetRootIsNoCabinet()
+		{
+			var revision = new DofRevision("prefixed", Path.Combine(_dir, "prefixed"));
+			Directory.CreateDirectory(revision.ConfigDir);
+			var cabinet = Path.Combine(revision.ConfigDir, "Cabinet.xml");
+			// libdof matches the root as written: a default namespace still makes a cabinet, a prefix does not
+			File.WriteAllText(cabinet, "<?xml version=\"1.0\"?><Cabinet xmlns=\"http://example.org/dof\"><AutoConfigEnabled>false</AutoConfigEnabled></Cabinet>");
+			Assert.That(DofCatalog.Load(revision).HasCabinet, Is.True);
+			File.WriteAllText(cabinet, "<?xml version=\"1.0\"?><d:Cabinet xmlns:d=\"http://example.org/dof\"><d:AutoConfigEnabled>false</d:AutoConfigEnabled></d:Cabinet>");
+			Assert.That(DofCatalog.Load(revision).HasCabinet, Is.False);
 		}
 
 		[Test]

@@ -76,14 +76,11 @@ namespace VisualPinball.Engine.DOF.Configuration
 		public IReadOnlyList<string> TableConfigs { get; }
 		public IReadOnlyList<DofCatalogController> Controllers { get; }
 
-		/// <summary>Whether the configuration has a cabinet file, which may list no controllers.</summary>
-		public bool HasCabinet { get; private set; }
-
 		/// <summary>
-		/// Whether DOF also sets up the boards it finds: without a cabinet file, or when the cabinet's
-		/// <c>AutoConfigEnabled</c> is missing or reads <c>true</c>, as libdof reads it.
+		/// Whether the configuration has a cabinet file, which may list no controllers: a root named <c>Cabinet</c> as written,
+		/// since libdof finds no cabinet under a prefixed root.
 		/// </summary>
-		public bool AutoConfig { get; private set; } = true;
+		public bool HasCabinet { get; private set; }
 
 		/// <summary>
 		/// Serial ports the cabinet file names: a game leases them before DOF opens them. libdof's auto-configurators
@@ -113,7 +110,6 @@ namespace VisualPinball.Engine.DOF.Configuration
 			var devices = new List<DofCatalogDevice>();
 			var cabinetControllers = new List<DofCatalogController>();
 			var hasCabinet = false;
-			var autoConfig = true;
 			var mappings = new List<KeyValuePair<string, string>>();
 			var legacy = new List<DofIniFile>();
 			var current = new List<DofIniFile>();
@@ -131,10 +127,7 @@ namespace VisualPinball.Engine.DOF.Configuration
 				var xml = DofXml.Load(path);
 				switch (DofXml.KindOf(xml)) {
 					case DofXmlKind.Cabinet:
-						hasCabinet = true;
-						// libdof takes the element's first text, lower-cased; anything but "true" turns it off.
-						var auto = DofXml.Text(DofXml.FirstChild(xml.Root, "AutoConfigEnabled"));
-						autoConfig = string.IsNullOrEmpty(auto) || auto.ToLowerInvariant() == "true";
+						hasCabinet |= DofXml.LiteralName(xml.Root) == "Cabinet";
 						// The elements as libdof finds them, by the names as written: a default namespace changes nothing.
 						foreach (var controller in CabinetControllers(xml)) {
 							var type = DofXml.LiteralName(controller);
@@ -163,7 +156,7 @@ namespace VisualPinball.Engine.DOF.Configuration
 			// keeps the order within each device, which is the one libdof matches in.
 			var effective = revision.ReadLibdofRows()?.OrderBy(r => r.Device).ToList();
 			return new DofCatalog(revision, devices, effective ?? rows, effective != null, mappings, revision.TableConfigs, cabinetControllers) {
-				HasCabinet = hasCabinet, AutoConfig = autoConfig,
+				HasCabinet = hasCabinet,
 			};
 		}
 
