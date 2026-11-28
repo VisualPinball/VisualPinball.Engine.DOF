@@ -18,6 +18,7 @@ namespace VisualPinball.Engine.DOF.Configuration
 	/// &lt;revision&gt;/tables/               table XML configs, as &lt;name&gt;.xml
 	/// &lt;revision&gt;/source/               the imported global config as it was, for later imports
 	/// &lt;revision&gt;/import-report.txt
+	/// &lt;revision&gt;/origin.txt          what the import was made from, such as the zip's name
 	/// &lt;revision&gt;/libdof-rows.txt      the table rows libdof read when the import was checked
 	/// </code>
 	/// The revision folder is the base path libdof gets, and it reads nothing outside it.
@@ -28,6 +29,7 @@ namespace VisualPinball.Engine.DOF.Configuration
 		public const string TablesFolder = "tables";
 		public const string SourceFolder = "source";
 		public const string ReportFile = "import-report.txt";
+		public const string OriginFile = "origin.txt";
 		public const string LibdofRowsFile = "libdof-rows.txt";
 
 		public string Id { get; }
@@ -101,6 +103,36 @@ namespace VisualPinball.Engine.DOF.Configuration
 			var path = Path.Combine(BasePath, ReportFile);
 			return File.Exists(path) ? File.ReadAllText(path) : null;
 		}
+
+		/// <summary>What the revision was made from, such as the zip's name, or null for a revision from before it was written.</summary>
+		public string ReadOrigin()
+		{
+			var path = Path.Combine(BasePath, OriginFile);
+			var origin = File.Exists(path) ? File.ReadAllText(path).Trim() : "";
+			return origin.Length > 0 ? origin : null;
+		}
+
+		/// <summary>The number of warnings in the import report.</summary>
+		public int CountWarnings()
+		{
+			var report = ReadReport();
+			if (report == null) {
+				return 0;
+			}
+			var prefix = DofReportSeverity.Warning + " (";
+			var count = 0;
+			foreach (var line in report.Split('\n')) {
+				if (line.StartsWith(prefix, StringComparison.Ordinal)) {
+					count++;
+				}
+			}
+			return count;
+		}
+
+		/// <summary>When the revision was made, in UTC, from its id; null for an id of another form.</summary>
+		public DateTime? CreatedUtc
+			=> Id.Length >= 15 && DateTime.TryParseExact(Id.Substring(0, 15), "yyyyMMdd-HHmmss", CultureInfo.InvariantCulture,
+				DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var created) ? created : (DateTime?)null;
 
 		/// <summary>A file name made of ASCII letters, digits and <c>-_. </c>, which every platform and code page can represent.</summary>
 		internal static string SafeName(string name)

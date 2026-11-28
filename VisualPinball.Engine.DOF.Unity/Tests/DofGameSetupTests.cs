@@ -168,11 +168,13 @@ namespace VisualPinball.Engine.DOF.Unity.Tests
 				File.WriteAllText(cabinet, "<?xml version=\"1.0\"?><Cabinet xmlns=\"http://example.org/dof\">" + Controllers + "</Cabinet>");
 				Assert.That(DofGameSetup.AutoConfigEnabled(revision), Is.False);
 				Assert.That(DofGameSetup.LeaseKeys(revision, DofCatalog.Load(revision)), Is.EqualTo(new[] { "serial:COM7", DofGameSetup.FtdiFamily }));
+				Assert.That(DofCatalog.Load(revision).HasCabinet, Is.True);
 
 				// A prefix does: libdof finds no Cabinet, so it configures the connected devices itself.
 				File.WriteAllText(cabinet, "<?xml version=\"1.0\"?><d:Cabinet xmlns:d=\"http://example.org/dof\">" + Controllers.Replace("<", "<d:").Replace("<d:/", "</d:") + "</d:Cabinet>");
 				Assert.That(DofGameSetup.AutoConfigEnabled(revision), Is.True);
 				Assert.That(DofGameSetup.LeaseKeys(revision, DofCatalog.Load(revision)), Is.EqualTo(new[] { DofGameSetup.FtdiFamily }));
+				Assert.That(DofCatalog.Load(revision).HasCabinet, Is.False, "the settings page says so too");
 			}
 		}
 

@@ -20,13 +20,20 @@ namespace VisualPinball.Engine.DOF.Configuration
 		public IReadOnlyList<string> Ports { get; }
 		/// <summary>The ROM names of its rows, in file order.</summary>
 		public IReadOnlyList<string> Roms { get; }
+		/// <summary>The ports (from 1) where an RGB toy starts, which takes it and the next two; see <see cref="DofIniFile.RgbPorts"/>.</summary>
+		public IReadOnlyList<int> RgbPorts { get; }
+		/// <summary>How many ports the file uses: the header's, or as far as a row reaches when that is further.</summary>
+		public int PortCount { get; }
 
-		internal DofCatalogDevice(int number, string fileName, IReadOnlyList<string> ports, IReadOnlyList<string> roms)
+		internal DofCatalogDevice(int number, string fileName, IReadOnlyList<string> ports, IReadOnlyList<string> roms,
+			IReadOnlyList<int> rgbPorts = null, int portExtent = 0)
 		{
 			Number = number;
 			FileName = fileName;
 			Ports = ports;
 			Roms = roms;
+			RgbPorts = rgbPorts ?? Array.Empty<int>();
+			PortCount = Math.Max(ports.Count, portExtent);
 		}
 	}
 
@@ -44,13 +51,19 @@ namespace VisualPinball.Engine.DOF.Configuration
 		/// Teensy and Wemos strip controllers), or null.
 		/// </summary>
 		public string SerialPort { get; }
+		/// <summary>
+		/// Whether it connects over a serial port, with or without one named yet: a type that has one, unless it says it uses
+		/// another transport (a PinOne on <c>HID</c>).
+		/// </summary>
+		public bool UsesSerialPort { get; }
 
-		internal DofCatalogController(string type, string name, string serialPort)
+		internal DofCatalogController(string type, string name, string serialPort, bool usesSerialPort = false)
 		{
 			Type = type;
 			Named = name != null;
 			Name = name ?? type;
 			SerialPort = serialPort;
+			UsesSerialPort = usesSerialPort || serialPort != null;
 		}
 	}
 
@@ -75,6 +88,24 @@ namespace VisualPinball.Engine.DOF.Configuration
 		/// </summary>
 		public IReadOnlyList<string> TableConfigs { get; }
 		public IReadOnlyList<DofCatalogController> Controllers { get; }
+
+		/// <summary>
+		/// Whether the configuration has a cabinet file, which may list no controllers: a root named <c>Cabinet</c> as written,
+		/// since libdof finds no cabinet under a prefixed root.
+		/// </summary>
+		public bool HasCabinet { get; private set; }
+
+		/// <summary>
+		/// The highest output the cabinet file's LedWiz equivalents map, by the ini device they stand for: DOF can drive those
+		/// outputs even where no ini row puts anything on them.
+		/// </summary>
+		public IReadOnlyDictionary<int, int> CabinetOutputs { get; private set; } = new Dictionary<int, int>();
+
+		/// <summary>
+		/// The highest output a cabinet file's LedWiz equivalent counts for: larger numbers are no controller's, and would
+		/// size a board beyond anything shown. The native output map has the same limit.
+		/// </summary>
+		public const int MaxCabinetOutput = 4096;
 
 		/// <summary>
 		/// Serial ports the cabinet file names: a game leases them before DOF opens them. libdof's auto-configurators
@@ -103,6 +134,8 @@ namespace VisualPinball.Engine.DOF.Configuration
 		{
 			var devices = new List<DofCatalogDevice>();
 			var cabinetControllers = new List<DofCatalogController>();
+			var hasCabinet = false;
+			var cabinetOutputs = new Dictionary<int, int>();
 			var mappings = new List<KeyValuePair<string, string>>();
 			var legacy = new List<DofIniFile>();
 			var current = new List<DofIniFile>();
@@ -120,10 +153,16 @@ namespace VisualPinball.Engine.DOF.Configuration
 				var xml = DofXml.Load(path);
 				switch (DofXml.KindOf(xml)) {
 					case DofXmlKind.Cabinet:
+						hasCabinet |= DofXml.LiteralName(xml.Root) == "Cabinet";
 						// The elements as libdof finds them, by the names as written: a default namespace changes nothing.
 						foreach (var controller in CabinetControllers(xml)) {
 							var type = DofXml.LiteralName(controller);
-							cabinetControllers.Add(new DofCatalogController(type, DofXml.ControllerName(controller), DofXml.SerialPortOf(controller)));
+							var portElement = DofXml.SerialPortElement(type);
+							var serial = portElement != null && !(type == "PinOne" && DofXml.Value(controller, portElement) == "HID");
+							cabinetControllers.Add(new DofCatalogController(type, DofXml.ControllerName(controller), DofXml.SerialPortOf(controller), serial));
+						}
+						foreach (var (device, output) in LedWizEquivalentOutputs(xml)) {
+							cabinetOutputs[device] = Math.Max(output, cabinetOutputs.TryGetValue(device, out var known) ? known : 0);
 						}
 						break;
 					case DofXmlKind.TableMappings:
@@ -141,13 +180,34 @@ namespace VisualPinball.Engine.DOF.Configuration
 			var inis = current.Count > 0 ? current : legacy;
 			var rows = new List<DofRomRow>();
 			foreach (var ini in inis.OrderBy(i => i.Device)) {
-				devices.Add(new DofCatalogDevice(ini.Device, ini.Name, ini.PortNames, ini.Roms));
+				devices.Add(new DofCatalogDevice(ini.Device, ini.Name, ini.PortNames, ini.Roms, ini.RgbPorts, ini.PortExtent));
 				rows.AddRange(ini.Roms.Select(r => new DofRomRow(ini.Device, r)));
 			}
 			// libdof lists the ini files in directory order, which differs between file systems; a stable sort by device
 			// keeps the order within each device, which is the one libdof matches in.
 			var effective = revision.ReadLibdofRows()?.OrderBy(r => r.Device).ToList();
-			return new DofCatalog(revision, devices, effective ?? rows, effective != null, mappings, revision.TableConfigs, cabinetControllers);
+			return new DofCatalog(revision, devices, effective ?? rows, effective != null, mappings, revision.TableConfigs, cabinetControllers) {
+				HasCabinet = hasCabinet,
+				CabinetOutputs = cabinetOutputs,
+			};
+		}
+
+		/// <summary>The outputs a cabinet file's LedWiz equivalents map, each with the ini device it stands for.</summary>
+		private static IEnumerable<(int Device, int Output)> LedWizEquivalentOutputs(System.Xml.Linq.XDocument xml)
+		{
+			if (xml.Root == null || DofXml.LiteralName(xml.Root) != "Cabinet") {
+				yield break;
+			}
+			foreach (var toy in DofXml.FirstChild(xml.Root, "Toys")?.Elements() ?? Enumerable.Empty<System.Xml.Linq.XElement>()) {
+				if (DofXml.LiteralName(toy) != "LedWizEquivalent" || !int.TryParse(DofXml.Value(toy, "LedWizNumber"), out var device)) {
+					continue;
+				}
+				foreach (var output in DofXml.Children(DofXml.FirstChild(toy, "Outputs"), "LedWizEquivalentOutput")) {
+					if (int.TryParse(DofXml.Value(output, "LedWizEquivalentOutputNumber"), out var number) && number > 0 && number <= MaxCabinetOutput) {
+						yield return (device, number);
+					}
+				}
+			}
 		}
 
 		/// <summary>

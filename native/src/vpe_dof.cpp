@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -75,6 +76,8 @@ struct vpe_dof
 	// it too, so an updater thread that still runs never reaches a freed gate.
 	std::shared_ptr<DOF::OutputGate> gate;
 	std::string basePath;
+	// The host's routing of ini device ports (vpe_dof_set_output_map), applied when init sets up the cabinet.
+	std::map<int32_t, std::vector<int32_t>> outputMaps;
 	std::atomic<State> state { State::Created };
 	std::mutex lifecycle;
 };
@@ -284,6 +287,50 @@ int32_t FinishLocked(vpe_dof* dof, std::string* error)
 	return status;
 }
 
+// Routes the ports of the LedWiz equivalents as the host mapped them (vpe_dof_set_output_map), by the output names the
+// cabinet gave them: the table config copies those names into its toys, and a port test resolves them through the
+// equivalent. Each port takes the name its target had before any was changed, so ports can trade places.
+void ApplyOutputMaps(const std::map<int32_t, std::vector<int32_t>>& maps, DOF::Cabinet* cabinet)
+{
+	DOF::ToyList* toys = cabinet ? cabinet->GetToys() : nullptr;
+	if (maps.empty() || !toys)
+		return;
+	for (DOF::IToy* toy : *toys)
+	{
+		auto* lwe = dynamic_cast<DOF::LedWizEquivalent*>(toy);
+		if (!lwe)
+			continue;
+		auto map = maps.find(lwe->GetLedWizNumber());
+		if (map == maps.end())
+			continue;
+		DOF::LedWizEquivalentOutputList& outputs = lwe->GetOutputs();
+		std::unordered_map<int, std::string> names;
+		for (DOF::LedWizEquivalentOutput* output : outputs)
+		{
+			// The first of a number, which is the one libdof's lookup finds.
+			if (output)
+				names.emplace(output->GetLedWizEquivalentOutputNumber(), output->GetOutputName());
+		}
+		int routed = 0;
+		for (size_t i = 0; i < map->second.size(); i++)
+		{
+			const int port = static_cast<int>(i) + 1;
+			const int target = map->second[i];
+			if (target <= 0 || target == port)
+				continue;
+			auto name = names.find(target);
+			const std::string targetName = name != names.end() ? name->second : std::string();
+			if (DOF::LedWizEquivalentOutput* output = outputs.FindByNumber(port))
+				output->SetOutputName(targetName);
+			else if (!targetName.empty())
+				outputs.AddOutput(new DOF::LedWizEquivalentOutput(port, targetName));
+			routed++;
+		}
+		DOF::Log::Write("VPE: routed " + std::to_string(routed) + " port(s) of LedWiz equivalent " + std::to_string(lwe->GetLedWizNumber())
+			+ " as the player's output wiring says");
+	}
+}
+
 }
 
 extern "C" {
@@ -410,6 +457,9 @@ VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_init(vpe_dof* dof, const char* table_fi
 				dof->state = State::Finished;
 				return VPE_DOF_ERROR;
 			}
+			// Before the table config makes its toys from the cabinet's outputs, and only once the cabinet is set up.
+			const auto maps = dof->outputMaps;
+			dof->pinball->SetCabinetReady([maps](DOF::Cabinet* cabinet) { ApplyOutputMaps(maps, cabinet); });
 			dof->pinball->Setup(globalConfig, table_file ? table_file : "", rom_name ? rom_name : "");
 			dof->pinball->Init();
 			dof->state = State::Running;
@@ -695,6 +745,27 @@ VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_test_output(vpe_dof* dof, int32_t devic
 			return VPE_DOF_INVALID_ARGUMENT;
 		uint8_t v = static_cast<uint8_t>(std::clamp<int32_t>(value, 0, 255));
 		return dof->pinball->Post([output, v]() { output->SetOutput(v); }) ? VPE_DOF_OK : VPE_DOF_INVALID_STATE;
+	}
+	catch (...)
+	{
+		return VPE_DOF_ERROR;
+	}
+}
+
+VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_set_output_map(vpe_dof* dof, int32_t device, const int32_t* targets, int32_t count)
+{
+	if (!dof || device < 1 || device > 999 || count < 0 || count > 4096 || (count > 0 && !targets))
+		return VPE_DOF_INVALID_ARGUMENT;
+	try
+	{
+		std::lock_guard<std::mutex> lock(dof->lifecycle);
+		if (dof->state.load() != State::Created)
+			return VPE_DOF_INVALID_STATE;
+		if (count == 0)
+			dof->outputMaps.erase(device);
+		else
+			dof->outputMaps[device] = std::vector<int32_t>(targets, targets + count);
+		return VPE_DOF_OK;
 	}
 	catch (...)
 	{

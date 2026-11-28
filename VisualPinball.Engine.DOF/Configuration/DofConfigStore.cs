@@ -76,7 +76,17 @@ namespace VisualPinball.Engine.DOF.Configuration
 		/// Takes a lease on the active revision for a game. Dispose it when the game's DOF session has finished.
 		/// </summary>
 		/// <returns>The lease, or null if nothing was imported.</returns>
-		public DofRevisionLease Acquire()
+		public DofRevisionLease Acquire() => Acquire(true);
+
+		/// <summary>
+		/// Takes a lease on the active revision while it is read, such as by the settings page, so a prune does not delete
+		/// it meanwhile. Unlike a game's lease, releasing it deletes nothing: a read must not prune, since another Player
+		/// sharing the folder may be building a revision this one does not know about.
+		/// </summary>
+		/// <returns>The lease, or null if nothing was imported.</returns>
+		public DofRevisionLease AcquireForReading() => Acquire(false);
+
+		private DofRevisionLease Acquire(bool prune)
 		{
 			lock (_lock) {
 				var revision = Revision(ReadPointers().active);
@@ -85,11 +95,11 @@ namespace VisualPinball.Engine.DOF.Configuration
 				}
 				_leases.TryGetValue(revision.Id, out var count);
 				_leases[revision.Id] = count + 1;
-				return new DofRevisionLease(this, revision);
+				return new DofRevisionLease(this, revision, prune);
 			}
 		}
 
-		internal void Release(DofRevision revision)
+		internal void Release(DofRevision revision, bool prune)
 		{
 			lock (_lock) {
 				if (_leases.TryGetValue(revision.Id, out var count)) {
@@ -100,7 +110,9 @@ namespace VisualPinball.Engine.DOF.Configuration
 					}
 				}
 			}
-			Prune();
+			if (prune) {
+				Prune();
+			}
 		}
 
 		/// <summary>Makes the previous revision active again. The current one becomes the previous one.</summary>
@@ -281,19 +293,21 @@ namespace VisualPinball.Engine.DOF.Configuration
 	public sealed class DofRevisionLease : IDisposable
 	{
 		private DofConfigStore _store;
+		private readonly bool _prune;
 
 		public DofRevision Revision { get; }
 
-		internal DofRevisionLease(DofConfigStore store, DofRevision revision)
+		internal DofRevisionLease(DofConfigStore store, DofRevision revision, bool prune)
 		{
 			_store = store;
 			Revision = revision;
+			_prune = prune;
 		}
 
 		public void Dispose()
 		{
 			var store = System.Threading.Interlocked.Exchange(ref _store, null);
-			store?.Release(Revision);
+			store?.Release(Revision, _prune);
 		}
 	}
 }

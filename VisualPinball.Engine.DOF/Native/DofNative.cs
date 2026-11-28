@@ -15,7 +15,7 @@ namespace VisualPinball.Engine.DOF.Native
 	internal static class DofNative
 	{
 		public const string Library = "VpeDof";
-		public const int AbiVersion = 5;
+		public const int AbiVersion = 6;
 
 		[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
 		public delegate void LogCallback(int level, IntPtr message, IntPtr user);
@@ -61,6 +61,9 @@ namespace VisualPinball.Engine.DOF.Native
 
 		[DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "vpe_dof_set_connect_tests")]
 		public static extern int SetConnectTests(IntPtr dof, int allowed);
+
+		[DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "vpe_dof_set_output_map")]
+		public static extern int SetOutputMap(IntPtr dof, int device, int[] targets, int count);
 
 		[DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "vpe_dof_latch_output_gate")]
 		public static extern long LatchOutputGate(IntPtr dof);

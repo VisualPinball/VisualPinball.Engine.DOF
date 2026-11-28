@@ -5,6 +5,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using VisualPinball.Engine.DOF.Native;
 
@@ -308,6 +309,28 @@ namespace VisualPinball.Engine.DOF
 				Leave();
 			}
 			DofException.ThrowIfFailed(status, "Setting DOF's connect tests");
+		}
+
+		/// <summary>
+		/// Rewires ini device <paramref name="device"/>'s ports: port <c>i + 1</c> drives the controller output that port
+		/// <c>targets[i]</c> drives in the cabinet file (0 or <c>i + 1</c> keeps its own). Ports past the list keep theirs.
+		/// An empty list removes the device's map. Call before <see cref="Init"/>; the cabinet's LedWiz equivalents take
+		/// the map as DOF loads them, before the table configuration reads them.
+		/// </summary>
+		public void SetOutputMap(int device, IReadOnlyList<int> targets)
+		{
+			if (targets == null) {
+				throw new ArgumentNullException(nameof(targets));
+			}
+			var array = targets.ToArray();
+			EnterOrThrow();
+			int status;
+			try {
+				status = DofNative.SetOutputMap(_dof, device, array, array.Length);
+			} finally {
+				Leave();
+			}
+			DofException.ThrowIfFailed(status, $"Setting the output map of DOF device {device}");
 		}
 
 		/// <summary>

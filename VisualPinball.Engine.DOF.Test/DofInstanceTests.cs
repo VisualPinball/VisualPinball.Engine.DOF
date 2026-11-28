@@ -171,8 +171,29 @@ namespace VisualPinball.Engine.DOF.Test
 		[Test]
 		public void ReportsAbiAndLibdofVersion()
 		{
-			Assert.That(DofLibrary.NativeAbiVersion, Is.EqualTo(5));
+			Assert.That(DofLibrary.NativeAbiVersion, Is.EqualTo(6));
 			Assert.That(DofLibrary.LibdofVersion, Does.Match(@"^\d+\.\d+\.\d+"));
+		}
+
+		[Test]
+		public void OutputMapRewiresTheDevicesPorts()
+		{
+			var unit = Unit("ArtNetA");
+			using var config = new TestConfig().GlobalConfig().Cabinet(8, unit).Ini(1, "vpetest,S1,S2,S3");
+			using var dof = DofInstance.Create(config.Root);
+			// Ports 1 and 2 trade outputs, port 3 takes the unused output 6, and port 4 keeps its own (0).
+			dof.SetOutputMap(1, new[] { 2, 1, 6, 0 });
+			Assert.That(() => dof.SetOutputMap(0, new[] { 1 }), Throws.InstanceOf<DofException>(), "no device 0");
+			dof.Init(config.TableFile, "vpetest");
+			dof.Data('S', 1, 1);
+			Expect(unit.Universe, f => f[1] == 255 && f[0] == 0, "port 1 on output 2");
+			dof.Data('S', 1, 0);
+			dof.Data('S', 2, 1);
+			Expect(unit.Universe, f => f[0] == 255 && f[1] == 0, "port 2 on output 1");
+			dof.Data('S', 3, 1);
+			Expect(unit.Universe, f => f[5] == 255 && f[2] == 0, "port 3 on output 6");
+			Assert.That(() => dof.SetOutputMap(1, new int[0]), Throws.InstanceOf<DofException>(), "the map is set before Init");
+			dof.Finish();
 		}
 
 		[Test]

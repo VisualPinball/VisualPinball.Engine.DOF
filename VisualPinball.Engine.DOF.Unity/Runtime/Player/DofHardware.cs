@@ -28,6 +28,9 @@ namespace VisualPinball.Engine.DOF.Player
 
 		/// <summary>Takes DOF if nobody uses it, without waiting.</summary>
 		public static IDisposable TryAcquire() => Owner.Wait(0) ? new Subscription(() => Owner.Release()) : null;
+
+		/// <summary>Whether a game or a test uses DOF now.</summary>
+		public static bool InUse => Owner.CurrentCount == 0;
 	}
 
 	/// <summary>
@@ -113,6 +116,7 @@ namespace VisualPinball.Engine.DOF.Player
 		/// <param name="store">The configurations.</param>
 		/// <param name="leases">The player's device leases; without them nothing is opened.</param>
 		/// <param name="pluginId">Who holds the leases.</param>
+		/// <param name="wiring">How the cabling differs from the configuration; the messages name the output the port drives.</param>
 		/// <param name="device">The ini device.</param>
 		/// <param name="port">The port, from 1.</param>
 		/// <param name="duration">How long the port stays on.</param>
@@ -120,9 +124,11 @@ namespace VisualPinball.Engine.DOF.Player
 		/// <param name="nativeFactory">Creates the DOF instance; tests replace it.</param>
 		/// <param name="cancellation">Before the port is on, nothing is turned on; afterwards it ends the pulse early.</param>
 		/// <returns>What happened, for the user, and whether a controller sent the pulse for its whole time.</returns>
-		internal static (bool Success, string Message) Pulse(DofConfigStore store, PluginOutputLeases leases, string pluginId, int device, int port, TimeSpan duration,
-			TimeSpan confirmTimeout, Func<string, IDofTestNative> nativeFactory, CancellationToken cancellation)
-			=> Run(store, leases, pluginId, nativeFactory, confirmTimeout, cancellation, (native, dark) => {
+		internal static (bool Success, string Message) Pulse(DofConfigStore store, PluginOutputLeases leases, string pluginId, DofOutputWiring wiring, int device, int port,
+			TimeSpan duration, TimeSpan confirmTimeout, Func<string, IDofTestNative> nativeFactory, CancellationToken cancellation)
+		{
+			var output = wiring.OutputOf(device, port);
+			return Run(store, leases, pluginId, wiring, nativeFactory, confirmTimeout, cancellation, (native, dark) => {
 				if (cancellation.IsCancellationRequested) {
 					return (false, Cancelled);
 				}
@@ -138,8 +144,8 @@ namespace VisualPinball.Engine.DOF.Player
 				var status = native.TestOutput(device, port, 255);
 				if (status != DofStatus.Ok) {
 					return (false, status == DofStatus.InvalidArgument
-						? $"Device {device} has no output {port} DOF can set (it may be part of a toy, such as an RGB LED)."
-						: $"DOF could not set output {port} of device {device} ({status}).");
+						? $"Device {device} has no output {output} DOF can set (it may be part of a toy, such as an RGB LED)."
+						: $"DOF could not set output {output} of device {device} ({status}).");
 				}
 				if (cancellation.IsCancellationRequested) {
 					return (false, Cancelled);
@@ -157,14 +163,15 @@ namespace VisualPinball.Engine.DOF.Player
 				// The times are the gate's, as requested: a controller writes the opening a little later and, when the
 				// gate closes early, maybe not at all.
 				if (cancelled) {
-					return (false, $"Cancelled after {open.TotalSeconds:0.##} s: the pulse to output {port} of device {device} was requested for "
+					return (false, $"Cancelled after {open.TotalSeconds:0.##} s: the pulse to output {output} of device {device} was requested for "
 						+ $"{duration.TotalSeconds:0.##} s.{failed}");
 				}
-				var requested = $"Requested a pulse of {duration.TotalSeconds:0.##} s on output {port} of device {device}";
+				var requested = $"Requested a pulse of {duration.TotalSeconds:0.##} s on output {output} of device {device}";
 				return wrote > 0
 					? (true, $"{requested}: {Controllers(wrote)} acknowledged the gate opening. Delivery to the selected port is unconfirmed.{failed}")
 					: (false, $"{requested}, but no controller confirmed writing it.{failed}");
 			});
+		}
 
 		private const string Cancelled = "Cancelled; nothing was turned on.";
 
@@ -175,9 +182,9 @@ namespace VisualPinball.Engine.DOF.Player
 		/// what its device did (an Art-Net one sent a UDP packet), and the message says so. Runs on the calling thread and
 		/// blocks; call it from a worker.
 		/// </summary>
-		internal static (bool Success, string Message) AllOff(DofConfigStore store, PluginOutputLeases leases, string pluginId, TimeSpan confirmTimeout,
+		internal static (bool Success, string Message) AllOff(DofConfigStore store, PluginOutputLeases leases, string pluginId, DofOutputWiring wiring, TimeSpan confirmTimeout,
 			Func<string, IDofTestNative> nativeFactory, CancellationToken cancellation)
-			=> Run(store, leases, pluginId, nativeFactory, confirmTimeout, cancellation, (native, dark) => {
+			=> Run(store, leases, pluginId, wiring, nativeFactory, confirmTimeout, cancellation, (native, dark) => {
 				var missing = dark.Missing.Count == 0 ? string.Empty
 					: $" The cabinet also names {Units(dark.Missing, null)}, which DOF did not start: {Their(dark.Missing)} outputs may still be on.";
 				var confirmed = dark.Applied ? dark.State.Written : 0;
@@ -228,9 +235,9 @@ namespace VisualPinball.Engine.DOF.Player
 		/// <summary>
 		/// Takes DOF, the active revision and the device leases, opens DOF with its gate closed (so nothing shows what DOF
 		/// sets on start), closes it once more and waits until every unit confirmed that or failed, runs
-		/// <paramref name="test"/>, and finishes DOF, which turns every output off.
+		/// <paramref name="test"/>, and finishes DOF, which turns every output off. The ports are wired as a game wires them.
 		/// </summary>
-		private static (bool Success, string Message) Run(DofConfigStore store, PluginOutputLeases leases, string pluginId,
+		private static (bool Success, string Message) Run(DofConfigStore store, PluginOutputLeases leases, string pluginId, DofOutputWiring wiring,
 			Func<string, IDofTestNative> nativeFactory, TimeSpan confirmTimeout, CancellationToken cancellation, Func<IDofTestNative, Dark, (bool, string)> test)
 		{
 			if (leases == null) {
@@ -260,6 +267,9 @@ namespace VisualPinball.Engine.DOF.Player
 					// instance, also for a unit that connects or reconnects while the gate is open.
 					native.SetOutputGate(false);
 					native.SetConnectTests(false);
+					foreach (var device in wiring.Devices) {
+						native.SetOutputMap(device, wiring.MapOf(device));
+					}
 					native.Init(null, null);
 					var result = test(native, ConfirmDark(native, catalog, confirmTimeout, cancellation));
 					native.Finish();
@@ -349,6 +359,7 @@ namespace VisualPinball.Engine.DOF.Player
 	internal interface IDofTestNative : IDisposable
 	{
 		void SetConnectTests(bool allowed);
+		void SetOutputMap(int device, IReadOnlyList<int> targets);
 		void Init(string tableFile, string romName);
 		/// <summary>The controllers DOF started (<see cref="DofInstance.Describe"/>), after init.</summary>
 		IReadOnlyList<DofController> Controllers();
@@ -365,6 +376,7 @@ namespace VisualPinball.Engine.DOF.Player
 		private DofTestInstance(DofInstance instance) { _instance = instance; }
 		public static IDofTestNative Create(string basePath) => new DofTestInstance(DofInstance.Create(basePath));
 		public void SetConnectTests(bool allowed) => _instance.SetConnectTests(allowed);
+		public void SetOutputMap(int device, IReadOnlyList<int> targets) => _instance.SetOutputMap(device, targets);
 		public void Init(string tableFile, string romName) => _instance.Init(tableFile, romName);
 		public IReadOnlyList<DofController> Controllers() => _instance.Describe().Controllers;
 		public long SetOutputGate(bool open) => _instance.SetOutputGate(open);

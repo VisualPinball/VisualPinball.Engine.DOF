@@ -62,6 +62,11 @@ namespace VisualPinball.Engine.DOF.Session
 		public Action<DofLogLevel, string> Log { get; set; }
 		/// <summary>Creates the DOF instance; tests replace it.</summary>
 		public Func<string, IDofNative> NativeFactory { get; set; }
+		/// <summary>
+		/// The output maps of the devices whose cabling differs from the configuration (<see cref="Configuration.DofOutputWiring.Maps"/>),
+		/// set before DOF starts; null or empty for none.
+		/// </summary>
+		public IReadOnlyDictionary<int, IReadOnlyList<int>> OutputMaps { get; set; }
 		/// <summary>Tests turn the stop deadline's timer off to see a stop that ends late before the timer fires.</summary>
 		internal bool StopDeadlineTimer { get; set; } = true;
 	}
@@ -613,6 +618,9 @@ namespace VisualPinball.Engine.DOF.Session
 				return false;
 			}
 			try {
+				foreach (var map in _options.OutputMaps ?? new Dictionary<int, IReadOnlyList<int>>()) {
+					native.SetOutputMap(map.Key, map.Value);
+				}
 				// No table file: libdof then looks up no table XML config, whatever the revision's global config names.
 				// The player does not load table configs yet.
 				native.Init(null, _options.RomName);

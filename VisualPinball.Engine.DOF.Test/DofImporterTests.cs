@@ -115,12 +115,16 @@ namespace VisualPinball.Engine.DOF.Test
 			Assert.That(Has(report, DofReportSeverity.Info, "libdof reads 3 table rows for 2 devices"), Is.True, report.ToString());
 			Assert.That(Has(report, DofReportSeverity.Info, "Skipped readme.txt"), Is.True);
 			Assert.That(revision.ReadReport(), Does.Contain("libdof reads"));
+			Assert.That(revision.ReadOrigin(), Is.EqualTo("config.zip"));
+			Assert.That(revision.CreatedUtc, Is.EqualTo(DateTime.UtcNow).Within(TimeSpan.FromMinutes(1)));
+			Assert.That(revision.CountWarnings(), Is.EqualTo(report.Entries.Count(e => e.Severity == DofReportSeverity.Warning)));
 
 			var catalog = DofCatalog.Load(revision);
 			Assert.That(catalog.Rows, Is.EqualTo(new[] { new DofRomRow(1, "afm"), new DofRomRow(1, "t2"), new DofRomRow(51, "afm") }));
 			Assert.That(catalog.Devices[0].Ports, Is.EqualTo(new[] { "Flipper Left", "Knocker" }));
 			Assert.That(catalog.TableMappings, Is.EqualTo(new[] { new KeyValuePair<string, string>("Attack From Mars", "afm") }));
 			Assert.That(catalog.Match("afm_113b").Select(r => r.Device), Is.EqualTo(new[] { 1, 51 }));
+			Assert.That(catalog.HasCabinet, Is.False);
 
 			// Without a cabinet the generated global config leaves the cabinet empty, so DOF configures itself.
 			var global = XDocument.Load(revision.GlobalConfigFile).Root;
@@ -128,6 +132,20 @@ namespace VisualPinball.Engine.DOF.Test
 			Assert.That(global.Element("CabinetConfigFilePattern").Value, Is.Empty);
 			Assert.That(global.Element("ShapeDefinitionFilePattern").Value, Is.EqualTo(Path.Combine(revision.ConfigDir, "DirectOutputShapes.xml")));
 			Assert.That(File.Exists(Path.Combine(revision.ConfigDir, "DirectOutputShapes.png")), Is.True);
+		}
+
+		[Test]
+		public void CatalogKnowsTheOutputsTheCabinetMaps()
+		{
+			var outputs = string.Concat(new[] { 1, 4, 2, 2000000000 }.Select(n => $"<LedWizEquivalentOutput><OutputName>Out {n}</OutputName><LedWizEquivalentOutputNumber>{n}</LedWizEquivalentOutputNumber></LedWizEquivalentOutput>"));
+			var cabinet = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<Cabinet><Name>Test</Name><OutputControllers /><Toys>"
+				+ $"<LedWizEquivalent><Name>LedWizEquivalent 30</Name><LedWizNumber>30</LedWizNumber><Outputs>{outputs}</Outputs></LedWizEquivalent>"
+				+ "<LedWizEquivalent><Name>Broken</Name><LedWizNumber>x</LedWizNumber><Outputs>" + outputs + "</Outputs></LedWizEquivalent>"
+				+ "</Toys></Cabinet>\r\n";
+			Accepted(_importer.Import(Folder("Mapped", ("Config/cabinet.xml", cabinet), ("Config/directoutputconfig30.ini", Header + "#\"Rom\",\"Knocker\"\r\nrom,S1,0,0,0\r\n"))));
+			var catalog = DofCatalog.Load(_store.Active);
+			Assert.That(catalog.CabinetOutputs, Is.EqualTo(new Dictionary<int, int> { [30] = 4 }), "the highest output a controller can have, by the device it stands for");
+			Assert.That(catalog.Devices.Single().PortCount, Is.EqualTo(1), "the ini itself puts nothing past the knocker");
 		}
 
 		[Test]
@@ -152,6 +170,10 @@ namespace VisualPinball.Engine.DOF.Test
 			// Each controller's own element: ComPort for PinControl (and PinOne), ComPortName for the strip controllers.
 			Assert.That(DofCatalog.Load(revision).SerialPorts, Is.EqualTo(new[] { "COM3", "COM5" }));
 			Assert.That(revision.ReadSerialPorts(), Is.EqualTo(new[] { "COM3", "COM5" }));
+			Assert.That(revision.ReadOrigin(), Is.EqualTo("the folder DirectOutput"));
+			Assert.That(revision.CountWarnings(), Is.EqualTo(report.Entries.Count(e => e.Severity == DofReportSeverity.Warning)).And.GreaterThan(0));
+			Assert.That(DofCatalog.Load(revision).HasCabinet, Is.True);
+			Assert.That(DofCatalog.Load(revision).CabinetOutputs, Is.Empty, "a LedWiz equivalent without outputs maps none");
 
 			// The serial port gets this computer's name in a new revision; the import itself is unchanged.
 			var overridden = Accepted(_importer.ApplySerialOverrides(new Dictionary<string, string> { ["PinControl 1"] = "/dev/ttyACM0", ["Teensy 1"] = "/dev/ttyACM1" }));
@@ -198,6 +220,19 @@ namespace VisualPinball.Engine.DOF.Test
 			Assert.That(DofCatalog.Load(_store.Active).SerialPorts, Is.EqualTo(new[] { "COM3", "/dev/ttyACM1" }));
 			var teensy = XDocument.Load(Path.Combine(_store.Active.ConfigDir, "cabinet.xml")).Root.Descendants().Single(e => e.Name.LocalName == "TeensyStripController");
 			Assert.That(teensy.Elements().Count(e => e.Name.LocalName == "ComPortName"), Is.EqualTo(1));
+		}
+
+		[Test]
+		public void APrefixedCabinetRootIsNoCabinet()
+		{
+			var revision = new DofRevision("prefixed", Path.Combine(_dir, "prefixed"));
+			Directory.CreateDirectory(revision.ConfigDir);
+			var cabinet = Path.Combine(revision.ConfigDir, "Cabinet.xml");
+			// libdof matches the root as written: a default namespace still makes a cabinet, a prefix does not
+			File.WriteAllText(cabinet, "<?xml version=\"1.0\"?><Cabinet xmlns=\"http://example.org/dof\"><AutoConfigEnabled>false</AutoConfigEnabled></Cabinet>");
+			Assert.That(DofCatalog.Load(revision).HasCabinet, Is.True);
+			File.WriteAllText(cabinet, "<?xml version=\"1.0\"?><d:Cabinet xmlns:d=\"http://example.org/dof\"><d:AutoConfigEnabled>false</d:AutoConfigEnabled></d:Cabinet>");
+			Assert.That(DofCatalog.Load(revision).HasCabinet, Is.False);
 		}
 
 		[Test]
@@ -262,6 +297,79 @@ namespace VisualPinball.Engine.DOF.Test
 			Accepted(_importer.Import(Zip("replace.zip", ("directoutputconfig.ini", MainIni)), DofImportMode.Replace));
 			Assert.That(DofCatalog.Load(_store.Active).Controllers, Is.Empty, "replace drops the cabinet");
 			Assert.That(_store.Active.TableConfigs, Is.Empty);
+		}
+
+		[Test]
+		public void RgbToysTakeThreePortsAsLibdofCountsThem()
+		{
+			// Ports 1-2 single, 3 unassigned, 4-6 an RGB flasher whose name is on its first port, 7 single, and an RGB toy on
+			// 8-10 that the header ends before naming its other ports. One row writes the flasher as a colour (one column),
+			// another as three plain columns, a third through a variable. "shifted" has a colour in the slingshot's column:
+			// that shifts its own columns, not the cabinet's ports.
+			var head = "[version]\r\nversion=5467\r\n\r\n[Colors DOF]\r\nRed=#FF0000FF\r\nYellow=#FFFF00FF\r\n\r\n[Variables DOF]\r\nflash=E110 Yellow\r\n\r\n[Config DOF]\r\n";
+			var ini = head
+				+ "#\"Rom\",\"Slingshot\",\"Coin\",\"\",\"Flasher\",\"\",\"\",\"Knocker\",\"Beacon\",\r\n"
+				+ "colour,E1,E2,0,E3 Red w400/E4 #00FF00,S5,E9 #ff00ff00 f200\r\n"
+				+ "plain,E1,E2,0,0,0,0,S5\r\n"
+				+ "variable,E1,0,0,@flash@,0\r\n"
+				+ "shifted,S11 Red 50 AH100,E2,0,0,0,0,0\r\n";
+			Accepted(_importer.Import(Zip("config.zip", ("directoutputconfig.ini", ini))));
+			var device = DofCatalog.Load(_store.Active).Devices.Single();
+			Assert.That(device.RgbPorts, Is.EqualTo(new[] { 4, 8 }));
+			Assert.That(device.PortCount, Is.EqualTo(10), "the beacon's blue port, past the header's 8");
+
+			// Without a header, every row's colours count, and the ports as far as a row reaches.
+			Accepted(_importer.Import(Zip("plain.zip", ("directoutputconfig.ini", head + "colour,E1,E2,0,E3 Red,S5\r\n"))));
+			device = DofCatalog.Load(_store.Active).Devices.Single();
+			Assert.That(device.RgbPorts, Is.EqualTo(new[] { 4 }));
+			Assert.That(device.PortCount, Is.EqualTo(7));
+		}
+
+		[Test]
+		public void RgbPortsFollowHowLibdofReadsTheRows()
+		{
+			Ports("rom,(max(S1,S2)>0) Red,E3", new[] { 1 }, 4, "the comma of a condition does not end its column");
+			Ports("[Variables DOF]\r\n@flash@=E1 Red\r\n[Config DOF]\r\nrom,@flash@,S2", new[] { 1 }, 4, "a variable defined with its @s");
+			Ports("[TableVariables]\r\nrom,flash=E1 Red/dim={S1 I24/S2}\r\n[Config DOF]\r\nrom,@flash@,@dim@,S3\r\nother,@flash@", new[] { 1 }, 5, "a ROM's own variables");
+			Ports("[Colors DOF]\r\nWhite=#FFFFFFFF\r\n[Config DOF]\r\nrom,S1 Orange,S2 White", new[] { 1, 4 }, 6, "any word is a colour to libdof");
+			Ports("rom,OFF White,S2", new int[0], 2, "a setting fixed off is dropped");
+			Ports("rom,S1 Red 1 2 3,S2 APCRED", new int[0], 2, "a setting libdof cannot parse is dropped, and a plasma's second colour is not the toy's");
+			Ports("#\"Rom\",\"Knocker\"\r\nrom,S1,S2", new int[0], 2, "a row reaching past the header");
+			Ports("#\"Rom\",\"Knocker\"\r\nrom,S1,S2 Red,S3", new[] { 2 }, 5, "an RGB toy past the header");
+			Ports("[Variables DOF]\r\nflashcolour=S1 Red\r\nflash=@flashcolour@\r\n[Config DOF]\r\nrom,@flash@,S2", new[] { 1 }, 4, "a variable that uses another");
+			Ports("[Config outs]\r\nold,S1 Red,S2\r\n[Config DOF]\r\nrom,S1,S2", new int[0], 2, "only the [Config DOF] section where there is one");
+			Ports("rom,S1,S2\r\nROM,S1 Red,S2", new int[0], 2, "the first row of a ROM");
+			Ports("#\"Rom\",\"Knocker\"\r\nrom,S1,0,OFF,0", new int[0], 1, "past the header, columns of 0 put nothing on the board");
+			Ports("rom,S1,0,OFF,0", new int[0], 4, "without a header, the columns a row writes are the board's ports");
+			Ports("#\"Rom\",\"Knocker\",\"\"\r\nrom,S1,0", new int[0], 2, "a quoted empty name at the header's end is a port");
+			Ports("[Config DOF]\r\n#\"Rom\",\"Flasher\",\"\",\"\"\r\nrom,S1 Red\r\n[Config outs]\r\n#\"Rom\",\"A\",\"B\",\"C\"\r\nold,S1", new[] { 1 }, 3,
+				"the header of the section the rows come from");
+			var timer = System.Diagnostics.Stopwatch.StartNew();
+			Ports("[Variables DOF]\r\na=" + string.Concat(Enumerable.Repeat("@a@", 100)) + "\r\n[Config DOF]\r\nrom,@a@,S2", new int[0], 2,
+				"a variable that uses itself stops growing the row");
+			Assert.That(timer.ElapsedMilliseconds, Is.LessThan(2000));
+		}
+
+		private void Ports(string config, int[] rgb, int extent, string because)
+		{
+			var path = Path.Combine(_dir, "directoutputconfig30.ini");
+			File.WriteAllText(path, config.Contains("[Config DOF]") ? config : "[Config DOF]\r\n" + config);
+			var ini = DofIniFile.Load(path);
+			Assert.That(ini.RgbPorts, Is.EqualTo(rgb), because);
+			Assert.That(ini.PortExtent, Is.EqualTo(extent), because);
+		}
+
+		[Test]
+		public void TheConfigToolsCabinetExportIsNamedAsSuch()
+		{
+			var export = Path.Combine(_dir, "My Cabinet.json");
+			File.WriteAllText(export, "{\"type\":\"cabinet\",\"name\":\"My Cabinet\",\"variables\":{\"pwm\":true},\"devices\":[{\"name\":\"Ledwiz 1\",\"outputs\":32}]}");
+			Rejected(_importer.Import(export), "download its zip");
+			var other = Path.Combine(_dir, "other.json");
+			File.WriteAllText(other, "{\"type\":\"table\"}");
+			Rejected(_importer.Import(other), "not a DOF configuration file");
+			File.WriteAllText(other, "{\"type\":\"table\",\"settings\":{\"type\":\"cabinet\"}}");
+			Rejected(_importer.Import(other), "not a DOF configuration file");
 		}
 
 		[Test]

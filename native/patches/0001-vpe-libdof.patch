@@ -36,7 +36,7 @@ index 9bf30ae..8d447f3 100644
  
  void Log::Instrumentation(const std::string& key, const std::string& message)
 diff --git a/src/Pinball.cpp b/src/Pinball.cpp
-index 8589ce9..3dc45b4 100644
+index 8589ce9..d94cc7e 100644
 --- a/src/Pinball.cpp
 +++ b/src/Pinball.cpp
 @@ -12,6 +12,9 @@
@@ -79,7 +79,16 @@ index 8589ce9..3dc45b4 100644
  
        Log::Init(m_globalConfig->IsEnableLogging());
     }
-@@ -376,6 +369,12 @@ void Pinball::Init()
+@@ -232,6 +225,8 @@ void Pinball::Setup(const std::string& globalConfigFileName, const std::string&
+       }
+ 
+       Log::Write("Cabinet loaded");
++      if (m_cabinetReady)
++         m_cabinetReady(m_cabinet);
+ 
+       Log::Write("Loading table config");
+ 
+@@ -376,6 +371,12 @@ void Pinball::Init()
  
  void Pinball::Finish()
  {
@@ -92,7 +101,7 @@ index 8589ce9..3dc45b4 100644
     Log::Write("Finishing framework");
     std::string errors;
     bool failed = false;
-@@ -473,19 +472,23 @@ void Pinball::MainThreadDoIt()
+@@ -473,19 +474,23 @@ void Pinball::MainThreadDoIt()
           bool updateRequired = false;
           auto start = std::chrono::steady_clock::now();
  
@@ -128,7 +137,7 @@ index 8589ce9..3dc45b4 100644
           }
  
           if (m_keepMainThreadAlive)
-@@ -520,12 +523,12 @@ void Pinball::MainThreadDoIt()
+@@ -520,12 +525,12 @@ void Pinball::MainThreadDoIt()
  
              std::unique_lock<std::mutex> lock(m_mainThreadMutex);
  
@@ -143,7 +152,7 @@ index 8589ce9..3dc45b4 100644
  
                 now = std::chrono::steady_clock::now();
                 nextAlarm = m_alarms->GetNextAlarmTime();
-@@ -538,6 +541,89 @@ void Pinball::MainThreadDoIt()
+@@ -538,6 +543,89 @@ void Pinball::MainThreadDoIt()
     {
        Log::Exception(StringExtensions::Build("An unexpected exception occured in the DirectOutput MainThread: {0}", e.what()));
     }
@@ -233,7 +242,7 @@ index 8589ce9..3dc45b4 100644
  }
  
  void Pinball::ReceiveData(char type, int number, int value)
-@@ -558,4 +644,94 @@ void Pinball::ReceiveData(const TableElementData& tableElementData)
+@@ -558,4 +646,94 @@ void Pinball::ReceiveData(const TableElementData& tableElementData)
     MainThreadSignal();
  }
  
@@ -329,7 +338,7 @@ index 8589ce9..3dc45b4 100644
 +
  }
 diff --git a/src/Pinball.h b/src/Pinball.h
-index 4bf85b5..1bd1a59 100644
+index 4bf85b5..3d3c6ef 100644
 --- a/src/Pinball.h
 +++ b/src/Pinball.h
 @@ -3,9 +3,13 @@
@@ -354,7 +363,7 @@ index 4bf85b5..1bd1a59 100644
  
  class Pinball
  {
-@@ -42,7 +47,19 @@ public:
+@@ -42,7 +47,24 @@ public:
     void ReceiveData(const std::string& tableElementName, int value);
     void ReceiveData(const TableElementData& tableElementData);
  
@@ -367,14 +376,19 @@ index 4bf85b5..1bd1a59 100644
 +   int64_t SetOutputGate(bool open);
 +   // Table element changes received but not processed yet.
 +   int GetPendingInputCount() const;
++   // VPE: called by Setup once the cabinet is loaded and configured, before the table config makes its toys from the
++   // cabinet's outputs: the host can still change the cabinet then, such as where a LedWiz equivalent's ports go.
++   void SetCabinetReady(std::function<void(Cabinet*)> callback) { m_cabinetReady = std::move(callback); }
 +
  private:
 +   friend class PinballTestAccess;
 +
++   std::function<void(Cabinet*)> m_cabinetReady;
++
     void SetAlarms(AlarmHandler* alarms) { m_alarms = alarms; }
     void SetGlobalConfig(GlobalConfig* globalConfig) { m_globalConfig = globalConfig; }
  
-@@ -61,7 +78,35 @@ private:
+@@ -61,7 +83,35 @@ private:
     std::condition_variable m_mainThreadCV;
     std::atomic<bool> m_keepMainThreadAlive;
     std::atomic<bool> m_mainThreadDoWork;

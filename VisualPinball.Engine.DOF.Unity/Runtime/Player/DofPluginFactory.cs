@@ -6,6 +6,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -26,7 +27,7 @@ namespace VisualPinball.Engine.DOF.Player
 	/// The DOF plugin: imports DOF configurations, runs DOF for each game and publishes the cabinet triggers, and
 	/// describes the settings the Player renders.
 	/// </summary>
-	internal sealed class DofPluginFactory : IPlayerPluginFactory, IPluginSettingsProvider, IPluginSystemDefaults
+	internal sealed class DofPluginFactory : IPlayerPluginFactory, IPluginSettingsProvider, IPluginSettingsInfoProvider, IPluginOutputMapProvider, IPluginOutputRearranger, IPluginSystemDefaults
 	{
 		internal const string Id = "org.visualpinball.dof";
 		private const string PinMameId = "org.visualpinball.pinmame";
@@ -54,8 +55,16 @@ namespace VisualPinball.Engine.DOF.Player
 
 		private readonly object _catalogLock = new object();
 		private DofCatalog _catalog;
+		private readonly object _detectionLock = new object();
+		private (IReadOnlyList<DofDetectedDevice> Devices, DateTime When)? _detection;
 		private volatile DofConfigStore _store;
 		private volatile PluginOutputLeases _leases;
+		private readonly object _wiringLock = new object();
+		private DofOutputWiring _wiring;
+		private string _wiringRoot;
+		private DateTime _wiringStamp;
+		// one change of a wiring file at a time in the process, whichever factory makes it
+		private static readonly object WiringFileLock = new object();
 
 		/// <param name="root">The folder of the imported configurations; the Player's plugin folder when null.</param>
 		internal DofPluginFactory(string root)
@@ -71,6 +80,9 @@ namespace VisualPinball.Engine.DOF.Player
 
 		/// <summary>Creates the DOF instance of port tests; tests replace it.</summary>
 		internal Func<string, IDofTestNative> TestNativeFactory { get; set; }
+
+		/// <summary>The serial ports of this computer, with what they are; tests replace it.</summary>
+		internal Func<IReadOnlyList<(string Port, string Description)>> SerialPortsFactory { get; set; } = LocalSerialPorts;
 
 		/// <summary>How long a port test keeps the output on.</summary>
 		internal TimeSpan PulseDuration { get; set; } = TimeSpan.FromSeconds(1);
@@ -180,30 +192,32 @@ namespace VisualPinball.Engine.DOF.Player
 		#region Schema
 
 		private static PluginSettingsSchema BuildSchema() => new PluginSettingsSchema(1,
-			new PluginSettingsGroup("Configuration", "Download your configuration from the DOF Config Tool with your browser and import the zip here. VPE never contacts the Config Tool. Imports apply from the next game.",
-				new PluginField("Status", "Status", SettingKind.Status),
-				new PluginField("ImportZip", "Config Tool zip or file", SettingKind.File) { Default = "", FullWidth = true,
-					Description = "A directoutputconfig.zip from the Config Tool, or a single file such as Cabinet.xml. It replaces the files it contains and keeps the rest, such as your cabinet file." },
-				new PluginField("ImportZipAction", "Import", SettingKind.Action) { Provider = "import-zip" },
-				new PluginField("ImportFolder", "Configuration folder", SettingKind.Folder) { Default = "", FullWidth = true,
-					Description = "A complete DOF configuration, such as the Config folder of an existing DirectOutput installation. It replaces the whole configuration." },
-				new PluginField("ImportFolderAction", "Import folder", SettingKind.Action) { Provider = "import-folder" },
-				new PluginField("ShowImport", "Show configuration", SettingKind.Action) { Provider = "show-import" },
-				new PluginField("Rollback", "Undo last import", SettingKind.Action) { Provider = "rollback" }),
+			new PluginSettingsGroup("Configuration", "Imports apply from the next game. VPE never contacts the DOF Config Tool.",
+				new PluginField("ActiveConfig", "Active configuration", SettingKind.Info) { Provider = "configuration" },
+				new PluginField("ShowImport", "Show details", SettingKind.Action) { Provider = "show-import", AttachTo = "ActiveConfig" },
+				new PluginField("Rollback", "Undo last import", SettingKind.Action) { Provider = "rollback", AttachTo = "ActiveConfig" }),
+			new PluginSettingsGroup("Import from the Config Tool", "Download your directoutputconfig.zip from the DOF Config Tool with your browser. Importing it replaces the files it contains and keeps the rest, such as your cabinet file.",
+				new PluginField("ImportZip", "Zip or file", SettingKind.File) { Default = "", FullWidth = true,
+					Description = "A directoutputconfig.zip, or a single file such as Cabinet.xml." },
+				new PluginField("ImportZipAction", "Import", SettingKind.Action) { Provider = "import-zip", AttachTo = "ImportZip" }),
+			new PluginSettingsGroup("Import an existing installation", "A complete DOF configuration, such as the Config folder of DirectOutput. Importing it replaces the whole configuration; the folder is copied, never changed.",
+				new PluginField("ImportFolder", "Configuration folder", SettingKind.Folder) { Default = "", FullWidth = true },
+				new PluginField("ImportFolderAction", "Import", SettingKind.Action) { Provider = "import-folder", AttachTo = "ImportFolder" }),
+			new PluginSettingsGroup("Hardware", "The connected boards DOF knows, found without opening them, and what the configuration wires to their outputs. Testing an output turns it on for a moment, outside a game; All off turns every output off, such as one a game that crashed left on. Where your cabling differs from the configuration, rearrange the outputs: games and tests use it at once, with every configuration you import.",
+				new PluginField("Devices", "Connected boards", SettingKind.Info) { Provider = "devices" },
+				new PluginField("Detect", "Detect again", SettingKind.Action) { Provider = "detect", AttachTo = "Devices" },
+				new PluginField("AllOff", "All off", SettingKind.Action) { Provider = "all-off", AttachTo = "Devices" },
+				new PluginField("ResetWiring", "Undo rearranging", SettingKind.Action) { Provider = "reset-wiring", AttachTo = "Devices" },
+				new PluginField("Outputs", "Outputs", SettingKind.Outputs) { Provider = "outputs", FullWidth = true }),
 			new PluginSettingsGroup("Serial ports", "Changes the port of a controller in your cabinet file, for when the board got another port on this computer.",
-				new PluginField("SerialOverrides", "Ports", SettingKind.Collection) { Default = new JArray(), FullWidth = true,
-					Description = "The controller's name in the cabinet file, and the port to use. Applied to the active configuration and to every import.",
+				new PluginField("SerialControllers", "Serial controllers", SettingKind.Info) { Provider = "serial-ports" },
+				new PluginField("SerialOverrides", "Ports", SettingKind.Collection) { Default = new JArray(), FullWidth = true, AddLabel = "Add a controller",
+					Description = "A controller of your cabinet file, and the port to use. Applied to the active configuration and to every import.",
 					Children = new[] {
-						new PluginField("Controller", "Controller", SettingKind.Text) { Default = "" },
-						new PluginField("Port", "Port", SettingKind.Text) { Default = "" },
+						new PluginField("Controller", "Controller", SettingKind.Choice) { Default = "", Provider = "serial-controllers", Row = "port" },
+						new PluginField("Port", "Port", SettingKind.Choice) { Default = "", Provider = "serial-port-names", Row = "port" },
 					} },
-				new PluginField("ApplySerialOverrides", "Apply ports", SettingKind.Action) { Provider = "apply-serial-overrides" }),
-			new PluginSettingsGroup("Hardware", "Detection lists connected boards DOF knows, without opening them. A test turns one output on for a moment, outside a game; All off turns every output off.",
-				new PluginField("Detect", "Detect devices", SettingKind.Action) { Provider = "detect" },
-				new PluginField("TestPort", "Output", SettingKind.Choice) { Default = "", Provider = "test-ports", FullWidth = true },
-				new PluginField("PulsePort", "Test output", SettingKind.Action) { Provider = "pulse-port" },
-				new PluginField("AllOff", "All off", SettingKind.Action) { Provider = "all-off",
-					Description = "Turns every output of the cabinet off, such as one a game that crashed left on." }),
+				new PluginField("ApplySerialOverrides", "Apply ports", SettingKind.Action) { Provider = "apply-serial-overrides", AttachTo = "SerialOverrides" }),
 			new PluginSettingsGroup("This game", "Which configuration rows the game uses.",
 				new PluginField("Rom", "Game name", SettingKind.Choice) { Default = DofGameSetup.Auto, Scope = ConfigurationScope.GameOnly, Provider = "roms", FullWidth = true,
 					Description = "Automatic uses the ROM the game plays, or the name the table sets for DOF. A table mapping for the table's name is offered here." }));
@@ -229,7 +243,9 @@ namespace VisualPinball.Engine.DOF.Player
 		private PluginChoiceCatalog Discover(string provider, PluginChoiceRequest request, CancellationToken cancellation)
 		{
 			cancellation.ThrowIfCancellationRequested();
-			var revision = Store.Active;
+			// leased while it is read: an import may activate another one meanwhile, and a prune would delete this one
+			using var lease = Store.AcquireForReading();
+			var revision = lease?.Revision;
 			var catalog = revision != null ? CatalogOf(revision) : null;
 			var id = revision?.Id ?? "none";
 			var choices = new List<PluginChoice>();
@@ -263,27 +279,46 @@ namespace VisualPinball.Engine.DOF.Player
 						MissingSelectionMessage = "The configuration has no rows for this name any more.",
 					};
 				}
-				case "test-ports": {
-					if (catalog != null) {
-						foreach (var device in catalog.Devices) {
-							string toy = null;
-							for (var i = 0; i < device.Ports.Count; i++) {
-								var name = device.Ports[i]?.Trim();
-								var label = string.IsNullOrEmpty(name)
-									? toy != null ? $"{toy}, next port" : "(unnamed)"
-									: name;
-								if (!string.IsNullOrEmpty(name)) {
-									toy = name;
-								}
-								choices.Add(new PluginChoice(DofPortTest.Id(device.Number, i + 1), $"Device {device.Number}, port {i + 1}: {label}", device.FileName));
-							}
+				case "serial-controllers": {
+					foreach (var controller in catalog?.Controllers.Where(c => c.UsesSerialPort) ?? Enumerable.Empty<DofCatalogController>()) {
+						if (choices.All(c => c.Id != controller.Name)) {
+							choices.Add(new PluginChoice(controller.Name, $"{controller.Name} ({controller.Type})",
+								controller.SerialPort != null ? $"On {controller.SerialPort} in the active configuration." : "The cabinet file names no port for it yet."));
 						}
 					}
-					// Not complete: a saved output that a new import dropped must not block saving the other settings.
-					return new PluginChoiceCatalog(id, choices, isComplete: false) { EmptyMessage = "Import a DOF configuration with ini files first." };
+					// a port saved for a controller the cabinet no longer has stays, so removing it is the user's call
+					foreach (var name in SerialOverrides(request.Settings).Keys.Where(n => choices.All(c => c.Id != n))) {
+						choices.Add(new PluginChoice(name, name + " (not in the cabinet file)", "The active cabinet file has no serial controller of this name."));
+					}
+					return new PluginChoiceCatalog(id, choices) { EmptyMessage = "Your cabinet file has no controller on a serial port." };
+				}
+				case "serial-port-names": {
+					foreach (var (port, description) in SerialPortsOrNone()) {
+						choices.Add(new PluginChoice(port, description.Length > 0 && description != port ? $"{port} · {description}" : port, "A serial port of this computer."));
+					}
+					// a board that is unplugged now keeps its port
+					foreach (var port in SerialOverrides(request.Settings).Values.Distinct().Where(p => choices.All(c => c.Id != p))) {
+						choices.Add(new PluginChoice(port, port + " (not connected)", "This computer has no such serial port now."));
+					}
+					return new PluginChoiceCatalog("ports", choices) { EmptyMessage = "This computer has no serial ports." };
 				}
 				default:
 					return new PluginChoiceCatalog("empty", Array.Empty<PluginChoice>());
+			}
+		}
+
+		/// <summary>The serial ports DOF finds on this computer, by name.</summary>
+		private static IReadOnlyList<(string Port, string Description)> LocalSerialPorts()
+			=> DofLibrary.EnumerateDevices().Where(d => d.Kind == DofDeviceKind.Serial && d.Path.Length > 0)
+				.Select(d => (d.Path, d.Description)).OrderBy(p => p.Path, StringComparer.OrdinalIgnoreCase).ToList();
+
+		private IReadOnlyList<(string Port, string Description)> SerialPortsOrNone()
+		{
+			try {
+				return SerialPortsFactory();
+			} catch (Exception e) when (e is DllNotFoundException || e is EntryPointNotFoundException || e is DofException) {
+				Logger.Warn(e, "[DOF] Listing the serial ports failed.");
+				return Array.Empty<(string, string)>();
 			}
 		}
 
@@ -303,12 +338,428 @@ namespace VisualPinball.Engine.DOF.Player
 
 		#endregion
 
+		#region Information
+
+		public Task<PluginInfo> DescribeAsync(string provider, PluginChoiceRequest request, CancellationToken cancellation)
+			=> Task.Run(() => Describe(provider, request, cancellation), cancellation);
+
+		private PluginInfo Describe(string provider, PluginChoiceRequest request, CancellationToken cancellation)
+		{
+			cancellation.ThrowIfCancellationRequested();
+			switch (provider) {
+				case "configuration": return DescribeConfiguration();
+				case "devices": return DescribeDevices();
+				case "serial-ports": return DescribeSerialPorts(request.Settings);
+				default: return new PluginInfo("");
+			}
+		}
+
+		/// <summary>
+		/// The cabinet's controllers on serial ports, and whether this computer has their ports. Without any, and without saved
+		/// ports, there is nothing to change, and the ports are hidden.
+		/// </summary>
+		private PluginInfo DescribeSerialPorts(PluginSettingsSnapshot settings)
+		{
+			using var lease = Store.AcquireForReading();
+			var revision = lease?.Revision;
+			var serial = revision != null ? CatalogOf(revision).Controllers.Where(c => c.UsesSerialPort).ToList() : new List<DofCatalogController>();
+			// any record, also one still without its port, stays to be finished or removed
+			var records = (settings.Value("SerialOverrides") as JArray)?.Count ?? 0;
+			var hidden = serial.Count == 0 && records == 0 ? new[] { "SerialOverrides" } : Array.Empty<string>();
+			if (revision == null) {
+				return new PluginInfo("Import a DOF configuration first. Its cabinet file names the controllers on serial ports.", PluginInfoTone.Neutral) { HiddenFields = hidden };
+			}
+			if (serial.Count == 0) {
+				return new PluginInfo("Your cabinet file has no controller on a serial port, so there is nothing to change here.", PluginInfoTone.Neutral) { HiddenFields = hidden };
+			}
+			var local = new HashSet<string>(SerialPortsOrNone().Select(p => p.Port), StringComparer.OrdinalIgnoreCase);
+			var lines = serial.Select(c => Line(c.Name, c.SerialPort == null ? $"No port yet ({c.Type})"
+				: local.Contains(c.SerialPort) ? $"{c.SerialPort} ({c.Type})" : $"{c.SerialPort} ({c.Type}), which this computer does not have")).ToList();
+			var missing = serial.Count(c => c.SerialPort == null || !local.Contains(c.SerialPort));
+			return missing == 0
+				? new PluginInfo(serial.Count == 1 ? "1 controller on a serial port" : $"{serial.Count} controllers on serial ports", PluginInfoTone.Good, lines) { HiddenFields = hidden }
+				: new PluginInfo(missing == 1 ? "1 controller has no port this computer has. Choose its port below." : $"{missing} controllers have no port this computer has. Choose their ports below.",
+					PluginInfoTone.Warning, lines) { HiddenFields = hidden };
+		}
+
+		private PluginInfo DescribeConfiguration()
+		{
+			// leased while it is read: an import may activate another one meanwhile, and a prune would delete this one
+			using var lease = Store.AcquireForReading();
+			var revision = lease?.Revision;
+			if (revision == null) {
+				return new PluginInfo("No configuration imported", PluginInfoTone.Problem, new[] {
+					Line("Next", "Import the zip you downloaded from the DOF Config Tool, or an existing DirectOutput folder, below."),
+				}, new[] { "ShowImport", "Rollback" });
+			}
+			var catalog = CatalogOf(revision);
+			var warnings = revision.CountWarnings();
+			var origin = revision.ReadOrigin();
+			var games = catalog.Rows.Select(r => r.Rom).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+			var lines = new List<KeyValuePair<string, string>> {
+				Line("Imported", When(revision) + (origin != null ? ", from " + origin : "")),
+				Line("Games", games == 1 ? "1 game" : $"{games} games"),
+				Line("Devices", catalog.Devices.Count == 0 ? "No ini files" : string.Join(", ", catalog.Devices.Select(d => $"{d.Number} ({d.FileName})"))),
+				Line("Cabinet", DescribeCabinet(revision, catalog)),
+			};
+			if (catalog.TableConfigs.Count > 0) {
+				lines.Add(Line("Table configs", $"{catalog.TableConfigs.Count}, kept but not loaded"));
+			}
+			var previous = Store.Previous;
+			if (previous != null) {
+				lines.Add(Line("Undo", "Goes back to the configuration of " + When(previous)));
+			}
+			// without an earlier configuration, Undo has nothing to go back to
+			var unavailable = previous == null ? new[] { "Rollback" } : Array.Empty<string>();
+			return warnings == 0
+				? new PluginInfo("Active, without warnings", PluginInfoTone.Good, lines, unavailable)
+				: new PluginInfo(warnings == 1 ? "Active, with 1 warning. Show details lists it." : $"Active, with {warnings} warnings. Show details lists them.", PluginInfoTone.Warning, lines, unavailable);
+		}
+
+		private PluginInfo DescribeDevices()
+		{
+			// All off drives the outputs of the active configuration, so there is nothing to turn off without one
+			var unavailable = new List<string>();
+			if (Store.Active == null) {
+				unavailable.Add("AllOff");
+			}
+			if (Wiring.IsEmpty) {
+				unavailable.Add("ResetWiring");
+			}
+			IReadOnlyList<DofDetectedDevice> devices;
+			DateTime when;
+			try {
+				(devices, when) = Detection(false);
+			} catch (Exception e) when (e is DllNotFoundException || e is EntryPointNotFoundException || e is DofException) {
+				return new PluginInfo("The native DOF library could not be loaded: " + e.Message, PluginInfoTone.Problem, null, unavailable);
+			}
+			var lines = new List<KeyValuePair<string, string>>();
+			foreach (var device in devices) {
+				var what = (device.Device > 0 ? $"Device {device.Device}" : $"Devices {device.DeviceRange}") + ": " + device.Info;
+				lines.Add(Line(device.Type, device.Notes.Count == 0 ? what : what + ". " + string.Join(" ", device.Notes)));
+			}
+			lines.Add(Line("Checked", when.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture)));
+			return devices.Count == 0
+				? new PluginInfo("No board DOF knows is connected", PluginInfoTone.Neutral, lines, unavailable)
+				: new PluginInfo(devices.Count == 1 ? "1 board connected" : $"{devices.Count} boards connected", PluginInfoTone.Good, lines, unavailable);
+		}
+
+		/// <summary>The boards last detected; detects them the first time, and again when asked to.</summary>
+		private (IReadOnlyList<DofDetectedDevice> Devices, DateTime When) Detection(bool again)
+		{
+			lock (_detectionLock) {
+				if (again || _detection == null) {
+					_detection = (DofDetection.Detect(DofLibrary.EnumerateDevices()), DateTime.UtcNow);
+				}
+				return _detection.Value;
+			}
+		}
+
+		private static string DescribeCabinet(DofRevision revision, DofCatalog catalog)
+		{
+			if (!catalog.HasCabinet) {
+				return "No cabinet file: DOF sets up the boards it finds itself";
+			}
+			// as a game reads it: the cabinet file the global config names, its root and AutoConfigEnabled as libdof finds them
+			var autoConfig = DofGameSetup.AutoConfigEnabled(revision);
+			var controllers = string.Join(", ", catalog.Controllers.Select(c => c.SerialPort != null ? $"{c.Name} on {c.SerialPort}" : c.Name));
+			if (catalog.Controllers.Count == 0) {
+				return autoConfig
+					? "A cabinet file without controllers: DOF sets up the boards it finds"
+					: "A cabinet file without controllers, and automatic setup is off: DOF drives no board";
+			}
+			return autoConfig ? controllers + ", and the boards DOF finds itself" : controllers;
+		}
+
+		private static string When(DofRevision revision)
+			=> revision.CreatedUtc?.ToLocalTime().ToString("d MMM yyyy, HH:mm", CultureInfo.InvariantCulture) ?? revision.Id;
+
+		private static KeyValuePair<string, string> Line(string label, string value) => new KeyValuePair<string, string>(label, value);
+
+		#endregion
+
+		#region Outputs
+
+		/// <summary>The outputs of a LedWiz, which ini devices 1 to 16 stand for; the Config Tool's header ends at the last one in use.</summary>
+		private const int LedWizOutputs = 32;
+
+		/// <summary>
+		/// Why the outputs can't be tested: a host that shares its device reservations neither with the settings page nor before a
+		/// game (<see cref="DofPortTest.NoLeases"/>).
+		/// </summary>
+		internal const string NoTestsYet = "Start a game once to test the outputs.";
+
+		/// <summary>
+		/// The host's device reservations for a settings request, so the outputs can be tested before a game created the
+		/// plugin: the ones a game gets, so a test and another plugin never open a board at once. A request with the host's
+		/// capabilities brings its own, none when the host publishes none; one without has those of the game that created the
+		/// plugin.
+		/// </summary>
+		private PluginOutputLeases LeasesFor(PluginChoiceRequest request)
+			=> request?.Capabilities != null ? request.Capabilities.Find<PluginOutputLeases>(UnityPluginCapability.Outputs) : _leases;
+
+		public Task<PluginOutputMap> DescribeOutputsAsync(string provider, PluginChoiceRequest request, CancellationToken cancellation)
+		{
+			var leases = LeasesFor(request);
+			return Task.Run(() => DescribeOutputs(provider, leases, cancellation), cancellation);
+		}
+
+		private PluginOutputMap DescribeOutputs(string provider, PluginOutputLeases leases, CancellationToken cancellation)
+		{
+			cancellation.ThrowIfCancellationRequested();
+			if (provider != "outputs") {
+				return new PluginOutputMap(Array.Empty<PluginOutputBoard>());
+			}
+			// leased while it is read: an import may activate another one meanwhile, and a prune would delete this one; the wiring
+			// of the same store
+			var store = Store;
+			using var lease = store.AcquireForReading();
+			var revision = lease?.Revision;
+			if (revision == null) {
+				return new PluginOutputMap(Array.Empty<PluginOutputBoard>(), "Import a DOF configuration to see what it assigns to the outputs.");
+			}
+			var catalog = CatalogOf(revision);
+			var detected = DetectedBoards(catalog);
+			var wiring = ReadWiring(store.Root) ?? DofOutputWiring.None;
+			var boards = catalog.Devices.Select(device => Board(device, detected, Reach(catalog, detected, device.Number), wiring)).ToList();
+			return new PluginOutputMap(boards, "The configuration has no ini files, so it assigns nothing to the outputs.", leases == null ? NoTestsYet : "");
+		}
+
+		/// <summary>
+		/// The connected boards that are ini devices: only without a cabinet file, when DOF sets up the boards it finds. A
+		/// cabinet's controllers or toys, such as Art-Net or a LedWiz equivalent, can take a board's number instead.
+		/// </summary>
+		private IReadOnlyList<DofDetectedDevice> DetectedBoards(DofCatalog catalog)
+		{
+			if (catalog.HasCabinet) {
+				return Array.Empty<DofDetectedDevice>();
+			}
+			try {
+				return Detection(false).Devices;
+			} catch (Exception e) when (e is DllNotFoundException || e is EntryPointNotFoundException || e is DofException) {
+				return Array.Empty<DofDetectedDevice>();
+			}
+		}
+
+		/// <summary>
+		/// The highest output DOF drives on an ini device with or without a row: what the cabinet file maps, or the outputs DOF
+		/// sets up on a connected board of a fixed size.
+		/// </summary>
+		private static int Reach(DofCatalog catalog, IReadOnlyList<DofDetectedDevice> detected, int device)
+		{
+			var mapped = catalog.CabinetOutputs.TryGetValue(device, out var outputs) ? outputs : 0;
+			var board = detected.FirstOrDefault(d => d.Device == device);
+			return System.Math.Max(mapped, board == null ? 0 : FixedOutputs(board.Type));
+		}
+
+		// The outputs libdof's auto-configuration gives a board of a fixed size; 0 for one that reports its own, such as Pinscape.
+		private static int FixedOutputs(string type)
+		{
+			switch (type) {
+				case "LedWiz": return LedWizOutputs;
+				case "PacDrive": return 16;
+				case "PacLed64": return 64;
+				case "PacUIO": return 96;
+				case "FT245RBitbangController": return 8;
+				default: return 0;
+			}
+		}
+
+		/// <summary>
+		/// The outputs of an ini device: what its header names on each port, and the three ports of each RGB toy as its red,
+		/// green and blue, all named after the toy. Named after a board of its number when one is detected.
+		/// </summary>
+		/// <param name="mapped">The highest output DOF drives on the device with or without a row (<see cref="Reach"/>).</param>
+		/// <param name="wiring">
+		/// How the cabling differs from the configuration: each output shows the port that drives it, with a note where that is
+		/// another one. The ids stay the ports', so a test of an output pulses the port that drives it.
+		/// </param>
+		internal static PluginOutputBoard Board(DofCatalogDevice device, IReadOnlyList<DofDetectedDevice> detected, int mapped = 0, DofOutputWiring wiring = null)
+		{
+			wiring ??= DofOutputWiring.None;
+			var ports = Ports(device, mapped, wiring);
+			var outputs = new List<PluginOutput>(ports.Count);
+			for (var number = 1; number <= ports.Count; number++) {
+				var port = wiring.PortOn(device.Number, number);
+				var (name, channel) = ports[port - 1];
+				outputs.Add(new PluginOutput(DofPortTest.Id(device.Number, port), number, name, channel) {
+					Note = port != number ? $"Moved from {port}" : "",
+				});
+			}
+			var board = detected.FirstOrDefault(d => d.Device == device.Number);
+			return board != null
+				? new PluginOutputBoard($"{board.Type} {device.Number}", $"Device {device.Number} · {device.FileName}", outputs) { Rearrangeable = true }
+				: new PluginOutputBoard($"Device {device.Number}", device.FileName, outputs) { Rearrangeable = true };
+		}
+
+		/// <summary>What the configuration puts on each port of an ini device, from port 1: the header's name and the colour of an RGB toy's port.</summary>
+		private static IReadOnlyList<(string Name, PluginOutputChannel Channel)> Ports(DofCatalogDevice device, int mapped, DofOutputWiring wiring)
+		{
+			var count = System.Math.Max(device.Number >= 1 && device.Number <= 16 ? System.Math.Max(device.PortCount, LedWizOutputs) : device.PortCount, mapped);
+			count = System.Math.Max(count, wiring.Extent(device.Number));
+			var rgb = new HashSet<int>(device.RgbPorts);
+			var ports = new List<(string, PluginOutputChannel)>(count);
+			for (var port = 1; port <= count; port++) {
+				var name = port <= device.Ports.Count ? device.Ports[port - 1]?.Trim() ?? "" : "";
+				if (rgb.Contains(port) && port + 2 <= count) {
+					ports.Add((name, PluginOutputChannel.Red));
+					ports.Add((name, PluginOutputChannel.Green));
+					ports.Add((name, PluginOutputChannel.Blue));
+					port += 2;
+				} else {
+					ports.Add((name, PluginOutputChannel.None));
+				}
+			}
+			return ports;
+		}
+
+		public Task<PluginActionResult> TestOutputAsync(string provider, string output, PluginChoiceRequest request, CancellationToken cancellation)
+		{
+			var leases = LeasesFor(request);
+			return Task.Run(() => {
+				if (provider != "outputs") {
+					return new PluginActionResult(false, "Unknown DOF outputs.");
+				}
+				try {
+					return PulsePort(output, leases, cancellation);
+				} catch (DofException e) {
+					Logger.Warn(e, "[DOF] Testing output " + output + " failed.");
+					return new PluginActionResult(false, e.Message);
+				}
+			}, cancellation);
+		}
+
+		/// <summary>
+		/// The output wiring of the store's folder, read again when its file changed, such as by another settings page. Games
+		/// and tests use it as they start; when it can't be read, every port drives its own output, and the log says so.
+		/// </summary>
+		internal DofOutputWiring Wiring => ReadWiring(Store.Root) ?? DofOutputWiring.None;
+
+		// The next read reads the file, whatever its write time says: a file system may keep it too coarse to tell two saves apart.
+		private void ForgetWiring()
+		{
+			lock (_wiringLock) {
+				_wiring = null;
+			}
+		}
+
+		/// <summary>The wiring of a folder, or null when its file can't be read, after a few tries.</summary>
+		private DofOutputWiring ReadWiring(string root)
+		{
+			lock (_wiringLock) {
+				var path = Path.Combine(root, DofOutputWiring.FileName);
+				for (var attempt = 1; ; attempt++) {
+					try {
+						var stamp = File.Exists(path) ? File.GetLastWriteTimeUtc(path) : DateTime.MinValue;
+						if (_wiring == null || _wiringRoot != root || _wiringStamp != stamp) {
+							_wiring = DofOutputWiring.Load(root);
+							_wiringRoot = root;
+							_wiringStamp = stamp;
+						}
+						return _wiring;
+					} catch (Exception e) when (e is IOException || e is UnauthorizedAccessException) {
+						_wiring = null;
+						if (attempt == 3) {
+							Logger.Warn(e, "[DOF] The output wiring could not be read; until it can, every output gets what the configuration puts on it.");
+							return null;
+						}
+						Thread.Sleep(20);
+					}
+				}
+			}
+		}
+
+		public Task<PluginActionResult> SwapOutputsAsync(string provider, string first, string second, int count, PluginChoiceRequest request, CancellationToken cancellation)
+			=> Task.Run(() => provider != "outputs" ? new PluginActionResult(false, "Unknown DOF outputs.") : SwapOutputs(first, second, count, cancellation), cancellation);
+
+		/// <summary>
+		/// Swaps what drives two runs of outputs of a device, by where they show: the ids are ports, which drive the outputs the
+		/// wiring gives them. An RGB toy's three outputs move together or not at all, unless they are apart already.
+		/// </summary>
+		private PluginActionResult SwapOutputs(string first, string second, int count, CancellationToken cancellation)
+		{
+			cancellation.ThrowIfCancellationRequested();
+			if (!DofPortTest.TryParse(first, out var device, out var firstPort) || !DofPortTest.TryParse(second, out var other, out var secondPort)) {
+				return new PluginActionResult(false, "Unknown output.");
+			}
+			if (device != other) {
+				return new PluginActionResult(false, "Outputs move within their board only.");
+			}
+			if (device > DofOutputWiring.MaxDevice) {
+				return new PluginActionResult(false, $"Device {device} can't be rearranged: DOF takes devices 1 to {DofOutputWiring.MaxDevice}.");
+			}
+			// one folder for the whole change, should the host move the store meanwhile
+			var store = Store;
+			using var lease = store.AcquireForReading();
+			var revision = lease?.Revision;
+			var catalog = revision != null ? CatalogOf(revision) : null;
+			var entry = catalog?.Devices.FirstOrDefault(d => d.Number == device);
+			if (entry == null) {
+				return new PluginActionResult(false, "The configuration has no device " + device + ".");
+			}
+			lock (WiringFileLock) {
+				var wiring = ReadWiring(store.Root);
+				if (wiring == null) {
+					return new PluginActionResult(false, "The output wiring could not be read, so nothing was changed. Try again.");
+				}
+				var ports = Ports(entry, Reach(catalog, DetectedBoards(catalog), device), wiring);
+				var a = wiring.OutputOf(device, firstPort);
+				var b = wiring.OutputOf(device, secondPort);
+				if (count < 1 || firstPort > ports.Count || secondPort > ports.Count || a + count - 1 > ports.Count || b + count - 1 > ports.Count) {
+					return new PluginActionResult(false, "The outputs are not all on the board.");
+				}
+				if (a < b + count && b < a + count) {
+					return new PluginActionResult(false, "The outputs overlap.");
+				}
+				// An RGB toy on three outputs in a row: each run holds all three or none. One a new configuration put on outputs
+				// apart moves an output at a time, so it can be put back together.
+				for (var port = 1; port + 2 <= ports.Count; port++) {
+					if (ports[port - 1].Channel != PluginOutputChannel.Red) {
+						continue;
+					}
+					var start = wiring.OutputOf(device, port);
+					if (wiring.OutputOf(device, port + 1) != start + 1 || wiring.OutputOf(device, port + 2) != start + 2) {
+						continue;
+					}
+					foreach (var run in new[] { a, b }) {
+						var inside = Enumerable.Range(start, 3).Count(o => o >= run && o < run + count);
+						if (inside != 0 && inside != 3) {
+							return new PluginActionResult(false, $"That would split {Toy(ports[port - 1].Name)}: its red, green and blue move together.");
+						}
+					}
+				}
+				try {
+					wiring.Swap(device, a, b, count).Save(store.Root);
+				} catch (Exception e) when (e is IOException || e is UnauthorizedAccessException || e is ArgumentOutOfRangeException) {
+					Logger.Warn(e, "[DOF] Saving the output wiring failed.");
+					return new PluginActionResult(false, "Not rearranged: " + e.Message);
+				} finally {
+					ForgetWiring();
+				}
+				var moved = count == 1 ? $"outputs {a} and {b}" : $"outputs {a}–{a + count - 1} and {b}–{b + count - 1}";
+				Logger.Info($"[DOF] Swapped {moved} of device {device}.");
+				return new PluginActionResult(true, $"Swapped what drives {moved} of device {device}. {WhenItApplies()}");
+			}
+		}
+
+		// A game keeps the wiring it started with.
+		private static string WhenItApplies() => DofOwnership.InUse
+			? "The running game keeps the wiring it started with: it applies from the next game."
+			: "Games and tests use it from now on.";
+
+		private static string Toy(string name) => name.Length > 0 ? name : "an RGB toy";
+
+		#endregion
+
 		#region Actions
 
 		public Task<PluginActionResult> RunActionAsync(string action, PluginChoiceRequest request, CancellationToken cancellation)
-			=> Task.Run(() => RunAction(action, request, cancellation), cancellation);
+		{
+			var leases = LeasesFor(request);
+			return Task.Run(() => RunAction(action, request, leases, cancellation), cancellation);
+		}
 
-		private PluginActionResult RunAction(string action, PluginChoiceRequest request, CancellationToken cancellation)
+		private PluginActionResult RunAction(string action, PluginChoiceRequest request, PluginOutputLeases leases, CancellationToken cancellation)
 		{
 			try {
 				switch (action) {
@@ -321,8 +772,8 @@ namespace VisualPinball.Engine.DOF.Player
 							: new PluginActionResult(false, "There is no previous configuration.");
 					case "apply-serial-overrides": return ApplySerialOverrides(request.Settings);
 					case "detect": return Detect();
-					case "pulse-port": return PulsePort(request.Settings.String("TestPort"), cancellation);
-					case "all-off": return AllOff(cancellation);
+					case "all-off": return AllOff(leases, cancellation);
+					case "reset-wiring": return ResetWiring();
 					default: return new PluginActionResult(false, "Unknown DOF action.");
 				}
 			} catch (DofException e) {
@@ -359,27 +810,25 @@ namespace VisualPinball.Engine.DOF.Player
 			}
 			message.Append(warnings.Count == 1 ? " 1 warning: " : $" {warnings.Count} warnings, the first: ").Append(warnings[0].Message);
 			if (warnings.Count > 1) {
-				message.Append(" Show configuration lists them all.");
+				message.Append(" Show details lists them all.");
 			}
 		}
 
 		private PluginActionResult ShowImport()
 		{
-			var revision = Store.Active;
+			using var lease = Store.AcquireForReading();
+			var revision = lease?.Revision;
 			if (revision == null) {
 				return new PluginActionResult(false, "No DOF configuration is imported.");
 			}
+			// The Active configuration block already sums it up: the details are the controllers' types and the import report.
 			var catalog = CatalogOf(revision);
 			var text = new StringBuilder();
-			text.Append($"Revision {revision.Id}: ");
-			text.Append(catalog.Devices.Count == 1 ? "1 ini device" : $"{catalog.Devices.Count} ini devices");
-			text.Append($", {catalog.Rows.Select(r => r.Rom).Distinct(StringComparer.OrdinalIgnoreCase).Count()} games");
-			text.Append(catalog.Controllers.Count == 0 ? ", no cabinet file (DOF configures connected boards itself)" : ", controllers " + string.Join(", ", catalog.Controllers.Select(c => c.SerialPort != null ? $"{c.Name} ({c.Type}, {c.SerialPort})" : $"{c.Name} ({c.Type})")));
-			text.Append(catalog.TableConfigs.Count == 0 ? "." : $", {catalog.TableConfigs.Count} table configs (stored only, not loaded).");
-			var report = revision.ReadReport();
-			if (!string.IsNullOrWhiteSpace(report)) {
-				text.Append("\n").Append(report.Trim());
+			if (catalog.Controllers.Count > 0) {
+				text.Append("Controllers: ").Append(string.Join(", ", catalog.Controllers.Select(c => c.SerialPort != null ? $"{c.Name} ({c.Type}, {c.SerialPort})" : $"{c.Name} ({c.Type})"))).Append(".\n");
 			}
+			var report = revision.ReadReport();
+			text.Append(string.IsNullOrWhiteSpace(report) ? $"Revision {revision.Id} has no import report." : report.Trim());
 			return new PluginActionResult(true, text.ToString());
 		}
 
@@ -418,36 +867,53 @@ namespace VisualPinball.Engine.DOF.Player
 			return overrides;
 		}
 
-		private static PluginActionResult Detect()
+		// The list itself is the Connected boards information, which the page shows again after the action.
+		private PluginActionResult Detect()
 		{
-			var detected = DofDetection.Detect(DofLibrary.EnumerateDevices());
-			if (detected.Count == 0) {
-				return new PluginActionResult(true, "No board DOF knows is connected.");
-			}
-			var text = new StringBuilder(detected.Count == 1 ? "1 board:" : $"{detected.Count} boards:");
-			foreach (var device in detected) {
-				text.Append("\n").Append(device);
-				foreach (var note in device.Notes) {
-					text.Append("\n  ").Append(note);
-				}
-			}
-			Logger.Info("[DOF] Detected " + text);
-			return new PluginActionResult(true, text.ToString());
+			var (detected, _) = Detection(true);
+			Logger.Info("[DOF] Detected " + (detected.Count == 0 ? "no boards." : string.Join("; ", detected.Select(d => d.ToString()))));
+			return new PluginActionResult(true, detected.Count == 0 ? "No board DOF knows is connected." : detected.Count == 1 ? "Found 1 board." : $"Found {detected.Count} boards.");
 		}
 
-		private PluginActionResult PulsePort(string id, CancellationToken cancellation)
+		private PluginActionResult PulsePort(string id, PluginOutputLeases leases, CancellationToken cancellation)
 		{
 			if (!DofPortTest.TryParse(id, out var device, out var port)) {
-				return new PluginActionResult(false, "Choose an output first.");
+				return new PluginActionResult(false, "Unknown output " + id + ".");
 			}
-			var (success, message) = DofPortTest.Pulse(Store, _leases, Id, device, port, PulseDuration, ConfirmTimeout, TestNativeFactory, cancellation);
+			var store = Store;
+			var (success, message) = DofPortTest.Pulse(store, leases, Id, ReadWiring(store.Root) ?? DofOutputWiring.None, device, port, PulseDuration, ConfirmTimeout, TestNativeFactory, cancellation);
 			return new PluginActionResult(success, message);
 		}
 
-		private PluginActionResult AllOff(CancellationToken cancellation)
+		private PluginActionResult AllOff(PluginOutputLeases leases, CancellationToken cancellation)
 		{
-			var (success, message) = DofPortTest.AllOff(Store, _leases, Id, ConfirmTimeout, TestNativeFactory, cancellation);
+			var store = Store;
+			var (success, message) = DofPortTest.AllOff(store, leases, Id, ReadWiring(store.Root) ?? DofOutputWiring.None, ConfirmTimeout, TestNativeFactory, cancellation);
 			return new PluginActionResult(success, message);
+		}
+
+		private PluginActionResult ResetWiring()
+		{
+			var root = Store.Root;
+			lock (WiringFileLock) {
+				var wiring = ReadWiring(root);
+				if (wiring == null) {
+					return new PluginActionResult(false, "The output wiring could not be read, so nothing was changed. Try again.");
+				}
+				if (wiring.IsEmpty) {
+					return new PluginActionResult(false, "No output is rearranged.");
+				}
+				try {
+					DofOutputWiring.None.Save(root);
+				} catch (Exception e) when (e is IOException || e is UnauthorizedAccessException) {
+					Logger.Warn(e, "[DOF] Removing the output wiring failed.");
+					return new PluginActionResult(false, "Not undone: " + e.Message);
+				} finally {
+					ForgetWiring();
+				}
+			}
+			Logger.Info("[DOF] The output wiring was reset.");
+			return new PluginActionResult(true, "Every output has what the configuration puts on it again. " + WhenItApplies());
 		}
 
 		#endregion

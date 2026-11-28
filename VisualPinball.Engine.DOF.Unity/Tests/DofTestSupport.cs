@@ -167,6 +167,7 @@ namespace VisualPinball.Engine.DOF.Unity.Tests
 			}
 		}
 
+		public void SetOutputMap(int device, IReadOnlyList<int> targets) => Record($"map:{device}:{string.Join(",", targets)}");
 		public void Init(string tableFile, string romName) => Record("init:" + romName);
 		public void Data(char type, int number, int value) => Record($"{type}{number}={value}");
 		public void DataNamed(string name, int value) => Record($"{name}={value}");
