@@ -124,6 +124,7 @@ namespace VisualPinball.Engine.DOF.Configuration
 			var roms = new List<string>();
 			// libdof reads the first [Config DOF] section, or else the first [Config outs] one
 			List<string> configDof = null, configOuts = null, rows = null;
+			IReadOnlyList<string> dofHeader = null, outsHeader = null;
 			var variables = new List<string>();
 			var tableVariables = new List<string>();
 			var unknown = new List<string>();
@@ -190,7 +191,12 @@ namespace VisualPinball.Engine.DOF.Configuration
 					}
 					if (line[0] == '#' || line.StartsWith("//", StringComparison.Ordinal)) {
 						if (expectHeader) {
-							PortNames = ParseHeader(line.TrimStart('#', '/').Trim());
+							// the header of the section the rows are read from, not of a later one libdof ignores
+							if (rows != null && rows == configDof) {
+								dofHeader = ParseHeader(line.TrimStart('#', '/').Trim());
+							} else if (rows != null) {
+								outsHeader = ParseHeader(line.TrimStart('#', '/').Trim());
+							}
 							expectHeader = false;
 						}
 						continue;
@@ -204,6 +210,7 @@ namespace VisualPinball.Engine.DOF.Configuration
 					rows?.Add(line);
 				}
 			}
+			PortNames = (configDof != null ? dofHeader : outsHeader) ?? Array.Empty<string>();
 			ReadPorts(configDof ?? configOuts ?? new List<string>(), Variables(variables), TableVariables(tableVariables));
 			if (!configFound) {
 				throw new FormatException($"{name} has no [Config DOF] or [Config outs] section, so it is not a DOF configuration file.");
@@ -350,22 +357,43 @@ namespace VisualPinball.Engine.DOF.Configuration
 			return ReplaceAll(d, variables);
 		}
 
+		/// <summary>The longest a row may grow to while its variables are replaced: a variable that uses itself grows it each round.</summary>
+		private const int MaxResolvedRow = 64 * 1024;
+
 		/// <summary>
-		/// Replaces the variables until none is left, a few rounds at most: libdof replaces them in its hash map's order, in which
-		/// a variable that uses another one is resolved or not by chance.
+		/// Replaces the variables until none is left, a few rounds at most and while the row stays shorter than
+		/// <see cref="MaxResolvedRow"/>: libdof replaces them in its hash map's order, in which a variable that uses another one
+		/// is resolved or not by chance.
 		/// </summary>
 		private static string ReplaceAll(string d, IReadOnlyList<KeyValuePair<string, string>> variables)
 		{
 			for (var round = 0; round < 8; round++) {
 				var before = d;
 				foreach (var variable in variables) {
-					d = d.Replace(Delimited(variable.Key), variable.Value);
+					var name = Delimited(variable.Key);
+					var count = Occurrences(d, name);
+					if (count == 0) {
+						continue;
+					}
+					if (d.Length + (long)count * (variable.Value.Length - name.Length) > MaxResolvedRow) {
+						return d;
+					}
+					d = d.Replace(name, variable.Value);
 				}
 				if (d == before) {
 					break;
 				}
 			}
 			return d;
+		}
+
+		private static int Occurrences(string text, string value)
+		{
+			var count = 0;
+			for (var at = text.IndexOf(value, StringComparison.Ordinal); at >= 0; at = text.IndexOf(value, at + value.Length, StringComparison.Ordinal)) {
+				count++;
+			}
+			return count;
 		}
 
 		private static string Delimited(string name)

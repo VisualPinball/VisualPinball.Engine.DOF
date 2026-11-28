@@ -324,6 +324,12 @@ namespace VisualPinball.Engine.DOF.Test
 			Ports("[Variables DOF]\r\nflashcolour=S1 Red\r\nflash=@flashcolour@\r\n[Config DOF]\r\nrom,@flash@,S2", new[] { 1 }, 4, "a variable that uses another");
 			Ports("[Config outs]\r\nold,S1 Red,S2\r\n[Config DOF]\r\nrom,S1,S2", new int[0], 2, "only the [Config DOF] section where there is one");
 			Ports("rom,S1,S2\r\nROM,S1 Red,S2", new int[0], 2, "the first row of a ROM");
+			Ports("[Config DOF]\r\n#\"Rom\",\"Flasher\",\"\",\"\"\r\nrom,S1 Red\r\n[Config outs]\r\n#\"Rom\",\"A\",\"B\",\"C\"\r\nold,S1", new[] { 1 }, 3,
+				"the header of the section the rows come from");
+			var timer = System.Diagnostics.Stopwatch.StartNew();
+			Ports("[Variables DOF]\r\na=" + string.Concat(Enumerable.Repeat("@a@", 100)) + "\r\n[Config DOF]\r\nrom,@a@,S2", new int[0], 2,
+				"a variable that uses itself stops growing the row");
+			Assert.That(timer.ElapsedMilliseconds, Is.LessThan(2000));
 		}
 
 		private void Ports(string config, int[] rgb, int extent, string because)
