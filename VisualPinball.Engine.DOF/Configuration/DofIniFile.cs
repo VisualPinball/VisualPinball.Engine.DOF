@@ -223,6 +223,7 @@ namespace VisualPinball.Engine.DOF.Configuration
 			IReadOnlyDictionary<string, List<KeyValuePair<string, string>>> tableVariables)
 		{
 			var rgb = new SortedSet<int>();
+			// without a header, the columns a row writes are all there is to tell the board's size, its 0s too
 			var extent = 0;
 			var reaches = new List<(int Extent, List<int> Starts)>();
 			var roms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -238,17 +239,24 @@ namespace VisualPinball.Engine.DOF.Configuration
 					last--;
 				}
 				var port = 1;
+				var reached = 0;
 				var starts = new List<int>();
 				for (var i = 1; i <= last; i++) {
-					var colour = Split(columns[i], '/').Any(setting => !string.IsNullOrWhiteSpace(setting) && HasColour(setting));
+					var settings = Split(columns[i], '/').Where(setting => !string.IsNullOrWhiteSpace(setting)).Select(Colour).ToList();
+					var colour = settings.Any(c => c == true);
 					if (colour) {
 						starts.Add(port);
 					}
 					port += colour ? 3 : 1;
+					// a column of settings libdof drops, such as 0, numbers its port but puts nothing on it: past the header, the
+					// Config Tool's 0s say nothing about the board
+					if (settings.Any(c => c != null)) {
+						reached = port - 1;
+					}
 				}
 				rgb.UnionWith(starts);
 				extent = Math.Max(extent, port - 1);
-				reaches.Add((port - 1, starts));
+				reaches.Add((reached, starts));
 			}
 			if (PortNames.Count == 0) {
 				RgbPorts = rgb.ToArray();
@@ -425,9 +433,10 @@ namespace VisualPinball.Engine.DOF.Configuration
 		/// <summary>
 		/// Whether libdof gives a setting a colour, which makes its column an RGB toy (TableConfigSetting.ParseSettingData): a
 		/// part after the trigger that is a <c>#RRGGBB</c> or <c>#RRGGBBAA</c> value, or a word of three letters or more that
-		/// is none of its keywords, defined in a colour section or not. A setting it cannot parse, or one fixed off, it drops.
+		/// is none of its keywords, defined in a colour section or not. Null for a setting it drops: one it cannot parse, or
+		/// one fixed off.
 		/// </summary>
-		internal static bool HasColour(string setting)
+		internal static bool? Colour(string setting)
 		{
 			var s = setting.Trim().ToUpperInvariant();
 			if (s.StartsWith("(", StringComparison.Ordinal)) {
@@ -445,12 +454,12 @@ namespace VisualPinball.Engine.DOF.Configuration
 					}
 				}
 				if (close < 0) {
-					return false;
+					return null;
 				}
 				s = s.Substring(close + 1).Trim();
 			} else {
 				if (s.Length == 0) {
-					return false;
+					return null;
 				}
 				var end = -1;
 				var lastChar = '\0';
@@ -465,10 +474,10 @@ namespace VisualPinball.Engine.DOF.Configuration
 				}
 				var trigger = s.Substring(0, end < 0 ? s.Length : end).Trim();
 				if (trigger == "OFF" || trigger == "0") {
-					return false;
+					return null;
 				}
 				if (trigger != "ON" && trigger != "1" && trigger != "B" && trigger != "BLINK" && !IsTrigger(trigger)) {
-					return false;
+					return null;
 				}
 				s = s.Substring(trigger.Length).Trim();
 			}
@@ -480,12 +489,12 @@ namespace VisualPinball.Engine.DOF.Configuration
 				}
 				if (IsInteger(part)) {
 					if (++integers > 2) {
-						return false;
+						return null;
 					}
 				} else if (IsHexColour(part) || part.Length > 2 && part.All(c => c >= 'A' && c <= 'Z' || c == '_')) {
 					colour = true;
 				} else {
-					return false;
+					return null;
 				}
 			}
 			return colour;
@@ -570,8 +579,8 @@ namespace VisualPinball.Engine.DOF.Configuration
 				return Array.Empty<string>();
 			}
 			fields.RemoveAt(0);
-			// The header ends with a comma: drop the empty field after it.
-			if (fields.Count > 0 && fields[fields.Count - 1].Length == 0) {
+			// The header ends with a comma: drop the empty field after it, but not a quoted one, which names a port.
+			if (fields.Count > 0 && fields[fields.Count - 1].Length == 0 && header.TrimEnd().EndsWith(",", StringComparison.Ordinal)) {
 				fields.RemoveAt(fields.Count - 1);
 			}
 			return fields;

@@ -399,13 +399,28 @@ namespace VisualPinball.Engine.DOF.Player
 		/// <summary>The outputs of a LedWiz, which ini devices 1 to 16 stand for; the Config Tool's header ends at the last one in use.</summary>
 		private const int LedWizOutputs = 32;
 
-		/// <summary>Why the outputs can't be tested before a game ran: the player shares its device reservations then (<see cref="DofPortTest.NoLeases"/>).</summary>
+		/// <summary>
+		/// Why the outputs can't be tested: a host that shares its device reservations neither with the settings page nor before a
+		/// game (<see cref="DofPortTest.NoLeases"/>).
+		/// </summary>
 		internal const string NoTestsYet = "Start a game once to test the outputs.";
 
-		public Task<PluginOutputMap> DescribeOutputsAsync(string provider, PluginChoiceRequest request, CancellationToken cancellation)
-			=> Task.Run(() => DescribeOutputs(provider, cancellation), cancellation);
+		/// <summary>
+		/// The host's device reservations for a settings request, so the outputs can be tested before a game created the
+		/// plugin: the ones a game gets, so a test and another plugin never open a board at once. A request with the host's
+		/// capabilities brings its own, none when the host publishes none; one without has those of the game that created the
+		/// plugin.
+		/// </summary>
+		private PluginOutputLeases LeasesFor(PluginChoiceRequest request)
+			=> request?.Capabilities != null ? request.Capabilities.Find<PluginOutputLeases>(UnityPluginCapability.Outputs) : _leases;
 
-		private PluginOutputMap DescribeOutputs(string provider, CancellationToken cancellation)
+		public Task<PluginOutputMap> DescribeOutputsAsync(string provider, PluginChoiceRequest request, CancellationToken cancellation)
+		{
+			var leases = LeasesFor(request);
+			return Task.Run(() => DescribeOutputs(provider, leases, cancellation), cancellation);
+		}
+
+		private PluginOutputMap DescribeOutputs(string provider, PluginOutputLeases leases, CancellationToken cancellation)
 		{
 			cancellation.ThrowIfCancellationRequested();
 			if (provider != "outputs") {
@@ -428,17 +443,18 @@ namespace VisualPinball.Engine.DOF.Player
 					detected = Array.Empty<DofDetectedDevice>();
 				}
 			}
-			var boards = catalog.Devices.Select(device => Board(device, detected)).ToList();
-			return new PluginOutputMap(boards, "The configuration has no ini files, so it assigns nothing to the outputs.", _leases == null ? NoTestsYet : "");
+			var boards = catalog.Devices.Select(device => Board(device, detected, catalog.CabinetOutputs.TryGetValue(device.Number, out var mapped) ? mapped : 0)).ToList();
+			return new PluginOutputMap(boards, "The configuration has no ini files, so it assigns nothing to the outputs.", leases == null ? NoTestsYet : "");
 		}
 
 		/// <summary>
 		/// The outputs of an ini device: what its header names on each port, and the three ports of each RGB toy as its red,
 		/// green and blue, all named after the toy. Named after a board of its number when one is detected.
 		/// </summary>
-		internal static PluginOutputBoard Board(DofCatalogDevice device, IReadOnlyList<DofDetectedDevice> detected)
+		/// <param name="mapped">The highest output a cabinet file maps to the device, which DOF drives with or without a row.</param>
+		internal static PluginOutputBoard Board(DofCatalogDevice device, IReadOnlyList<DofDetectedDevice> detected, int mapped = 0)
 		{
-			var count = device.Number >= 1 && device.Number <= 16 ? System.Math.Max(device.PortCount, LedWizOutputs) : device.PortCount;
+			var count = System.Math.Max(device.Number >= 1 && device.Number <= 16 ? System.Math.Max(device.PortCount, LedWizOutputs) : device.PortCount, mapped);
 			var rgb = new HashSet<int>(device.RgbPorts);
 			var outputs = new List<PluginOutput>(count);
 			for (var port = 1; port <= count; port++) {
@@ -459,26 +475,32 @@ namespace VisualPinball.Engine.DOF.Player
 		}
 
 		public Task<PluginActionResult> TestOutputAsync(string provider, string output, PluginChoiceRequest request, CancellationToken cancellation)
-			=> Task.Run(() => {
+		{
+			var leases = LeasesFor(request);
+			return Task.Run(() => {
 				if (provider != "outputs") {
 					return new PluginActionResult(false, "Unknown DOF outputs.");
 				}
 				try {
-					return PulsePort(output, cancellation);
+					return PulsePort(output, leases, cancellation);
 				} catch (DofException e) {
 					Logger.Warn(e, "[DOF] Testing output " + output + " failed.");
 					return new PluginActionResult(false, e.Message);
 				}
 			}, cancellation);
+		}
 
 		#endregion
 
 		#region Actions
 
 		public Task<PluginActionResult> RunActionAsync(string action, PluginChoiceRequest request, CancellationToken cancellation)
-			=> Task.Run(() => RunAction(action, request, cancellation), cancellation);
+		{
+			var leases = LeasesFor(request);
+			return Task.Run(() => RunAction(action, request, leases, cancellation), cancellation);
+		}
 
-		private PluginActionResult RunAction(string action, PluginChoiceRequest request, CancellationToken cancellation)
+		private PluginActionResult RunAction(string action, PluginChoiceRequest request, PluginOutputLeases leases, CancellationToken cancellation)
 		{
 			try {
 				switch (action) {
@@ -491,7 +513,7 @@ namespace VisualPinball.Engine.DOF.Player
 							: new PluginActionResult(false, "There is no previous configuration.");
 					case "apply-serial-overrides": return ApplySerialOverrides(request.Settings);
 					case "detect": return Detect();
-					case "all-off": return AllOff(cancellation);
+					case "all-off": return AllOff(leases, cancellation);
 					default: return new PluginActionResult(false, "Unknown DOF action.");
 				}
 			} catch (DofException e) {
@@ -593,18 +615,18 @@ namespace VisualPinball.Engine.DOF.Player
 			return new PluginActionResult(true, detected.Count == 0 ? "No board DOF knows is connected." : detected.Count == 1 ? "Found 1 board." : $"Found {detected.Count} boards.");
 		}
 
-		private PluginActionResult PulsePort(string id, CancellationToken cancellation)
+		private PluginActionResult PulsePort(string id, PluginOutputLeases leases, CancellationToken cancellation)
 		{
 			if (!DofPortTest.TryParse(id, out var device, out var port)) {
 				return new PluginActionResult(false, "Unknown output " + id + ".");
 			}
-			var (success, message) = DofPortTest.Pulse(Store, _leases, Id, device, port, PulseDuration, ConfirmTimeout, TestNativeFactory, cancellation);
+			var (success, message) = DofPortTest.Pulse(Store, leases, Id, device, port, PulseDuration, ConfirmTimeout, TestNativeFactory, cancellation);
 			return new PluginActionResult(success, message);
 		}
 
-		private PluginActionResult AllOff(CancellationToken cancellation)
+		private PluginActionResult AllOff(PluginOutputLeases leases, CancellationToken cancellation)
 		{
-			var (success, message) = DofPortTest.AllOff(Store, _leases, Id, ConfirmTimeout, TestNativeFactory, cancellation);
+			var (success, message) = DofPortTest.AllOff(Store, leases, Id, ConfirmTimeout, TestNativeFactory, cancellation);
 			return new PluginActionResult(success, message);
 		}
 

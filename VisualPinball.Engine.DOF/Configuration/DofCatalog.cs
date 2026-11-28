@@ -90,6 +90,12 @@ namespace VisualPinball.Engine.DOF.Configuration
 		public bool HasCabinet { get; private set; }
 
 		/// <summary>
+		/// The highest output the cabinet file's LedWiz equivalents map, by the ini device they stand for: DOF can drive those
+		/// outputs even where no ini row puts anything on them.
+		/// </summary>
+		public IReadOnlyDictionary<int, int> CabinetOutputs { get; private set; } = new Dictionary<int, int>();
+
+		/// <summary>
 		/// Serial ports the cabinet file names: a game leases them before DOF opens them. libdof's auto-configurators
 		/// can still probe other ports (PinOne's falls back to probing every port); the native layer has no allowlist.
 		/// </summary>
@@ -117,6 +123,7 @@ namespace VisualPinball.Engine.DOF.Configuration
 			var devices = new List<DofCatalogDevice>();
 			var cabinetControllers = new List<DofCatalogController>();
 			var hasCabinet = false;
+			var cabinetOutputs = new Dictionary<int, int>();
 			var mappings = new List<KeyValuePair<string, string>>();
 			var legacy = new List<DofIniFile>();
 			var current = new List<DofIniFile>();
@@ -139,6 +146,9 @@ namespace VisualPinball.Engine.DOF.Configuration
 						foreach (var controller in CabinetControllers(xml)) {
 							var type = DofXml.LiteralName(controller);
 							cabinetControllers.Add(new DofCatalogController(type, DofXml.ControllerName(controller), DofXml.SerialPortOf(controller)));
+						}
+						foreach (var (device, output) in LedWizEquivalentOutputs(xml)) {
+							cabinetOutputs[device] = Math.Max(output, cabinetOutputs.TryGetValue(device, out var known) ? known : 0);
 						}
 						break;
 					case DofXmlKind.TableMappings:
@@ -164,7 +174,26 @@ namespace VisualPinball.Engine.DOF.Configuration
 			var effective = revision.ReadLibdofRows()?.OrderBy(r => r.Device).ToList();
 			return new DofCatalog(revision, devices, effective ?? rows, effective != null, mappings, revision.TableConfigs, cabinetControllers) {
 				HasCabinet = hasCabinet,
+				CabinetOutputs = cabinetOutputs,
 			};
+		}
+
+		/// <summary>The outputs a cabinet file's LedWiz equivalents map, each with the ini device it stands for.</summary>
+		private static IEnumerable<(int Device, int Output)> LedWizEquivalentOutputs(System.Xml.Linq.XDocument xml)
+		{
+			if (xml.Root == null || DofXml.LiteralName(xml.Root) != "Cabinet") {
+				yield break;
+			}
+			foreach (var toy in DofXml.FirstChild(xml.Root, "Toys")?.Elements() ?? Enumerable.Empty<System.Xml.Linq.XElement>()) {
+				if (DofXml.LiteralName(toy) != "LedWizEquivalent" || !int.TryParse(DofXml.Value(toy, "LedWizNumber"), out var device)) {
+					continue;
+				}
+				foreach (var output in DofXml.Children(DofXml.FirstChild(toy, "Outputs"), "LedWizEquivalentOutput")) {
+					if (int.TryParse(DofXml.Value(output, "LedWizEquivalentOutputNumber"), out var number) && number > 0) {
+						yield return (device, number);
+					}
+				}
+			}
 		}
 
 		/// <summary>

@@ -135,6 +135,20 @@ namespace VisualPinball.Engine.DOF.Test
 		}
 
 		[Test]
+		public void CatalogKnowsTheOutputsTheCabinetMaps()
+		{
+			var outputs = string.Concat(new[] { 1, 4, 2 }.Select(n => $"<LedWizEquivalentOutput><OutputName>Out {n}</OutputName><LedWizEquivalentOutputNumber>{n}</LedWizEquivalentOutputNumber></LedWizEquivalentOutput>"));
+			var cabinet = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<Cabinet><Name>Test</Name><OutputControllers /><Toys>"
+				+ $"<LedWizEquivalent><Name>LedWizEquivalent 30</Name><LedWizNumber>30</LedWizNumber><Outputs>{outputs}</Outputs></LedWizEquivalent>"
+				+ "<LedWizEquivalent><Name>Broken</Name><LedWizNumber>x</LedWizNumber><Outputs>" + outputs + "</Outputs></LedWizEquivalent>"
+				+ "</Toys></Cabinet>\r\n";
+			Accepted(_importer.Import(Folder("Mapped", ("Config/cabinet.xml", cabinet), ("Config/directoutputconfig30.ini", Header + "#\"Rom\",\"Knocker\"\r\nrom,S1,0,0,0\r\n"))));
+			var catalog = DofCatalog.Load(_store.Active);
+			Assert.That(catalog.CabinetOutputs, Is.EqualTo(new Dictionary<int, int> { [30] = 4 }), "the highest output, by the device it stands for");
+			Assert.That(catalog.Devices.Single().PortCount, Is.EqualTo(1), "the ini itself puts nothing past the knocker");
+		}
+
+		[Test]
 		public void RelocatesAWindowsAuthoredConfiguration()
 		{
 			_importer.WindowsPortNames = false;
@@ -159,6 +173,7 @@ namespace VisualPinball.Engine.DOF.Test
 			Assert.That(revision.ReadOrigin(), Is.EqualTo("the folder DirectOutput"));
 			Assert.That(revision.CountWarnings(), Is.EqualTo(report.Entries.Count(e => e.Severity == DofReportSeverity.Warning)).And.GreaterThan(0));
 			Assert.That(DofCatalog.Load(revision).HasCabinet, Is.True);
+			Assert.That(DofCatalog.Load(revision).CabinetOutputs, Is.Empty, "a LedWiz equivalent without outputs maps none");
 
 			// The serial port gets this computer's name in a new revision; the import itself is unchanged.
 			var overridden = Accepted(_importer.ApplySerialOverrides(new Dictionary<string, string> { ["PinControl 1"] = "/dev/ttyACM0", ["Teensy 1"] = "/dev/ttyACM1" }));
@@ -324,6 +339,9 @@ namespace VisualPinball.Engine.DOF.Test
 			Ports("[Variables DOF]\r\nflashcolour=S1 Red\r\nflash=@flashcolour@\r\n[Config DOF]\r\nrom,@flash@,S2", new[] { 1 }, 4, "a variable that uses another");
 			Ports("[Config outs]\r\nold,S1 Red,S2\r\n[Config DOF]\r\nrom,S1,S2", new int[0], 2, "only the [Config DOF] section where there is one");
 			Ports("rom,S1,S2\r\nROM,S1 Red,S2", new int[0], 2, "the first row of a ROM");
+			Ports("#\"Rom\",\"Knocker\"\r\nrom,S1,0,OFF,0", new int[0], 1, "past the header, columns of 0 put nothing on the board");
+			Ports("rom,S1,0,OFF,0", new int[0], 4, "without a header, the columns a row writes are the board's ports");
+			Ports("#\"Rom\",\"Knocker\",\"\"\r\nrom,S1,0", new int[0], 2, "a quoted empty name at the header's end is a port");
 			Ports("[Config DOF]\r\n#\"Rom\",\"Flasher\",\"\",\"\"\r\nrom,S1 Red\r\n[Config outs]\r\n#\"Rom\",\"A\",\"B\",\"C\"\r\nold,S1", new[] { 1 }, 3,
 				"the header of the section the rows come from");
 			var timer = System.Diagnostics.Stopwatch.StartNew();

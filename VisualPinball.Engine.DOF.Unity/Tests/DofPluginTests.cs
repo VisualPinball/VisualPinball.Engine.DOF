@@ -481,6 +481,31 @@ namespace VisualPinball.Engine.DOF.Unity.Tests
 			AssertDofIsFree("nothing is held");
 		}
 
+		[Test]
+		public void TestsOutputsBeforeAGameWithTheReservationsTheSettingsPageShares()
+		{
+			var native = new RecordingTestNative();
+			var host = Host();
+			host.Import(340, "vpetest,S1", "COM11");
+			// The settings of a player that has not created the plugin yet, but passes its capabilities to the page.
+			var settingsOnly = new DofPluginFactory(host.Factory.Store.Root) { TestNativeFactory = _ => native, PulseDuration = TimeSpan.FromMilliseconds(20) };
+			var request = new PluginChoiceRequest(null, new PluginSettingsSnapshot(1), "windows") { Capabilities = host.Capabilities };
+			Assert.That(settingsOnly.DescribeOutputsAsync("outputs", request, CancellationToken.None).Result.TestUnavailableReason, Is.Empty);
+			// a host that shares its capabilities but no reservations: nothing to test with, whatever an earlier request brought
+			var without = new PluginChoiceRequest(null, new PluginSettingsSnapshot(1), "windows") { Capabilities = new PluginCapabilities() };
+			Assert.That(settingsOnly.DescribeOutputsAsync("outputs", without, CancellationToken.None).Result.TestUnavailableReason, Is.EqualTo(DofPluginFactory.NoTestsYet));
+			Assert.That(settingsOnly.TestOutputAsync("outputs", "1:1", without, CancellationToken.None).Result.Message, Is.EqualTo(DofPortTest.NoLeases));
+			using (host.Leases.Acquire("serial:COM11", "org.visualpinball.other")) {
+				var held = settingsOnly.TestOutputAsync("outputs", "1:1", request, CancellationToken.None).Result;
+				Assert.That(held.Success, Is.False, "the page's test respects what a game holds");
+				Assert.That(native.Calls, Is.Empty);
+			}
+			var pulse = settingsOnly.TestOutputAsync("outputs", "1:1", request, CancellationToken.None).Result;
+			Assert.That(pulse.Success, Is.True, pulse.Message);
+			Assert.That(native.Calls, Does.Contain("1:1=255"));
+			AssertDofIsFree("released after the test");
+		}
+
 		[UnityTest]
 		public IEnumerator TurnsTheCabinetOffWhenTheFeedIsWithdrawn()
 		{
