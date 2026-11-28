@@ -36,7 +36,7 @@ extern "C" {
 #endif
 
 /// Version of this ABI. Bumped on every incompatible change; the managed binding refuses a library with another one.
-#define VPE_DOF_ABI_VERSION 5
+#define VPE_DOF_ABI_VERSION 6
 
 enum vpe_dof_status
 {
@@ -149,6 +149,14 @@ VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_gate_pending(vpe_dof* dof, int64_t gene
 /// port test does. Runs on DOF's main thread and goes through the output gate. VPE_DOF_INVALID_ARGUMENT if the device
 /// or port does not exist, or the port names a toy (an LED strip or matrix) instead of a controller output.
 VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_test_output(vpe_dof* dof, int32_t device, int32_t port, int32_t value);
+
+/// Routes the ports of an ini device (the N of directoutputconfigN.ini) to other outputs of its LedWiz equivalent, for
+/// cabling that differs from the configuration: port i + 1 drives the output port targets[i] drives in the cabinet, its
+/// own for 0 or i + 1. A port whose target the equivalent has no output for drives nothing. Applied when init sets up
+/// the cabinet, before the table config makes its toys, so games and port tests follow it. Call before vpe_dof_init; a
+/// later call for the device replaces its map, a count of 0 removes it. VPE_DOF_INVALID_ARGUMENT for a device outside
+/// 1..999, a count outside 0..4096, or no targets for a count; VPE_DOF_INVALID_STATE after init.
+VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_set_output_map(vpe_dof* dof, int32_t device, const int32_t* targets, int32_t count);
 
 /// After init: lists "controller|<type>|<name>|<outputs>" and "toy|<type>|<name>" lines describing the cabinet.
 VPE_DOF_API int32_t VPE_DOF_CALL vpe_dof_describe(vpe_dof* dof, vpe_dof_string_fn callback, void* user);

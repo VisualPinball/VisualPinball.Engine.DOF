@@ -80,6 +80,8 @@ namespace VisualPinball.Engine.DOF.Test
 			}
 		}
 
+		public void SetOutputMap(int device, IReadOnlyList<int> targets) => Record($"map:{device}:{string.Join(",", targets)}");
+
 		public void Init(string tableFile, string romName)
 		{
 			lock (_lock) {

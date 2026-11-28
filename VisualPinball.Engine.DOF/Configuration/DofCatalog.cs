@@ -51,13 +51,19 @@ namespace VisualPinball.Engine.DOF.Configuration
 		/// Teensy and Wemos strip controllers), or null.
 		/// </summary>
 		public string SerialPort { get; }
+		/// <summary>
+		/// Whether it connects over a serial port, with or without one named yet: a type that has one, unless it says it uses
+		/// another transport (a PinOne on <c>HID</c>).
+		/// </summary>
+		public bool UsesSerialPort { get; }
 
-		internal DofCatalogController(string type, string name, string serialPort)
+		internal DofCatalogController(string type, string name, string serialPort, bool usesSerialPort = false)
 		{
 			Type = type;
 			Named = name != null;
 			Name = name ?? type;
 			SerialPort = serialPort;
+			UsesSerialPort = usesSerialPort || serialPort != null;
 		}
 	}
 
@@ -94,6 +100,12 @@ namespace VisualPinball.Engine.DOF.Configuration
 		/// outputs even where no ini row puts anything on them.
 		/// </summary>
 		public IReadOnlyDictionary<int, int> CabinetOutputs { get; private set; } = new Dictionary<int, int>();
+
+		/// <summary>
+		/// The highest output a cabinet file's LedWiz equivalent counts for: larger numbers are no controller's, and would
+		/// size a board beyond anything shown. The native output map has the same limit.
+		/// </summary>
+		public const int MaxCabinetOutput = 4096;
 
 		/// <summary>
 		/// Serial ports the cabinet file names: a game leases them before DOF opens them. libdof's auto-configurators
@@ -145,7 +157,9 @@ namespace VisualPinball.Engine.DOF.Configuration
 						// The elements as libdof finds them, by the names as written: a default namespace changes nothing.
 						foreach (var controller in CabinetControllers(xml)) {
 							var type = DofXml.LiteralName(controller);
-							cabinetControllers.Add(new DofCatalogController(type, DofXml.ControllerName(controller), DofXml.SerialPortOf(controller)));
+							var portElement = DofXml.SerialPortElement(type);
+							var serial = portElement != null && !(type == "PinOne" && DofXml.Value(controller, portElement) == "HID");
+							cabinetControllers.Add(new DofCatalogController(type, DofXml.ControllerName(controller), DofXml.SerialPortOf(controller), serial));
 						}
 						foreach (var (device, output) in LedWizEquivalentOutputs(xml)) {
 							cabinetOutputs[device] = Math.Max(output, cabinetOutputs.TryGetValue(device, out var known) ? known : 0);
@@ -189,7 +203,7 @@ namespace VisualPinball.Engine.DOF.Configuration
 					continue;
 				}
 				foreach (var output in DofXml.Children(DofXml.FirstChild(toy, "Outputs"), "LedWizEquivalentOutput")) {
-					if (int.TryParse(DofXml.Value(output, "LedWizEquivalentOutputNumber"), out var number) && number > 0) {
+					if (int.TryParse(DofXml.Value(output, "LedWizEquivalentOutputNumber"), out var number) && number > 0 && number <= MaxCabinetOutput) {
 						yield return (device, number);
 					}
 				}

@@ -137,14 +137,14 @@ namespace VisualPinball.Engine.DOF.Test
 		[Test]
 		public void CatalogKnowsTheOutputsTheCabinetMaps()
 		{
-			var outputs = string.Concat(new[] { 1, 4, 2 }.Select(n => $"<LedWizEquivalentOutput><OutputName>Out {n}</OutputName><LedWizEquivalentOutputNumber>{n}</LedWizEquivalentOutputNumber></LedWizEquivalentOutput>"));
+			var outputs = string.Concat(new[] { 1, 4, 2, 2000000000 }.Select(n => $"<LedWizEquivalentOutput><OutputName>Out {n}</OutputName><LedWizEquivalentOutputNumber>{n}</LedWizEquivalentOutputNumber></LedWizEquivalentOutput>"));
 			var cabinet = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<Cabinet><Name>Test</Name><OutputControllers /><Toys>"
 				+ $"<LedWizEquivalent><Name>LedWizEquivalent 30</Name><LedWizNumber>30</LedWizNumber><Outputs>{outputs}</Outputs></LedWizEquivalent>"
 				+ "<LedWizEquivalent><Name>Broken</Name><LedWizNumber>x</LedWizNumber><Outputs>" + outputs + "</Outputs></LedWizEquivalent>"
 				+ "</Toys></Cabinet>\r\n";
 			Accepted(_importer.Import(Folder("Mapped", ("Config/cabinet.xml", cabinet), ("Config/directoutputconfig30.ini", Header + "#\"Rom\",\"Knocker\"\r\nrom,S1,0,0,0\r\n"))));
 			var catalog = DofCatalog.Load(_store.Active);
-			Assert.That(catalog.CabinetOutputs, Is.EqualTo(new Dictionary<int, int> { [30] = 4 }), "the highest output, by the device it stands for");
+			Assert.That(catalog.CabinetOutputs, Is.EqualTo(new Dictionary<int, int> { [30] = 4 }), "the highest output a controller can have, by the device it stands for");
 			Assert.That(catalog.Devices.Single().PortCount, Is.EqualTo(1), "the ini itself puts nothing past the knocker");
 		}
 

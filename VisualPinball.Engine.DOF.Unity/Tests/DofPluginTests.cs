@@ -6,11 +6,14 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Newtonsoft.Json.Linq;
 using NUnit.Framework;
 using UnityEngine.TestTools;
+using VisualPinball.Engine.DOF.Configuration;
 using VisualPinball.Engine.DOF.Player;
 using VisualPinball.Engine.DOF.Session;
 using VisualPinball.Plugins;
@@ -317,6 +320,120 @@ namespace VisualPinball.Engine.DOF.Unity.Tests
 				Assert.That(result.Message, Does.Contain("FTDI").And.Contain("org.visualpinball.dmd"));
 				Assert.That(native.Calls, Is.Empty, "nothing is opened");
 			}
+		}
+
+		private static PluginChoiceRequest Request(JObject settings = null) => new PluginChoiceRequest(null, new PluginSettingsSnapshot(1, settings ?? new JObject()), "windows");
+
+		private static PluginActionResult Swap(DofTestHost host, string first, string second, int count = 1)
+			=> host.Factory.SwapOutputsAsync("outputs", first, second, count, Request(), CancellationToken.None).Result;
+
+		private static IReadOnlyList<PluginOutput> Outputs(DofTestHost host)
+			=> host.Factory.DescribeOutputsAsync("outputs", Request(), CancellationToken.None).Result.Boards.Single().Outputs;
+
+		[Test]
+		public void RearrangesOutputsForTheMapAndTheTests()
+		{
+			var native = new RecordingTestNative();
+			var host = Host();
+			host.Factory.TestNativeFactory = _ => native;
+			host.Factory.PulseDuration = TimeSpan.FromMilliseconds(20);
+			host.Import(361, "vpetest,S1,0,E2 White", null, "\"Rom\",\"Knocker\",\"\",\"Flasher\"");
+			Assert.That(host.Factory.DescribeOutputsAsync("outputs", Request(), CancellationToken.None).Result.Boards.Single().Rearrangeable, Is.True);
+			Assert.That(host.Factory.DescribeAsync("devices", Request(), CancellationToken.None).Result.UnavailableActions, Does.Contain("ResetWiring"), "nothing to undo yet");
+
+			var swapped = Swap(host, "1:1", "1:2");
+			Assert.That(swapped.Success, Is.True, swapped.Message);
+			var outputs = Outputs(host);
+			Assert.That(outputs.Take(2).Select(o => (o.Number, o.Id, o.Label, o.Note)), Is.EqualTo(new[] { (1, "1:2", "", "Moved from 2"), (2, "1:1", "Knocker", "Moved from 1") }));
+			Assert.That(File.Exists(Path.Combine(host.Factory.Store.Root, DofOutputWiring.FileName)), Is.True, "kept with the configurations");
+
+			// A test pulses the port, which DOF routes to the output it is cabled to.
+			var pulse = Pulse(host, "1:1");
+			Assert.That(pulse.Success, Is.True, pulse.Message);
+			Assert.That(native.Calls.IndexOf("map:1:2,1"), Is.InRange(0, native.Calls.IndexOf("init")), "the wiring is set before DOF starts");
+			Assert.That(pulse.Message, Does.Contain("on output 2 of device 1"), "named after the output it drives");
+
+			// An RGB toy moves as a whole.
+			Assert.That(Swap(host, "1:3", "1:7").Message, Does.Contain("would split Flasher"));
+			Assert.That(Swap(host, "1:3", "1:5", 3).Message, Does.Contain("overlap"));
+			swapped = Swap(host, "1:3", "1:6", 3);
+			Assert.That(swapped.Success, Is.True, swapped.Message);
+			outputs = Outputs(host);
+			Assert.That(outputs.Skip(5).Take(3).Select(o => (o.Number, o.Label, o.Channel)), Is.EqualTo(new[] {
+				(6, "Flasher", PluginOutputChannel.Red), (7, "Flasher", PluginOutputChannel.Green), (8, "Flasher", PluginOutputChannel.Blue),
+			}));
+			Assert.That(outputs.Skip(2).Take(3).Select(o => o.Id), Is.EqualTo(new[] { "1:6", "1:7", "1:8" }));
+			Assert.That(Swap(host, "1:1", "2:1").Success, Is.False, "within a board only");
+
+			var reset = RunAction(host, "reset-wiring");
+			Assert.That(reset.Success, Is.True, reset.Message);
+			Assert.That(Outputs(host).Select(o => o.Id), Is.EqualTo(Enumerable.Range(1, 32).Select(p => "1:" + p)));
+			Assert.That(Outputs(host).All(o => o.Note.Length == 0), Is.True);
+			Assert.That(File.Exists(Path.Combine(host.Factory.Store.Root, DofOutputWiring.FileName)), Is.False);
+			Assert.That(RunAction(host, "reset-wiring").Success, Is.False, "nothing left to undo");
+		}
+
+		[Test]
+		public void AnRgbToyANewConfigurationPutsApartMovesAnOutputAtATime()
+		{
+			var host = Host();
+			host.Import(364, "vpetest,S1");
+			Assert.That(Swap(host, "1:2", "1:5").Success, Is.True);
+			host.Import(364, "vpetest,E2 White", null, "\"Rom\",\"Flasher\"");
+			var outputs = Outputs(host);
+			Assert.That(outputs.Take(5).Select(o => o.Channel), Is.EqualTo(new[] {
+				PluginOutputChannel.Red, PluginOutputChannel.None, PluginOutputChannel.Blue, PluginOutputChannel.None, PluginOutputChannel.Green,
+			}), "the green drives output 5");
+			Assert.That(outputs[1].Id, Is.EqualTo("1:5"), "port 5 drives output 2");
+			var moved = Swap(host, "1:2", "1:5");
+			Assert.That(moved.Success, Is.True, "the green goes back between its red and blue: " + moved.Message);
+			Assert.That(Outputs(host).Take(3).Select(o => o.Channel), Is.EqualTo(new[] { PluginOutputChannel.Red, PluginOutputChannel.Green, PluginOutputChannel.Blue }));
+		}
+
+		[Test]
+		public void TheSerialPortsFollowTheCabinet()
+		{
+			var host = Host();
+			host.Factory.SerialPortsFactory = () => new[] { ("COM3", "USB Serial Device") };
+			host.Import(362, "vpetest,S1");
+			var info = host.Factory.DescribeAsync("serial-ports", Request(), CancellationToken.None).Result;
+			Assert.That(info.HiddenFields, Is.EqualTo(new[] { "SerialOverrides" }), "nothing to change without serial controllers");
+			Assert.That(info.Summary, Does.Contain("no controller on a serial port"));
+			var saved = new JObject { ["SerialOverrides"] = new JArray(new JObject { ["Controller"] = "Teensy", ["Port"] = "COM9" }) };
+			Assert.That(host.Factory.DescribeAsync("serial-ports", Request(saved), CancellationToken.None).Result.HiddenFields, Is.Empty, "saved ports stay to be removed");
+			var unfinished = new JObject { ["SerialOverrides"] = new JArray(new JObject { ["Controller"] = "Teensy", ["Port"] = "" }) };
+			Assert.That(host.Factory.DescribeAsync("serial-ports", Request(unfinished), CancellationToken.None).Result.HiddenFields, Is.Empty, "one without its port too");
+
+			host.Import(362, "vpetest,S1", "COM10");
+			info = host.Factory.DescribeAsync("serial-ports", Request(), CancellationToken.None).Result;
+			Assert.That(info.HiddenFields, Is.Empty);
+			Assert.That(info.Tone, Is.EqualTo(PluginInfoTone.Warning));
+			Assert.That(info.Lines.Single(), Is.EqualTo(new KeyValuePair<string, string>("Teensy", "COM10 (TeensyStripController), which this computer does not have")));
+
+			var controllers = host.Factory.DiscoverAsync("serial-controllers", Request(), CancellationToken.None).Result.Choices;
+			Assert.That(controllers.Select(c => (c.Id, c.Label)), Is.EqualTo(new[] { ("Teensy", "Teensy (TeensyStripController)") }));
+			var ports = host.Factory.DiscoverAsync("serial-port-names", Request(saved), CancellationToken.None).Result.Choices;
+			Assert.That(ports.Select(c => (c.Id, c.Label)), Is.EqualTo(new[] { ("COM3", "COM3 · USB Serial Device"), ("COM9", "COM9 (not connected)") }));
+		}
+
+		[UnityTest]
+		public IEnumerator GamesUseTheRearrangedOutputs()
+		{
+			const int universe = 363;
+			var host = Host();
+			host.Import(universe, "vpetest,S1,S2");
+			Assert.That(Swap(host, "1:1", "1:2").Success, Is.True);
+			var feed = host.PublishFeed();
+			var game = host.Game();
+			yield return host.Await(host.Plugin.PrepareGameAsync(game, CancellationToken.None), "prepare");
+			yield return host.Await(host.Plugin.StartGameAsync(CancellationToken.None), "start");
+			Assert.That(feed.BeginSnapshot(), Is.True);
+			feed.PublishSnapshot(RealtimeOutputKind.Solenoid, 1, 255);
+			feed.EndSnapshot();
+			Expect(universe, f => f[1] == 255 && f[0] == 0, "solenoid 1 drives the output the port is cabled to");
+			yield return host.Await(host.Plugin.StopGameAsync(CancellationToken.None), "stop");
+			yield return host.Await(host.Plugin.Quiescence, "quiescence");
+			AssertDofIsFree("DOF is free for the next test");
 		}
 
 		private static PluginActionResult RunAction(DofTestHost host, string action, CancellationToken cancellation = default)
@@ -631,6 +748,7 @@ namespace VisualPinball.Engine.DOF.Unity.Tests
 		private readonly HashSet<long> _openings = new HashSet<long>();
 
 		public void SetConnectTests(bool allowed) => Calls.Add(allowed ? "connect-tests:on" : "connect-tests:off");
+		public void SetOutputMap(int device, IReadOnlyList<int> targets) => Calls.Add($"map:{device}:{string.Join(",", targets)}");
 		public void Init(string tableFile, string romName) => Calls.Add("init");
 		public IReadOnlyList<DofController> Controllers() => Started;
 		public long SetOutputGate(bool open)

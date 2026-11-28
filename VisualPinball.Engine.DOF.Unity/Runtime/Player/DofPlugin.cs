@@ -160,6 +160,7 @@ namespace VisualPinball.Engine.DOF.Player
 					SnapshotTimeout = SnapshotTimeout,
 					Log = SessionLog,
 					NativeFactory = _factory.NativeFactory,
+					OutputMaps = _factory.Wiring.Maps,
 				});
 				var stopping = session;
 				session.StopOverdue += (_, __) => {

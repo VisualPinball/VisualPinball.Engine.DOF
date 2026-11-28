@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading;
@@ -170,6 +171,20 @@ namespace VisualPinball.Engine.DOF.Test
 			Assert.That(calls.IndexOf("gate:closed"), Is.LessThan(calls.IndexOf("init")), "dark before init");
 			Assert.That(calls.IndexOf("L1=1"), Is.GreaterThan(calls.IndexOf("init")));
 			Assert.That(calls.LastIndexOf("gate:open"), Is.GreaterThan(calls.IndexOf("S2=255")), "the snapshot is in before the gate opens");
+			Wait(session.StopAsync());
+		}
+
+		[Test]
+		public void OutputMapsAreSetBeforeInit()
+		{
+			var (session, native) = Create(o => {
+				o.WaitForSnapshot = false;
+				o.OutputMaps = new Dictionary<int, IReadOnlyList<int>> { [3] = new[] { 2, 1 } };
+			});
+			Wait(session.StartAsync());
+			var calls = native.Calls;
+			Assert.That(calls, Does.Contain("map:3:2,1"));
+			Assert.That(calls.IndexOf("map:3:2,1"), Is.LessThan(calls.IndexOf("init")));
 			Wait(session.StopAsync());
 		}
 
